@@ -25,9 +25,9 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-#define MAX_PACKET_SIZE 4096
+#define MAX_PACKET_SIZE 4160
 #define MAX_EVENTS 256
-#define TUN_MTU 1500
+#define TUN_MTU 4096
 #define UDP_IDLE_TIMEOUT_SEC 120
 #define HANDSHAKE_TIMEOUT_SEC 10
 #define UDP_HASH_BUCKETS 256
@@ -52,9 +52,10 @@ static atomic_int g_handshake_inflight = 0;
 
 #define TCP_HASH_BUCKETS 256
 #define MAX_TCP_SESSIONS 512
-#define TCP_APP_BUF_CAP (256 * 1024)
-#define TCP_SRV_BUF_CAP (256 * 1024)
+#define TCP_APP_BUF_CAP (1024 * 1024)
+#define TCP_SRV_BUF_CAP (1024 * 1024)
 #define TCP_IDLE_TIMEOUT_SEC 300
+#define TCP_READ_CHUNK (64 * 1024)
 
 typedef struct tcp_sess {
     uint32_t src_ip;        // App 端來源 IP（網路序）
@@ -77,8 +78,8 @@ typedef struct tcp_sess {
     int app_fin;            // 已收到 App FIN
     int srv_eof;            // server 已 EOF（read 回 0）
     int srv_fin_sent;       // 已送 FIN 給 App
-    unsigned char *app_buf; size_t app_len, app_cap;  // App→server 待送
-    unsigned char *srv_buf; size_t srv_len, srv_cap;  // server→App 待送（寫 TUN）
+    unsigned char *app_buf; size_t app_off, app_len, app_cap;  // App→server 待送（off=已送出前綴）
+    unsigned char *srv_buf; size_t srv_off, srv_len, srv_cap;  // server→App 待送（off=已寫 TUN 前綴）
     time_t last_active;
     struct tcp_sess *next;  // hash chain
 } tcp_sess_t;
@@ -127,27 +128,40 @@ static unsigned udp_hash_idx(uint32_t ip, uint16_t port) {
 
 // ---------- checksum ----------
 
-static uint16_t checksum16(const unsigned char *data, size_t len) {
-    uint32_t sum = 0;
-    while (len > 1) { sum += ((uint16_t)data[0] << 8) | data[1]; data += 2; len -= 2; }
-    if (len) sum += (uint16_t)data[0] << 8;
+// 以 32-bit 累加「byte-swapped 的 16-bit word」（大尾序資料以 little-endian 讀 4 bytes）
+static uint32_t accum_swapped(const unsigned char *data, size_t len, uint32_t sum) {
+    while (len >= 4) {
+        uint32_t w;
+        memcpy(&w, data, 4);
+        sum += (w & 0xFFFF) + (w >> 16);
+        data += 4; len -= 4;
+    }
+    while (len > 1) { sum += (uint32_t)((data[1] << 8) | data[0]); data += 2; len -= 2; }
+    if (len) sum += (uint32_t)data[0];
+    return sum;
+}
+
+// 完成累加並 swap 回真值（~ 後交換高低位元組）
+static uint16_t checksum_finish(uint32_t sum) {
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    return (uint16_t)~sum;
+    uint16_t res = (uint16_t)~sum;
+    return (uint16_t)((res >> 8) | (res << 8));
+}
+
+static uint16_t checksum16(const unsigned char *data, size_t len) {
+    return checksum_finish(accum_swapped(data, len, 0));
 }
 
 static uint16_t tcpudp_checksum(uint32_t saddr, uint32_t daddr, uint8_t proto, const unsigned char *data, size_t len) {
-    uint32_t sum = 0;
     unsigned char ph[12];
     memcpy(ph, &saddr, 4);
     memcpy(ph + 4, &daddr, 4);
     ph[8] = 0; ph[9] = proto;
     uint16_t l = htons((uint16_t)len);
     memcpy(ph + 10, &l, 2);
-    for (int i = 0; i < 12; i += 2) sum += ((uint16_t)ph[i] << 8) | ph[i + 1];
-    while (len > 1) { sum += ((uint16_t)data[0] << 8) | data[1]; data += 2; len -= 2; }
-    if (len) sum += (uint16_t)data[0] << 8;
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    return (uint16_t)~sum;
+    uint32_t sum = accum_swapped(ph, 12, 0);
+    sum = accum_swapped(data, len, sum);
+    return checksum_finish(sum);
 }
 
 // ---------- TUN 封包處理 ----------
@@ -167,7 +181,6 @@ static int parse_ipv4(const unsigned char *pkt, size_t len, uint8_t *proto, uint
 static void write_ipv4_udp_to_tun(udp_sess_t *sess, uint32_t remote_ip, uint16_t remote_port, const unsigned char *payload, size_t plen) {
     if (plen > TUN_MTU - 28) { LOGE("relay UDP payload 過大 (%zu)，丟棄", plen); return; }
     unsigned char pkt[TUN_MTU];
-    memset(pkt, 0, sizeof pkt);
     size_t total = 20 + 8 + plen;
 
     pkt[0] = 0x45;
@@ -179,6 +192,7 @@ static void write_ipv4_udp_to_tun(udp_sess_t *sess, uint32_t remote_ip, uint16_t
     pkt[9] = 17; // UDP
     memcpy(pkt + 12, &remote_ip, 4);
     memcpy(pkt + 16, &sess->src_ip, 4);
+    pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
     uint16_t csum = checksum16(pkt, 20);
     pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
 
@@ -214,14 +228,17 @@ static void send_tcp_rst(uint32_t saddr, uint32_t daddr, const unsigned char *tc
     uint32_t ack = htonl(ack_host);                      // host 序 → 網路序
 
     unsigned char rst[TUN_MTU];
-    memset(rst, 0, sizeof rst);
     size_t total = 20 + 20;
     rst[0] = 0x45;
+    rst[1] = 0;
     rst[2] = (total >> 8) & 0xFF; rst[3] = total & 0xFF;
+    rst[4] = 0; rst[5] = 0;
+    rst[6] = 0; rst[7] = 0;
     rst[8] = 64;
     rst[9] = 6; // TCP
     memcpy(rst + 12, &daddr, 4);
     memcpy(rst + 16, &saddr, 4);
+    rst[10] = 0; rst[11] = 0;   // checksum 欄位先歸零
     uint16_t csum = checksum16(rst, 20);
     rst[10] = csum >> 8; rst[11] = csum & 0xFF;
 
@@ -234,6 +251,8 @@ static void send_tcp_rst(uint32_t saddr, uint32_t daddr, const unsigned char *tc
     rst[u + 12] = 0x50;
     rst[u + 13] = 0x14; // RST|ACK
     rst[u + 14] = 0; rst[u + 15] = 0;
+    rst[u + 16] = 0; rst[u + 17] = 0;   // checksum 欄位先歸零
+    rst[u + 18] = 0; rst[u + 19] = 0;
     uint16_t tcsum = tcpudp_checksum(daddr, saddr, 6, rst + u, 20);
     rst[u + 16] = tcsum >> 8; rst[u + 17] = tcsum & 0xFF;
 
@@ -537,7 +556,6 @@ static ssize_t write_tcp_to_tun(uint32_t saddr, uint32_t daddr,
                                 const unsigned char *payload, size_t plen) {
     if (20 + 20 + plen > TUN_MTU) { LOGE("tcp 封包過大 (%zu)，丟棄", plen); return -1; }
     unsigned char pkt[TUN_MTU];
-    memset(pkt, 0, sizeof pkt);
     size_t total = 20 + 20 + plen;
 
     pkt[0] = 0x45; pkt[1] = 0;
@@ -548,6 +566,7 @@ static ssize_t write_tcp_to_tun(uint32_t saddr, uint32_t daddr,
     pkt[9] = 6;
     memcpy(pkt + 12, &saddr, 4);
     memcpy(pkt + 16, &daddr, 4);
+    pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
     uint16_t csum = checksum16(pkt, 20);
     pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
 
@@ -575,14 +594,16 @@ static ssize_t write_tcp_to_tun(uint32_t saddr, uint32_t daddr,
 static void send_tcp_synack(tcp_sess_t *sess) {
     if (g_tun_fd < 0) return;
     unsigned char pkt[TUN_MTU];
-    memset(pkt, 0, sizeof pkt);
     size_t total = 20 + 32;                     // 20 IP + 32 TCP（MSS + WS 選項）
     pkt[0] = 0x45; pkt[1] = 0;
     pkt[2] = (total >> 8) & 0xFF; pkt[3] = total & 0xFF;
+    pkt[4] = 0; pkt[5] = 0;
+    pkt[6] = 0; pkt[7] = 0;
     pkt[8] = 64;
     pkt[9] = 6;
     memcpy(pkt + 12, &sess->dst_ip, 4);
     memcpy(pkt + 16, &sess->src_ip, 4);
+    pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
     uint16_t csum = checksum16(pkt, 20);
     pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
 
@@ -596,11 +617,15 @@ static void send_tcp_synack(tcp_sess_t *sess) {
     pkt[u + 12] = 0x80;            // 32-byte TCP header（含 MSS + WS）
     pkt[u + 13] = 0x12;            // SYN|ACK
     pkt[u + 14] = 0xFF; pkt[u + 15] = 0xFF;
+    pkt[u + 16] = 0; pkt[u + 17] = 0;   // checksum 欄位先歸零
+    pkt[u + 18] = 0; pkt[u + 19] = 0;
     pkt[u + 20] = 0x02; pkt[u + 21] = 0x04;   // kind=2(MSS) len=4
-    pkt[u + 22] = 0x05; pkt[u + 23] = 0xB4;   // MSS=1460
+    uint16_t mss = htons((uint16_t)(TUN_MTU - 40));
+    memcpy(pkt + u + 22, &mss, 2);            // MSS=TUN_MTU-40
     pkt[u + 24] = 0x01; pkt[u + 25] = 0x01;   // NOP NOP
     pkt[u + 26] = 0x03; pkt[u + 27] = 0x03;   // kind=3(WS) len=3
     pkt[u + 28] = 0x0A;                        // shift=10（與 App 提議相同）
+    pkt[u + 29] = 0; pkt[u + 30] = 0; pkt[u + 31] = 0;
     uint16_t tcsum = tcpudp_checksum(sess->dst_ip, sess->src_ip, 6, pkt + u, 32);
     pkt[u + 16] = tcsum >> 8; pkt[u + 17] = tcsum & 0xFF;
 
@@ -736,11 +761,18 @@ static void flush_tcp_srv_buf(tcp_sess_t *sess) {
         // 流量控制：App 通告 window 已滿 → 暫停送出，等 App ACK 開窗
         if (sess->srv_next - sess->app_acked >= sess->app_win) break;
         ssize_t w = write_tcp_to_tun(sess->dst_ip, sess->src_ip, sess->dst_port, sess->src_port,
-                                     sess->srv_next, sess->app_next, 0x18, sess->srv_buf, chunk);
+                                     sess->srv_next, sess->app_next, 0x18,
+                                     sess->srv_buf + sess->srv_off, chunk);
         if (w < 0) { set_tun_epoll_out(1); return; }
         sess->srv_next += (uint32_t)chunk;
-        memmove(sess->srv_buf, sess->srv_buf + chunk, sess->srv_len - chunk);
+        sess->srv_off += chunk;
         sess->srv_len -= chunk;
+        if (sess->srv_len == 0) sess->srv_off = 0;
+    }
+    // 已送出超過一半前綴 → 搬移回收空間（分攤成本，避免逐 segment memmove）
+    if (sess->srv_off >= TCP_SRV_BUF_CAP / 2) {
+        memmove(sess->srv_buf, sess->srv_buf + sess->srv_off, sess->srv_len);
+        sess->srv_off = 0;
     }
     if (sess->srv_in_off && sess->srv_len < TCP_SRV_BUF_CAP / 2) set_srv_in(sess, 1);
     if (sess->srv_eof && sess->srv_len == 0 && !sess->srv_fin_sent) {
@@ -754,10 +786,11 @@ static void flush_tcp_app_buf(tcp_sess_t *sess) {
     int fd = atomic_load(&sess->srv_fd);
     if (fd < 0) return;
     while (sess->app_len > 0) {
-        ssize_t n = send(fd, sess->app_buf, sess->app_len, MSG_NOSIGNAL);
+        ssize_t n = send(fd, sess->app_buf + sess->app_off, sess->app_len, MSG_NOSIGNAL);
         if (n > 0) {
-            memmove(sess->app_buf, sess->app_buf + n, sess->app_len - (size_t)n);
+            sess->app_off += (size_t)n;
             sess->app_len -= (size_t)n;
+            if (sess->app_len == 0) sess->app_off = 0;
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             break;
         } else {
@@ -769,6 +802,18 @@ static void flush_tcp_app_buf(tcp_sess_t *sess) {
         set_srv_out(sess, 0);
         if (sess->app_fin) shutdown(fd, SHUT_WR);
     }
+}
+
+// 在 app_buf 尾部保留 need 位元組空間（不足時先 compact）；回傳寫入位置或 NULL
+static unsigned char *app_buf_reserve(tcp_sess_t *sess, size_t need) {
+    if (sess->app_buf == NULL) sess->app_buf = malloc(TCP_APP_BUF_CAP);
+    if (!sess->app_buf) return NULL;
+    if (sess->app_off > 0 && sess->app_len > 0) {
+        memmove(sess->app_buf, sess->app_buf + sess->app_off, sess->app_len);
+        sess->app_off = 0;
+    }
+    if (sess->app_off + sess->app_len + need > TCP_APP_BUF_CAP) return NULL;
+    return sess->app_buf + sess->app_off + sess->app_len;
 }
 
 static void flush_all_tcp(void) {
@@ -998,9 +1043,9 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, int ihl,
     if (payload_len > 0) {
         if (atomic_load(&sess->state) == 0) {
             // CONNECT 中：緩衝並 ACK（避免等 app 重傳），建立後由 kick 觸發送出
-            if (sess->app_buf == NULL) sess->app_buf = malloc(TCP_APP_BUF_CAP);
-            if (sess->app_buf && sess->app_len + payload_len <= TCP_APP_BUF_CAP) {
-                memcpy(sess->app_buf + sess->app_len, pkt + t + (size_t)tcp_hlen, payload_len);
+            unsigned char *dst = app_buf_reserve(sess, payload_len);
+            if (dst) {
+                memcpy(dst, pkt + t + (size_t)tcp_hlen, payload_len);
                 sess->app_len += payload_len;
                 sess->app_next += (uint32_t)payload_len;
                 send_tcp_ack(sess);
@@ -1016,17 +1061,17 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, int ihl,
                     send_tcp_ack(sess);
                 } else if (n > 0) {
                     sess->app_next += (uint32_t)n;
-                    if (sess->app_buf == NULL) sess->app_buf = malloc(TCP_APP_BUF_CAP);
-                    if (sess->app_buf && payload_len - (size_t)n <= TCP_APP_BUF_CAP) {
-                        memcpy(sess->app_buf, pkt + t + (size_t)tcp_hlen + n, payload_len - (size_t)n);
+                    unsigned char *dst = app_buf_reserve(sess, payload_len - (size_t)n);
+                    if (dst) {
+                        memcpy(dst, pkt + t + (size_t)tcp_hlen + n, payload_len - (size_t)n);
                         sess->app_len = payload_len - (size_t)n;
                         send_tcp_ack(sess);
                         set_srv_out(sess, 1);
                     }
                 } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    if (sess->app_buf == NULL) sess->app_buf = malloc(TCP_APP_BUF_CAP);
-                    if (sess->app_buf && payload_len <= TCP_APP_BUF_CAP) {
-                        memcpy(sess->app_buf, pkt + t + (size_t)tcp_hlen, payload_len);
+                    unsigned char *dst = app_buf_reserve(sess, payload_len);
+                    if (dst) {
+                        memcpy(dst, pkt + t + (size_t)tcp_hlen, payload_len);
                         sess->app_len = payload_len;
                         sess->app_next += (uint32_t)payload_len;
                         send_tcp_ack(sess);
@@ -1037,8 +1082,9 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, int ihl,
                     return;
                 }
             } else {
-                if (sess->app_buf && sess->app_len + payload_len <= TCP_APP_BUF_CAP) {
-                    memcpy(sess->app_buf + sess->app_len, pkt + t + (size_t)tcp_hlen, payload_len);
+                unsigned char *dst = app_buf_reserve(sess, payload_len);
+                if (dst) {
+                    memcpy(dst, pkt + t + (size_t)tcp_hlen, payload_len);
                     sess->app_len += payload_len;
                     sess->app_next += (uint32_t)payload_len;
                     send_tcp_ack(sess);
@@ -1080,18 +1126,24 @@ static void handle_tcp_event(tcp_sess_t *sess, uint32_t ev, time_t now) {
     if (ev & (EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP)) {
         if (ev & (EPOLLERR | EPOLLHUP)) { close_tcp_session(sess, 1); return; }
         for (;;) {
-            unsigned char tmp[TUN_MTU];
-            ssize_t r = recv(sfd, tmp, sizeof tmp, 0);
+            if (sess->srv_buf == NULL) sess->srv_buf = malloc(TCP_SRV_BUF_CAP);
+            if (!sess->srv_buf) { close_tcp_session(sess, 1); return; }
+            // 前綴已送出超過一半 → 搬移回收空間（分攤成本）
+            if (sess->srv_off >= TCP_SRV_BUF_CAP / 2) {
+                memmove(sess->srv_buf, sess->srv_buf + sess->srv_off, sess->srv_len);
+                sess->srv_off = 0;
+            }
+            size_t used = sess->srv_off + sess->srv_len;
+            if (used >= TCP_SRV_BUF_CAP) {
+                // 緩衝滿：暫停讀取，等 App 消化後（flush 內）再續，靠 relay TCP 回壓
+                if (sess->srv_len == 0) { close_tcp_session(sess, 1); return; }
+                set_srv_in(sess, 0);
+                break;
+            }
+            size_t want = TCP_SRV_BUF_CAP - used;
+            if (want > TCP_READ_CHUNK) want = TCP_READ_CHUNK;
+            ssize_t r = recv(sfd, sess->srv_buf + used, want, 0);
             if (r > 0) {
-                if (sess->srv_buf == NULL) sess->srv_buf = malloc(TCP_SRV_BUF_CAP);
-                if (!sess->srv_buf) { close_tcp_session(sess, 1); return; }
-                if (sess->srv_len + (size_t)r > TCP_SRV_BUF_CAP) {
-                    // 緩衝滿：暫停讀取，等 App 消化後（flush 內）再續，靠 relay TCP 回壓
-                    if (sess->srv_len == 0) { close_tcp_session(sess, 1); return; }
-                    set_srv_in(sess, 0);
-                    break;
-                }
-                memcpy(sess->srv_buf + sess->srv_len, tmp, (size_t)r);
                 sess->srv_len += (size_t)r;
                 flush_tcp_srv_buf(sess);
                 if (sess->closed) return;

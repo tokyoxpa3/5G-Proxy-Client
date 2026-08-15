@@ -32,6 +32,10 @@ class TunSocksService : VpnService() {
         const val ACTION_STOP = "com.tokyoxpa3.socksclient.STOP"
         const val ACTION_STATUS = "com.tokyoxpa3.socksclient.STATUS"
 
+        // 5G 高頻寬×高延遲（BDP 常 >1MB），relay socket buffer 太小會卡住吞吐量。
+        // 在 connect 前設定，讓 kernel 直接以較大 window 協商。
+        const val SOCKET_BUFFER_SIZE = 1 * 1024 * 1024
+
         const val EXTRA_HOST = "TUNNEL_HOST"
         const val EXTRA_PORT = "TUNNEL_PORT"
         const val EXTRA_USER = "TUNNEL_USER"
@@ -117,7 +121,7 @@ class TunSocksService : VpnService() {
 
             val builder = Builder()
             builder.setSession(getString(R.string.app_name))
-            builder.setMtu(1500)
+            builder.setMtu(4096)
             builder.addAddress("10.8.0.2", 32)
             builder.addRoute("0.0.0.0", 0)
             builder.addRoute("::", 0)
@@ -189,6 +193,8 @@ class TunSocksService : VpnService() {
         return try {
             if (isUdp) {
                 val ds = DatagramSocket()
+                ds.receiveBufferSize = SOCKET_BUFFER_SIZE
+                ds.sendBufferSize = SOCKET_BUFFER_SIZE
                 val ok = protect(ds)
                 if (!ok) {
                     Log.e(TAG, "protect(DatagramSocket) 失敗")
@@ -201,6 +207,8 @@ class TunSocksService : VpnService() {
                 fd
             } else {
                 val socket = Socket()
+                socket.setReceiveBufferSize(SOCKET_BUFFER_SIZE)
+                socket.setSendBufferSize(SOCKET_BUFFER_SIZE)
                 socket.bind(InetSocketAddress(0)) // 強制建立 fd（綁定暫存埠）
                 val ok = protect(socket)
                 if (!ok) {
