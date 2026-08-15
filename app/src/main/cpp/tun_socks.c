@@ -1,7 +1,8 @@
-// tun_socks.c — 客戶端 TUN → SOCKS5 引擎（P1：UDP/DNS relay + TCP RST 拒接）
+// tun_socks.c — 客戶端 TUN → SOCKS5 引擎
 // 流量路徑:
-//   [App] --TUN--> 本引擎解析封包 --SOCKS5 UDP ASSOCIATE--> [SOCKS5 伺服器] --> [目標]
-//   TCP 連線在 P1 回送 RST（Phase 2 才實作 TCP 狀態機）
+//   [App] --TUN--> 本引擎解析封包 --SOCKS5--> [SOCKS5 伺服器] --> [目標]
+//   UDP/DNS/QUIC：SOCKS5 UDP ASSOCIATE relay
+//   TCP：內建 TCP 狀態機，經 SOCKS5 CONNECT 轉發
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
