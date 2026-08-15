@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">5G Proxy Client</string>
+    <string name="notification_channel_name">隧道狀態</string>
+    <string name="notification_connecting">連線中…</string>
+    <string name="notification_running">隧道已啟用</string>
+    <string name="notification_stopped">已停止</string>
+</resources>
