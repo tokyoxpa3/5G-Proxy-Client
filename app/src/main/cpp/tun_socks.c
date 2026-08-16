@@ -75,7 +75,7 @@ static void ip_to_str(const ip_addr_t *a, char *out, size_t n) {
 
 #define TCP_HASH_BUCKETS 256
 #define MAX_TCP_SESSIONS 512
-#define TCP_APP_BUF_CAP (1024 * 1024)
+#define TCP_APP_BUF_CAP (4 * 1024 * 1024)
 #define TCP_SRV_BUF_CAP (1024 * 1024)
 #define TCP_IDLE_TIMEOUT_SEC 300
 #define TCP_READ_CHUNK (64 * 1024)
@@ -88,6 +88,7 @@ typedef struct tcp_sess {
     atomic_int srv_fd;      // SOCKS5 CONNECT 的 stream socket（Java protect）
     atomic_int state;       // 0=CONNECT 中 1=就緒
     atomic_int handshake_failed;
+    atomic_int thread_done; // 背景 connect 線程結束標記（釋放前檢查）
     int closed;             // engine 單一執行緒持有
     int want_out;           // srv_fd 已註冊 EPOLLOUT
     int srv_in_off;         // 緩衝滿時暫停讀 srv_fd
@@ -140,11 +141,15 @@ typedef struct udp_sess {
     int tx_armed;               // control_fd 已註冊 EPOLLOUT
     unsigned char *rx_buf; size_t rx_len, rx_off, rx_cap;   // ← server 的串流緩衝
     int rx_want;                // -1 = 待讀 2-byte 長度欄；>=0 = 待讀 datagram 長度
+    atomic_int thread_done;     // handshake 線程結束標記（釋放前檢查）
     struct udp_sess *next;  // hash chain
 } udp_sess_t;
 
 static udp_sess_t *g_udp_hash[UDP_HASH_BUCKETS];
 static pthread_mutex_t g_udp_hash_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static udp_sess_t *g_udp_graveyard = NULL;   // 線程未結束前暫存待釋放 session（受 g_udp_hash_lock 保護）
+static tcp_sess_t *g_tcp_graveyard = NULL;   // 同上（僅 engine 單執行緒存取）
 
 static void udp_sess_free_bufs(udp_sess_t *sess);
 
@@ -306,7 +311,8 @@ static void write_udp_to_tun(udp_sess_t *sess, const ip_addr_t *remote, uint16_t
 static ssize_t write_tcp_to_tun(const ip_addr_t *saddr, const ip_addr_t *daddr,
                                 uint16_t sport, uint16_t dport,
                                 uint32_t seq, uint32_t ack, uint8_t flags,
-                                const unsigned char *payload, size_t plen);
+                                const unsigned char *payload, size_t plen,
+                                uint16_t win);
 
 static void send_tcp_rst(const ip_addr_t *src, const ip_addr_t *dst, const unsigned char *tcp, size_t tlen) {
     if (tlen < 20) return;
@@ -323,7 +329,7 @@ static void send_tcp_rst(const ip_addr_t *src, const ip_addr_t *dst, const unsig
     size_t payload = tlen - tcp_hlen;
     uint32_t ack_host = seq_host + (uint32_t)(payload + ((flags & 0x02) ? 1 : 0));
     // 回應方向：src←(dst_ip, dst_port)，seq=0, ack=對應值
-    write_tcp_to_tun(dst, src, dport, sport, 0, ack_host, 0x14, NULL, 0);
+    write_tcp_to_tun(dst, src, dport, sport, 0, ack_host, 0x14, NULL, 0, 0);
 }
 
 // ---------- UDP 會話 ----------
@@ -333,11 +339,17 @@ static void handle_relay_udp(udp_sess_t *sess, const unsigned char *buf, ssize_t
 // UDP-in-TCP：將一整個 frame（長度欄 + SOCKS5 datagram）加入送出佇列。
 // 只在「未 arm EPOLLOUT」時才觸發第一次，避免重複 MOD。
 static void udp_tcp_append(udp_sess_t *sess, const unsigned char *frame, size_t flen) {
-    if (sess->tx_len + flen > sess->tx_cap) {
-        LOGE("udp-in-tcp tx 佇列滿，丟棄 datagram");
-        return;
-    }
     if (sess->tx_len == 0) sess->tx_off = 0;
+    if (sess->tx_off + sess->tx_len + flen > sess->tx_cap) {
+        // 尾部空間不足：先壓縮（tx_off>0 時），仍不足才丟棄
+        if (sess->tx_off > 0 && sess->tx_len + flen <= sess->tx_cap) {
+            memmove(sess->tx_buf, sess->tx_buf + sess->tx_off, sess->tx_len);
+            sess->tx_off = 0;
+        } else {
+            LOGE("udp-in-tcp tx 佇列滿，丟棄 datagram");
+            return;
+        }
+    }
     memcpy(sess->tx_buf + sess->tx_off + sess->tx_len, frame, flen);
     sess->tx_len += flen;
     if (!sess->tx_armed) {
@@ -537,7 +549,7 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
         pthread_mutex_unlock(&g_udp_hash_lock);
         return;
     }
-    forward_udp_to_server(sess, dst_ip, dport, pkt + u + 8, payload_len);
+    if (!sess->closed) forward_udp_to_server(sess, dst_ip, dport, pkt + u + 8, payload_len);
 }
 
 static int send_all(int fd, const unsigned char *buf, size_t len) {
@@ -672,25 +684,8 @@ static void *udp_session_thread(void *arg) {
     sess->relay_fd = rfd;
     sess->relay_addr = relay;
 
-    // 先寫狀態再註冊 epoll（main loop 在 epoll_wait 回傳後才能看到 session）
-    sess->state = 1;
-    sess->last_active = time(NULL);
-    struct epoll_event ev;
-    // 注意：epoll_data 是 union，data.fd 與 data.ptr 共用記憶體。
-    // 因此把 fd 號碼存進 data.fd 後，讀 data.ptr 會得到垃圾指標；
-    // 改用「指標低 bit」區分事件來源：control 存原指標，relay 存指標|1。
-    if (udp_tcp) {
-        // UDP-in-TCP：control_fd 兼任 relay，以 tag=1 註冊
-        ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR; ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
-    } else {
-        ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR; ev.data.ptr = sess;
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
-        ev.events = EPOLLIN | EPOLLERR | EPOLLHUP; ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, rfd, &ev) < 0) { epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, cfd, NULL); goto fail; }
-    }
-
-    // 立即轉發 handshake 期間緩衝的首包（不需等 App 重傳）
+    // 在註冊 epoll 前先轉發 handshake 期間緩衝的首包，
+    // 避免線程與 engine 並發操作 tx_buf（UDP-in-TCP）
     pthread_mutex_lock(&g_udp_hash_lock);
     unsigned char *pd = sess->pend_data;
     size_t pl = sess->pend_len;
@@ -704,6 +699,27 @@ static void *udp_session_thread(void *arg) {
         free(pd);
     }
 
+    // 先寫狀態再註冊 epoll（main loop 在 epoll_wait 回傳後才能看到 session）
+    sess->state = 1;
+    sess->last_active = time(NULL);
+    struct epoll_event ev;
+    // 注意：epoll_data 是 union，data.fd 與 data.ptr 共用記憶體。
+    // 因此把 fd 號碼存進 data.fd 後，讀 data.ptr 會得到垃圾指標；
+    // 改用「指標低 bit」區分事件來源：control 存原指標，relay 存指標|1。
+    if (udp_tcp) {
+        // UDP-in-TCP：control_fd 兼任 relay，以 tag=1 註冊
+        unsigned int uev = EPOLLIN | EPOLLRDHUP | EPOLLERR;
+        if (sess->tx_len > 0) uev |= EPOLLOUT;   // 首包已入隊：需立即排空
+        ev.events = uev; ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
+    } else {
+        ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR; ev.data.ptr = sess;
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
+        ev.events = EPOLLIN | EPOLLERR | EPOLLHUP; ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, rfd, &ev) < 0) { epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, cfd, NULL); goto fail; }
+    }
+
+    atomic_store(&sess->thread_done, 1);   // 先標記，engine 才可安全 free（shutdown 等 inflight==0）
     atomic_fetch_sub(&g_handshake_inflight, 1);
     if (udp_tcp) LOGI("udp handshake 完成: UDP-in-TCP (relay 走同一 TCP)");
     else LOGI("udp handshake 完成: relay=%s:%d", inet_ntoa(relay.sin_addr), ntohs(relay.sin_port));
@@ -716,23 +732,22 @@ fail:
         ip_to_str(&sess->src_ip, b1, sizeof b1);
         LOGI("udp handshake 失敗 (src=%s:%d)", b1, ntohs(sess->src_port));
     }
-    if (cfd >= 0) { release_java_socket(cfd); close(cfd); }
-    if (rfd >= 0) { release_java_socket(rfd); close(rfd); }
-    // 從 hash 移除並釋放（誰 unlink 誰 free，避免雙重釋放）
+    if (cfd >= 0) { release_java_socket(cfd); close(cfd); sess->control_fd = -1; }
+    if (rfd >= 0) { release_java_socket(rfd); close(rfd); sess->relay_fd = -1; }
+    // 從 hash 移除；記憶體保留至線程結束（thread_done=1）後由 graveyard collect 釋放，
+    // 避免 engine（handle_tun_udp）在 unlock 後仍使用 sess 造成 UAF
     pthread_mutex_lock(&g_udp_hash_lock);
     unsigned idx = udp_hash_idx(&sess->src_ip, sess->src_port);
     udp_sess_t **pp = &g_udp_hash[idx];
     while (*pp && *pp != sess) pp = &(*pp)->next;
-    if (*pp) {
+    if (*pp && !sess->closed) {
         *pp = sess->next;
         sess->closed = 1;
-        pthread_mutex_unlock(&g_udp_hash_lock);
-        udp_sess_free_bufs(sess);
-        free(sess);
-        atomic_fetch_sub(&g_udp_session_count, 1);
-    } else {
-        pthread_mutex_unlock(&g_udp_hash_lock);
+        sess->next = g_udp_graveyard;
+        g_udp_graveyard = sess;
     }
+    pthread_mutex_unlock(&g_udp_hash_lock);
+    atomic_store(&sess->thread_done, 1);
     atomic_fetch_sub(&g_handshake_inflight, 1);
     jni_detach_thread();
     return NULL;
@@ -778,6 +793,38 @@ static void close_session_fds(udp_sess_t *sess) {
     }
 }
 
+// 兩階段釋放：一律移入 graveyard，真正 free 統一在 udp_graveyard_collect() 執行
+// （位於 event 批次處理結束後、loop 結尾）。原因：UDP session 有 control+relay 兩條 fd，
+// 同一批次可能出現兩個事件指向同一 session——若第一個事件就 free，第二個事件會讀寫
+// 已釋放（甚至已被新 session 重用）的記憶體，損壞 hash 鏈。
+// 呼叫端須先關閉 fds（或先呼叫 close_session_fds），且已自 hash unlink。
+static void udp_sess_release(udp_sess_t *sess) {
+    pthread_mutex_lock(&g_udp_hash_lock);
+    sess->next = g_udp_graveyard;
+    g_udp_graveyard = sess;
+    pthread_mutex_unlock(&g_udp_hash_lock);
+}
+
+static void udp_graveyard_collect(void) {
+    pthread_mutex_lock(&g_udp_hash_lock);
+    udp_sess_t **pp = &g_udp_graveyard;
+    while (*pp) {
+        udp_sess_t *s = *pp;
+        if (atomic_load(&s->thread_done)) {
+            *pp = s->next;
+            pthread_mutex_unlock(&g_udp_hash_lock);
+            close_session_fds(s);
+            udp_sess_free_bufs(s);
+            free(s);
+            atomic_fetch_sub(&g_udp_session_count, 1);
+            pthread_mutex_lock(&g_udp_hash_lock);
+        } else {
+            pp = &s->next;
+        }
+    }
+    pthread_mutex_unlock(&g_udp_hash_lock);
+}
+
 // ---------- TCP 封包處理 ----------
 
 // 送出 TCP 封包給 App（以 App 觀點：saddr/daddr 為 IP 位址，sport/dport 為埠）
@@ -785,7 +832,8 @@ static void close_session_fds(udp_sess_t *sess) {
 static ssize_t write_tcp_to_tun(const ip_addr_t *saddr, const ip_addr_t *daddr,
                                 uint16_t sport, uint16_t dport,
                                 uint32_t seq, uint32_t ack, uint8_t flags,
-                                const unsigned char *payload, size_t plen) {
+                                const unsigned char *payload, size_t plen,
+                                uint16_t win) {
     int is6 = (saddr->family == AF_INET6);
     size_t ip_hlen = is6 ? 40 : 20;
     if (ip_hlen + 20 + plen > TUN_MTU) { LOGE("tcp 封包過大 (%zu)，丟棄", plen); return -1; }
@@ -824,7 +872,7 @@ static ssize_t write_tcp_to_tun(const ip_addr_t *saddr, const ip_addr_t *daddr,
     memcpy(pkt + u + 8, &ack_n, 4);
     pkt[u + 12] = 0x50;
     pkt[u + 13] = flags;
-    pkt[u + 14] = 0xFF; pkt[u + 15] = 0xFF;   // window 65535
+    pkt[u + 14] = (uint8_t)(win >> 8); pkt[u + 15] = (uint8_t)(win & 0xFF);
     pkt[u + 16] = 0; pkt[u + 17] = 0;
     pkt[u + 18] = 0; pkt[u + 19] = 0;
     if (plen) memcpy(pkt + u + 20, payload, plen);
@@ -875,7 +923,8 @@ static void send_tcp_synack(tcp_sess_t *sess) {
     memcpy(pkt + u + 8, &ack_n, 4);
     pkt[u + 12] = 0x80;            // 32-byte TCP header（含 MSS + WS）
     pkt[u + 13] = 0x12;            // SYN|ACK
-    pkt[u + 14] = 0xFF; pkt[u + 15] = 0xFF;
+    pkt[u + 14] = (uint8_t)((TCP_APP_BUF_CAP >> 10) >> 8);
+    pkt[u + 15] = (uint8_t)((TCP_APP_BUF_CAP >> 10) & 0xFF);
     pkt[u + 16] = 0; pkt[u + 17] = 0;   // checksum 欄位先歸零
     pkt[u + 18] = 0; pkt[u + 19] = 0;
     pkt[u + 20] = 0x02; pkt[u + 21] = 0x04;   // kind=2(MSS) len=4
@@ -893,19 +942,27 @@ static void send_tcp_synack(tcp_sess_t *sess) {
     else if (w != (ssize_t)total) LOGI("write tun SYN-ACK partial %zd/%zu", w, total);
 }
 
+// 引擎對 App 通告的接收 window：app_buf 剩餘空間（SYNACK 協商 shift=10，單位 1KB）
+static uint16_t tcp_win_field(const tcp_sess_t *sess) {
+    size_t occ = sess->app_off + sess->app_len;
+    size_t free = (occ >= TCP_APP_BUF_CAP) ? 0 : (TCP_APP_BUF_CAP - occ);
+    uint16_t w = (uint16_t)(free >> 10);
+    return (w > 0) ? w : 1;
+}
+
 static void send_tcp_ack(tcp_sess_t *sess) {
     write_tcp_to_tun(&sess->dst_ip, &sess->src_ip, sess->dst_port, sess->src_port,
-                     sess->srv_next, sess->app_next, 0x10, NULL, 0);
+                     sess->srv_next, sess->app_next, 0x10, NULL, 0, tcp_win_field(sess));
 }
 
 static void send_tcp_fin(tcp_sess_t *sess) {
     write_tcp_to_tun(&sess->dst_ip, &sess->src_ip, sess->dst_port, sess->src_port,
-                     sess->srv_next, sess->app_next, 0x11, NULL, 0);
+                     sess->srv_next, sess->app_next, 0x11, NULL, 0, tcp_win_field(sess));
 }
 
 static void send_session_rst(tcp_sess_t *sess) {
     write_tcp_to_tun(&sess->dst_ip, &sess->src_ip, sess->dst_port, sess->src_port,
-                     0, sess->app_next, 0x14, NULL, 0);
+                     0, sess->app_next, 0x14, NULL, 0, 0);
 }
 
 // ---------- 背景連線用 IO（poll 短循環 + g_running 檢查） ----------
@@ -952,6 +1009,9 @@ static int net_recv_all(int fd, unsigned char *buf, size_t len) {
 
 // ---------- TCP 會話管理 ----------
 
+// engine 單一執行緒呼叫（唯一釋放 session 之處，background 線程不碰 hash）
+// 兩階段釋放：若背景 connect 線程尚未結束（thread_done==0），先移入 graveyard，
+// 由 engine_loop 每輪結尾的 tcp_graveyard_collect() 在 thread_done==1 後真正 free。
 static void tcp_session_destroy(tcp_sess_t *sess) {
     int fd = atomic_load(&sess->srv_fd);
     if (fd >= 0) {
@@ -963,11 +1023,38 @@ static void tcp_session_destroy(tcp_sess_t *sess) {
     unsigned idx = tcp_hash_idx(&sess->src_ip, sess->src_port);
     tcp_sess_t **pp = &g_tcp_hash[idx];
     while (*pp && *pp != sess) pp = &(*pp)->next;
-    if (*pp) *pp = sess->next;
-    free(sess->app_buf);
-    free(sess->srv_buf);
-    free(sess);
-    atomic_fetch_sub(&g_tcp_session_count, 1);
+    if (!*pp) {
+        // 已不在 hash（可能已進 graveyard）→ 防止 double free
+        LOGE("tcp_session_destroy: session 不在 hash，跳過釋放");
+        return;
+    }
+    *pp = sess->next;
+    if (atomic_load(&sess->thread_done)) {
+        free(sess->app_buf);
+        free(sess->srv_buf);
+        free(sess);
+        atomic_fetch_sub(&g_tcp_session_count, 1);
+    } else {
+        LOGI("tcp session 待線程結束後釋放");
+        sess->next = g_tcp_graveyard;
+        g_tcp_graveyard = sess;
+    }
+}
+
+static void tcp_graveyard_collect(void) {
+    tcp_sess_t **pp = &g_tcp_graveyard;
+    while (*pp) {
+        tcp_sess_t *s = *pp;
+        if (atomic_load(&s->thread_done)) {
+            *pp = s->next;
+            free(s->app_buf);
+            free(s->srv_buf);
+            free(s);
+            atomic_fetch_sub(&g_tcp_session_count, 1);
+        } else {
+            pp = &s->next;
+        }
+    }
 }
 
 // engine 單一執行緒呼叫（唯一釋放 session 之處，background 線程不碰 hash）
@@ -1022,7 +1109,7 @@ static void flush_tcp_srv_buf(tcp_sess_t *sess) {
         if (sess->srv_next - sess->app_acked >= sess->app_win) break;
         ssize_t w = write_tcp_to_tun(&sess->dst_ip, &sess->src_ip, sess->dst_port, sess->src_port,
                                      sess->srv_next, sess->app_next, 0x18,
-                                     sess->srv_buf + sess->srv_off, chunk);
+                                     sess->srv_buf + sess->srv_off, chunk, tcp_win_field(sess));
         if (w < 0) { set_tun_epoll_out(1); return; }
         sess->srv_next += (uint32_t)chunk;
         sess->srv_off += chunk;
@@ -1045,6 +1132,7 @@ static void flush_tcp_srv_buf(tcp_sess_t *sess) {
 static void flush_tcp_app_buf(tcp_sess_t *sess) {
     int fd = atomic_load(&sess->srv_fd);
     if (fd < 0) return;
+    size_t before = sess->app_len;
     while (sess->app_len > 0) {
         ssize_t n = send(fd, sess->app_buf + sess->app_off, sess->app_len, MSG_NOSIGNAL);
         if (n > 0) {
@@ -1061,6 +1149,10 @@ static void flush_tcp_app_buf(tcp_sess_t *sess) {
     if (sess->app_len == 0) {
         set_srv_out(sess, 0);
         if (sess->app_fin) shutdown(fd, SHUT_WR);
+    }
+    // 排空後重開 window：主動送 window-update ACK，避免 App 停在縮小的窗上死鎖
+    if (sess->app_len < before && !sess->closed && atomic_load(&sess->state) == 1) {
+        send_tcp_ack(sess);
     }
 }
 
@@ -1114,6 +1206,7 @@ static void *tcp_connect_thread(void *arg) {
     tcp_sess_t *sess = (tcp_sess_t *)arg;
     unsigned char buf[320];
     int sfd = -1;
+    int fd_stored = 0;   // srv_fd 是否已交由 engine 管理（之後線程不再 close）
 
     sfd = request_java_socket(g_srv_host, g_srv_port, 0);
     if (sfd < 0) goto fail;
@@ -1167,29 +1260,34 @@ static void *tcp_connect_thread(void *arg) {
     }
 
     atomic_store(&sess->srv_fd, sfd);
+    fd_stored = 1;
     atomic_store(&sess->state, 1);
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR;
     ev.data.ptr = (tcp_sess_t *)((uintptr_t)sess | 3);
     if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, sfd, &ev) < 0) {
-        atomic_store(&sess->srv_fd, -1);
-        goto fail;
+        // fd 已交予 engine（srv_fd=sfd），engine 銷毀時會關閉，線程不再 close
+        atomic_store(&sess->handshake_failed, 1);
+        if (g_kick_pipe[1] >= 0) { char k = 1; write(g_kick_pipe[1], &k, 1); }
+        goto done;
     }
     if (g_kick_pipe[1] >= 0) { char k = 1; write(g_kick_pipe[1], &k, 1); }
     char b1[64];
     ip_to_str(&sess->dst_ip, b1, sizeof b1);
     LOGI("tcp connect 完成 -> %s:%d", b1, ntohs(sess->dst_port));
-    atomic_fetch_sub(&g_handshake_inflight, 1);
-    jni_detach_thread();
-    return NULL;
+    goto done;
 
 fail:
     ip_to_str(&sess->dst_ip, b1, sizeof b1);
     LOGI("tcp connect 失敗 -> %s:%d", b1, ntohs(sess->dst_port));
-    if (sfd >= 0) { release_java_socket(sfd); close(sfd); }
+    // 只有 store 前（fd_stored==0）的失敗才由線程 close；store 後 fd 屬 engine 所有
+    if (sfd >= 0 && !fd_stored) { release_java_socket(sfd); close(sfd); }
     if (g_tun_fd >= 0) send_session_rst(sess);
     atomic_store(&sess->handshake_failed, 1);
     if (g_kick_pipe[1] >= 0) { char k = 1; write(g_kick_pipe[1], &k, 1); }
+
+done:
+    atomic_store(&sess->thread_done, 1);   // 先標記，engine 才可安全 free（shutdown 等 inflight==0）
     atomic_fetch_sub(&g_handshake_inflight, 1);
     jni_detach_thread();
     return NULL;
@@ -1317,6 +1415,7 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
         if (atomic_load(&sess->state) == 0) {
             // CONNECT 中：緩衝並 ACK（避免等 app 重傳），建立後由 kick 觸發送出
             unsigned char *dst = app_buf_reserve(sess, payload_len);
+            if (!dst) { flush_tcp_app_buf(sess); dst = app_buf_reserve(sess, payload_len); }
             if (dst) {
                 memcpy(dst, pkt + t + (size_t)tcp_hlen, payload_len);
                 sess->app_len += payload_len;
@@ -1327,41 +1426,19 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
         } else {
             int sfd = atomic_load(&sess->srv_fd);
             if (sfd < 0) return;
-            if (sess->app_len == 0) {
-                ssize_t n = send(sfd, pkt + t + (size_t)tcp_hlen, payload_len, MSG_NOSIGNAL);
-                if (n == (ssize_t)payload_len) {
-                    sess->app_next += (uint32_t)payload_len;
-                    send_tcp_ack(sess);
-                } else if (n > 0) {
-                    sess->app_next += (uint32_t)n;
-                    unsigned char *dst = app_buf_reserve(sess, payload_len - (size_t)n);
-                    if (dst) {
-                        memcpy(dst, pkt + t + (size_t)tcp_hlen + n, payload_len - (size_t)n);
-                        sess->app_len = payload_len - (size_t)n;
-                        send_tcp_ack(sess);
-                        set_srv_out(sess, 1);
-                    }
-                } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    unsigned char *dst = app_buf_reserve(sess, payload_len);
-                    if (dst) {
-                        memcpy(dst, pkt + t + (size_t)tcp_hlen, payload_len);
-                        sess->app_len = payload_len;
-                        sess->app_next += (uint32_t)payload_len;
-                        send_tcp_ack(sess);
-                        set_srv_out(sess, 1);
-                    }
-                } else {
-                    close_tcp_session(sess, 1);
-                    return;
-                }
-            } else {
-                unsigned char *dst = app_buf_reserve(sess, payload_len);
-                if (dst) {
-                    memcpy(dst, pkt + t + (size_t)tcp_hlen, payload_len);
-                    sess->app_len += payload_len;
-                    sess->app_next += (uint32_t)payload_len;
-                    send_tcp_ack(sess);
-                }
+            // 一律先入 app_buf 再 flush：直接 send 遇到 partial 時，App 重傳餘數會被重複接受
+            unsigned char *dst = app_buf_reserve(sess, payload_len);
+            if (!dst) {
+                flush_tcp_app_buf(sess);
+                if (sess->closed) return;
+                dst = app_buf_reserve(sess, payload_len);
+            }
+            if (dst) {
+                memcpy(dst, pkt + t + (size_t)tcp_hlen, payload_len);
+                sess->app_len += payload_len;
+                sess->app_next += (uint32_t)payload_len;
+                send_tcp_ack(sess);
+                set_srv_out(sess, 1);
             }
         }
     }
@@ -1554,9 +1631,7 @@ static void *engine_loop(void *arg) {
                     if (*pp) *pp = sess->next;
                     pthread_mutex_unlock(&g_udp_hash_lock);
                     close_session_fds(sess);
-                    udp_sess_free_bufs(sess);
-                    free(sess);
-                    atomic_fetch_sub(&g_udp_session_count, 1);
+                    udp_sess_release(sess);
                 } else {
                     pthread_mutex_unlock(&g_udp_hash_lock);
                 }
@@ -1586,9 +1661,7 @@ static void *engine_loop(void *arg) {
             pthread_mutex_unlock(&g_udp_hash_lock);
             for (int i = 0; i < gc; i++) {
                 close_session_fds(garbage[i]);
-                udp_sess_free_bufs(garbage[i]);
-                free(garbage[i]);
-                atomic_fetch_sub(&g_udp_session_count, 1);
+                udp_sess_release(garbage[i]);
             }
 
             // TCP 閒置 / 失敗會話回收
@@ -1609,6 +1682,10 @@ static void *engine_loop(void *arg) {
                 tcp_session_destroy(tcp_garbage[i]);
             }
         }
+
+        // 每輪結束：回收兩階段釋放（背景線程已結束）的 session
+        tcp_graveyard_collect();
+        udp_graveyard_collect();
     }
 
 shutdown:
@@ -1623,6 +1700,10 @@ shutdown:
             waited_ms += 100;
         }
     }
+
+    // 線程已全部結束（thread_done 皆已設定）：清空兩階段釋放清單
+    tcp_graveyard_collect();
+    udp_graveyard_collect();
 
     // 收集並關閉所有 session
     udp_sess_t *to_close = NULL;
