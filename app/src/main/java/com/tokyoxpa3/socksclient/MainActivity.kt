@@ -8,6 +8,7 @@ import android.content.IntentFilter
 import android.net.VpnService
 import android.os.Bundle
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -23,8 +24,10 @@ class MainActivity : Activity() {
     private lateinit var etPort: EditText
     private lateinit var etUser: EditText
     private lateinit var etPass: EditText
+    private lateinit var cbUdpInTcp: CheckBox
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
+    private lateinit var btnSelectApps: Button
     private lateinit var tvStatus: TextView
 
     private val statusReceiver = object : BroadcastReceiver() {
@@ -40,9 +43,9 @@ class MainActivity : Activity() {
         DebugLog.init(this)
         buildUi()
         DebugLog.getLastCrash()?.let { crash ->
-            tvStatus.text = "⚠️ 上次發生崩潰：\n$crash"
+            tvStatus.text = getString(R.string.last_crash_prefix, crash)
         } ?: DebugLog.getLastError()?.let { err ->
-            tvStatus.text = "⚠️ 上次錯誤：\n$err"
+            tvStatus.text = getString(R.string.last_error_prefix, err)
         }
     }
 
@@ -69,35 +72,48 @@ class MainActivity : Activity() {
             setPadding(0, 24, 0, 6)
         }
 
-        etHost = EditText(this).apply { hint = "伺服器 IP（例：192.168.1.100）" }
+        etHost = EditText(this).apply { hint = getString(R.string.hint_host) }
         etPort = EditText(this).apply {
-            hint = "連接埠（例：1080）"
+            hint = getString(R.string.hint_port)
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
         }
-        etUser = EditText(this).apply { hint = "使用者名稱（可留空）" }
+        etUser = EditText(this).apply { hint = getString(R.string.hint_user) }
         etPass = EditText(this).apply {
-            hint = "密碼（可留空）"
+            hint = getString(R.string.hint_pass)
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
 
-        btnStart = Button(this).apply { text = "🚀 啟動隧道" }
+        btnStart = Button(this).apply { text = getString(R.string.btn_start_tunnel) }
         btnStop = Button(this).apply {
-            text = "🛑 停止隧道"
+            text = getString(R.string.btn_stop_tunnel)
             isEnabled = false
+        }
+        btnSelectApps = Button(this).apply {
+            text = getString(R.string.btn_select_apps)
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, AppListActivity::class.java))
+            }
         }
         tvStatus = TextView(this).apply {
             textSize = 14f
             setPadding(0, 24, 0, 0)
         }
 
-        root.addView(label("SOCKS5 伺服器"))
+        cbUdpInTcp = CheckBox(this).apply {
+            text = getString(R.string.label_udp_in_tcp)
+            setPadding(0, 24, 0, 0)
+        }
+
+        root.addView(label(getString(R.string.label_server)))
         root.addView(etHost)
         root.addView(etPort)
-        root.addView(label("認證（可選）"))
+        root.addView(label(getString(R.string.label_auth)))
         root.addView(etUser)
         root.addView(etPass)
+        root.addView(cbUdpInTcp)
         root.addView(btnStart)
         root.addView(btnStop)
+        root.addView(btnSelectApps)
         root.addView(tvStatus)
 
         setContentView(root)
@@ -107,13 +123,14 @@ class MainActivity : Activity() {
         etPort.setText(prefs.getString("port", "1080"))
         etUser.setText(prefs.getString("user", ""))
         etPass.setText(prefs.getString("pass", ""))
+        cbUdpInTcp.isChecked = prefs.getBoolean("udp_in_tcp", false)
 
         btnStart.setOnClickListener {
             try {
                 val host = etHost.text.toString().trim()
                 val port = etPort.text.toString().trim().toIntOrNull()
                 if (host.isEmpty() || port == null || port !in 1..65535) {
-                    Toast.makeText(this, "請輸入有效的伺服器位址與連接埠", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, getString(R.string.toast_invalid_input), Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
                 prefs.edit()
@@ -121,14 +138,15 @@ class MainActivity : Activity() {
                     .putString("port", etPort.text.toString().trim())
                     .putString("user", etUser.text.toString().trim())
                     .putString("pass", etPass.text.toString().trim())
+                    .putBoolean("udp_in_tcp", cbUdpInTcp.isChecked)
                     .apply()
 
-                Toast.makeText(this, "正在啟動隧道…", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, getString(R.string.toast_starting), Toast.LENGTH_SHORT).show()
                 android.util.Log.i("MainActivity", "Start button pressed, preparing VPN")
 
                 val vpnIntent = VpnService.prepare(this)
                 if (vpnIntent != null) {
-                    Toast.makeText(this, "請在系統視窗允許 VPN 連線", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, getString(R.string.toast_allow_vpn), Toast.LENGTH_LONG).show()
                     startActivityForResult(vpnIntent, REQ_VPN_PERMISSION)
                 } else {
                     startTunnel(host, port)
@@ -136,7 +154,7 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 android.util.Log.e("MainActivity", "Start click error", e)
                 DebugLog.recordError("點擊啟動時錯誤：${e.message}")
-                Toast.makeText(this, "啟動失敗：${e.message}", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, getString(R.string.toast_start_failed, e.message), Toast.LENGTH_LONG).show()
             }
         }
 
@@ -152,7 +170,7 @@ class MainActivity : Activity() {
                 val port = etPort.text.toString().trim().toIntOrNull() ?: 1080
                 startTunnel(etHost.text.toString().trim(), port)
             } else {
-                Toast.makeText(this, "未取得 VPN 權限", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, getString(R.string.toast_vpn_denied), Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -164,6 +182,7 @@ class MainActivity : Activity() {
             putExtra(TunSocksService.EXTRA_PORT, port)
             putExtra(TunSocksService.EXTRA_USER, etUser.text.toString().trim())
             putExtra(TunSocksService.EXTRA_PASS, etPass.text.toString().trim())
+            putExtra(TunSocksService.EXTRA_UDP_IN_TCP, cbUdpInTcp.isChecked)
         }
         try {
             if (android.os.Build.VERSION.SDK_INT >= 26) {
@@ -173,8 +192,8 @@ class MainActivity : Activity() {
             }
         } catch (e: Exception) {
             android.util.Log.e("MainActivity", "startForegroundService error", e)
-            DebugLog.recordError("服務啟動失敗：${e.message}")
-            Toast.makeText(this, "服務啟動失敗：${e.message}", Toast.LENGTH_LONG).show()
+            DebugLog.recordError(getString(R.string.toast_service_start_failed, e.message))
+            Toast.makeText(this, getString(R.string.toast_service_start_failed, e.message), Toast.LENGTH_LONG).show()
         }
     }
 

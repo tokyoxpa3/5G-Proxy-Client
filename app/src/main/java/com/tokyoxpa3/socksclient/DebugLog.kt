@@ -26,7 +26,12 @@ object DebugLog {
         handlerInstalled = true
         val original = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            val detail = buildString {
+            val detail = ctx?.let { c ->
+                c.getString(
+                    R.string.debug_crash_detail,
+                    ts(), thread.name, throwable.javaClass.name, throwable.message, throwable.stackTraceToString()
+                )
+            } ?: buildString {
                 appendLine("時間: ${ts()}")
                 appendLine("線程: ${thread.name}")
                 appendLine("類型: ${throwable.javaClass.name}")

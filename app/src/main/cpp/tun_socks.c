@@ -28,7 +28,7 @@
 #define MAX_PACKET_SIZE 4160
 #define MAX_EVENTS 256
 #define TUN_MTU 4096
-#define UDP_IDLE_TIMEOUT_SEC 120
+#define UDP_IDLE_TIMEOUT_SEC 330
 #define HANDSHAKE_TIMEOUT_SEC 10
 #define UDP_HASH_BUCKETS 256
 #define MAX_UDP_SESSIONS 512
@@ -44,9 +44,32 @@ static int g_srv_port = 1080;
 static char g_auth_user[128];
 static char g_auth_pass[128];
 static int g_auth_enabled = 0;
+static int g_udp_in_tcp = 0;    // 1 = UDP relay 走 TCP frame（cmd=0x04 擴充）
 
 static atomic_int g_udp_session_count = 0;
 static atomic_int g_handshake_inflight = 0;
+
+// ---------- 位址抽象（v4 / v6 共用 session 結構） ----------
+
+typedef struct {
+    int family;             // AF_INET / AF_INET6
+    unsigned char ip[16];   // 網路序位址（v4 存前 4 bytes）
+} ip_addr_t;
+
+static int ip_addr_eq(const ip_addr_t *a, const ip_addr_t *b) {
+    return a->family == b->family && memcmp(a->ip, b->ip, 16) == 0;
+}
+
+static uint32_t ip_hash32(const ip_addr_t *a) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 16; i++) { h ^= a->ip[i]; h *= 16777619u; }
+    return h ^ (uint32_t)a->family;
+}
+
+static void ip_to_str(const ip_addr_t *a, char *out, size_t n) {
+    if (a->family == AF_INET6) inet_ntop(AF_INET6, a->ip, out, n);
+    else inet_ntop(AF_INET, a->ip, out, n);
+}
 
 // ---------- TCP 會話（P2） ----------
 
@@ -58,9 +81,9 @@ static atomic_int g_handshake_inflight = 0;
 #define TCP_READ_CHUNK (64 * 1024)
 
 typedef struct tcp_sess {
-    uint32_t src_ip;        // App 端來源 IP（網路序）
+    ip_addr_t src_ip;       // App 端來源 IP（v4/v6）
     uint16_t src_port;      // App 端來源 Port（網路序）
-    uint32_t dst_ip;        // 真實目標 IP（網路序）
+    ip_addr_t dst_ip;       // 真實目標 IP（v4/v6）
     uint16_t dst_port;      // 真實目標 Port（網路序）
     atomic_int srv_fd;      // SOCKS5 CONNECT 的 stream socket（Java protect）
     atomic_int state;       // 0=CONNECT 中 1=就緒
@@ -89,8 +112,8 @@ static atomic_int g_tcp_session_count = 0;
 static int g_kick_pipe[2] = {-1, -1};
 static int g_tun_want_out = 0;
 
-static unsigned tcp_hash_idx(uint32_t ip, uint16_t port) {
-    return ((ip >> 16) ^ ip ^ (uint32_t)port) % TCP_HASH_BUCKETS;
+static unsigned tcp_hash_idx(const ip_addr_t *ip, uint16_t port) {
+    return (ip_hash32(ip) ^ (uint32_t)port) % TCP_HASH_BUCKETS;
 }
 
 static uint32_t tcp_isn_counter = 0;
@@ -99,31 +122,39 @@ static uint32_t next_tcp_isn(void) {
 }
 
 typedef struct udp_sess {
-    uint32_t src_ip;        // App 端來源 IP（網路序）
+    ip_addr_t src_ip;       // App 端來源 IP（v4/v6）
     uint16_t src_port;      // App 端來源 Port（網路序）
     int control_fd;         // 通往伺服器的 TCP 控制連線（Java protect）
-    int relay_fd;           // 伺服器 UDP relay 的 socket（Java protect）
+    int relay_fd;           // 伺服器 UDP relay 的 socket（Java protect）；UDP-in-TCP 時為 -1
     struct sockaddr_in relay_addr;
     int state;              // 0=handshake 中 1=就緒
     int closed;
     time_t last_active;
     unsigned char *pend_data;   // handshake 期間緩衝的首包（避免等 App 重傳）
     uint16_t pend_len;
-    uint32_t pend_ip;           // 首包目標 IP（網路序）
+    ip_addr_t pend_ip;          // 首包目標 IP（v4/v6）
     uint16_t pend_port;         // 首包目標 Port（網路序）
+    // UDP-in-TCP：relay 直接走 control_fd 上的 frame 串流
+    int udp_tcp;                // 1 = 使用 frame-over-TCP relay
+    unsigned char *tx_buf; size_t tx_len, tx_off, tx_cap;   // → server 的待送佇列
+    int tx_armed;               // control_fd 已註冊 EPOLLOUT
+    unsigned char *rx_buf; size_t rx_len, rx_off, rx_cap;   // ← server 的串流緩衝
+    int rx_want;                // -1 = 待讀 2-byte 長度欄；>=0 = 待讀 datagram 長度
     struct udp_sess *next;  // hash chain
 } udp_sess_t;
 
 static udp_sess_t *g_udp_hash[UDP_HASH_BUCKETS];
 static pthread_mutex_t g_udp_hash_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void udp_sess_free_bufs(udp_sess_t *sess);
+
 static void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags != -1) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static unsigned udp_hash_idx(uint32_t ip, uint16_t port) {
-    return ((ip >> 16) ^ ip ^ (uint32_t)port) % UDP_HASH_BUCKETS;
+static unsigned udp_hash_idx(const ip_addr_t *ip, uint16_t port) {
+    return (ip_hash32(ip) ^ (uint32_t)port) % UDP_HASH_BUCKETS;
 }
 
 // ---------- checksum ----------
@@ -152,10 +183,10 @@ static uint16_t checksum16(const unsigned char *data, size_t len) {
     return checksum_finish(accum_swapped(data, len, 0));
 }
 
-static uint16_t tcpudp_checksum(uint32_t saddr, uint32_t daddr, uint8_t proto, const unsigned char *data, size_t len) {
+static uint16_t tcpudp_checksum4(const unsigned char *saddr, const unsigned char *daddr, uint8_t proto, const unsigned char *data, size_t len) {
     unsigned char ph[12];
-    memcpy(ph, &saddr, 4);
-    memcpy(ph + 4, &daddr, 4);
+    memcpy(ph, saddr, 4);
+    memcpy(ph + 4, daddr, 4);
     ph[8] = 0; ph[9] = proto;
     uint16_t l = htons((uint16_t)len);
     memcpy(ph + 10, &l, 2);
@@ -164,21 +195,48 @@ static uint16_t tcpudp_checksum(uint32_t saddr, uint32_t daddr, uint8_t proto, c
     return checksum_finish(sum);
 }
 
+static uint16_t tcpudp_checksum6(const unsigned char *saddr, const unsigned char *daddr, uint8_t proto, const unsigned char *data, size_t len) {
+    unsigned char ph[40];
+    memcpy(ph, saddr, 16);
+    memcpy(ph + 16, daddr, 16);
+    uint32_t l = htonl((uint32_t)len);
+    memcpy(ph + 32, &l, 4);
+    ph[36] = 0; ph[37] = 0; ph[38] = 0; ph[39] = proto;
+    uint32_t sum = accum_swapped(ph, 40, 0);
+    sum = accum_swapped(data, len, sum);
+    return checksum_finish(sum);
+}
+
+static uint16_t transport_checksum(int family, const unsigned char *saddr, const unsigned char *daddr, uint8_t proto, const unsigned char *data, size_t len) {
+    if (family == AF_INET6) return tcpudp_checksum6(saddr, daddr, proto, data, len);
+    return tcpudp_checksum4(saddr, daddr, proto, data, len);
+}
+
 // ---------- TUN 封包處理 ----------
 
-static int parse_ipv4(const unsigned char *pkt, size_t len, uint8_t *proto, uint32_t *saddr, uint32_t *daddr, int *ihl) {
+static int parse_ipv4(const unsigned char *pkt, size_t len, uint8_t *proto, ip_addr_t *saddr, ip_addr_t *daddr, int *ihl) {
     if (len < 20) return -1;
     if ((pkt[0] >> 4) != 4) return -1;
     *ihl = (pkt[0] & 0x0F) * 4;
     if (*ihl < 20 || (size_t)*ihl > len) return -1;
     *proto = pkt[9];
-    memcpy(saddr, pkt + 12, 4);
-    memcpy(daddr, pkt + 16, 4);
+    saddr->family = AF_INET; memcpy(saddr->ip, pkt + 12, 4); memset(saddr->ip + 4, 0, 12);
+    daddr->family = AF_INET; memcpy(daddr->ip, pkt + 16, 4); memset(daddr->ip + 4, 0, 12);
+    return 0;
+}
+
+// 注意：不處理 IPv6 extension header（常見無 ext header 的封包可正常運作）
+static int parse_ipv6(const unsigned char *pkt, size_t len, uint8_t *proto, ip_addr_t *saddr, ip_addr_t *daddr) {
+    if (len < 40) return -1;
+    if ((pkt[0] >> 4) != 6) return -1;
+    *proto = pkt[6];
+    saddr->family = AF_INET6; memcpy(saddr->ip, pkt + 8, 16);
+    daddr->family = AF_INET6; memcpy(daddr->ip, pkt + 24, 16);
     return 0;
 }
 
 // 回覆 App 的 IP 封包（relay 回應 → TUN）
-static void write_ipv4_udp_to_tun(udp_sess_t *sess, uint32_t remote_ip, uint16_t remote_port, const unsigned char *payload, size_t plen) {
+static void write_ipv4_udp_to_tun(udp_sess_t *sess, const ip_addr_t *remote, uint16_t remote_port, const unsigned char *payload, size_t plen) {
     if (plen > TUN_MTU - 28) { LOGE("relay UDP payload 過大 (%zu)，丟棄", plen); return; }
     unsigned char pkt[TUN_MTU];
     size_t total = 20 + 8 + plen;
@@ -190,8 +248,8 @@ static void write_ipv4_udp_to_tun(udp_sess_t *sess, uint32_t remote_ip, uint16_t
     pkt[6] = 0; pkt[7] = 0;
     pkt[8] = 64;
     pkt[9] = 17; // UDP
-    memcpy(pkt + 12, &remote_ip, 4);
-    memcpy(pkt + 16, &sess->src_ip, 4);
+    memcpy(pkt + 12, remote->ip, 4);
+    memcpy(pkt + 16, sess->src_ip.ip, 4);
     pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
     uint16_t csum = checksum16(pkt, 20);
     pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
@@ -203,15 +261,54 @@ static void write_ipv4_udp_to_tun(udp_sess_t *sess, uint32_t remote_ip, uint16_t
     pkt[u + 4] = ulen >> 8; pkt[u + 5] = ulen & 0xFF;
     pkt[u + 6] = 0; pkt[u + 7] = 0;
     memcpy(pkt + u + 8, payload, plen);
-    uint16_t ucsum = tcpudp_checksum(remote_ip, sess->src_ip, 17, pkt + u, 8 + plen);
+    uint16_t ucsum = tcpudp_checksum4(remote->ip, sess->src_ip.ip, 17, pkt + u, 8 + plen);
     pkt[u + 6] = ucsum >> 8; pkt[u + 7] = ucsum & 0xFF;
 
     ssize_t w = write(g_tun_fd, pkt, total);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun failed: %s", strerror(errno));
 }
 
+static void write_ipv6_udp_to_tun(udp_sess_t *sess, const ip_addr_t *remote, uint16_t remote_port, const unsigned char *payload, size_t plen) {
+    if (plen > TUN_MTU - 48) { LOGE("relay UDP payload 過大 (%zu)，丟棄", plen); return; }
+    unsigned char pkt[TUN_MTU];
+    size_t total = 40 + 8 + plen;
+
+    pkt[0] = 0x60;                        // version=6
+    pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;   // traffic class / flow label
+    size_t pl = 8 + plen;
+    pkt[4] = (pl >> 8) & 0xFF; pkt[5] = pl & 0xFF;   // payload length
+    pkt[6] = 17;                          // next header = UDP
+    pkt[7] = 64;                          // hop limit
+    memcpy(pkt + 8, remote->ip, 16);
+    memcpy(pkt + 24, sess->src_ip.ip, 16);
+
+    size_t u = 40;
+    memcpy(pkt + u, &remote_port, 2);
+    memcpy(pkt + u + 2, &sess->src_port, 2);
+    uint16_t ulen = (uint16_t)(8 + plen);
+    pkt[u + 4] = ulen >> 8; pkt[u + 5] = ulen & 0xFF;
+    pkt[u + 6] = 0; pkt[u + 7] = 0;
+    memcpy(pkt + u + 8, payload, plen);
+    uint16_t ucsum = tcpudp_checksum6(remote->ip, sess->src_ip.ip, 17, pkt + u, 8 + plen);
+    pkt[u + 6] = ucsum >> 8; pkt[u + 7] = ucsum & 0xFF;
+
+    ssize_t w = write(g_tun_fd, pkt, total);
+    if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun failed: %s", strerror(errno));
+}
+
+static void write_udp_to_tun(udp_sess_t *sess, const ip_addr_t *remote, uint16_t remote_port, const unsigned char *payload, size_t plen) {
+    if (remote->family != sess->src_ip.family) { LOGE("relay 回應 family 不符，丟棄"); return; }
+    if (sess->src_ip.family == AF_INET6) write_ipv6_udp_to_tun(sess, remote, remote_port, payload, plen);
+    else write_ipv4_udp_to_tun(sess, remote, remote_port, payload, plen);
+}
+
 // P1：TCP 一律回 RST|ACK，讓 App 立即收到連線失敗（Phase 2 才實作 TCP 隧道）
-static void send_tcp_rst(uint32_t saddr, uint32_t daddr, const unsigned char *tcp, size_t tlen) {
+static ssize_t write_tcp_to_tun(const ip_addr_t *saddr, const ip_addr_t *daddr,
+                                uint16_t sport, uint16_t dport,
+                                uint32_t seq, uint32_t ack, uint8_t flags,
+                                const unsigned char *payload, size_t plen);
+
+static void send_tcp_rst(const ip_addr_t *src, const ip_addr_t *dst, const unsigned char *tcp, size_t tlen) {
     if (tlen < 20) return;
     uint16_t sport, dport;
     uint32_t seq;
@@ -225,60 +322,128 @@ static void send_tcp_rst(uint32_t saddr, uint32_t daddr, const unsigned char *tc
     if (tcp_hlen < 20 || tlen < (size_t)tcp_hlen) return;
     size_t payload = tlen - tcp_hlen;
     uint32_t ack_host = seq_host + (uint32_t)(payload + ((flags & 0x02) ? 1 : 0));
-    uint32_t ack = htonl(ack_host);                      // host 序 → 網路序
-
-    unsigned char rst[TUN_MTU];
-    size_t total = 20 + 20;
-    rst[0] = 0x45;
-    rst[1] = 0;
-    rst[2] = (total >> 8) & 0xFF; rst[3] = total & 0xFF;
-    rst[4] = 0; rst[5] = 0;
-    rst[6] = 0; rst[7] = 0;
-    rst[8] = 64;
-    rst[9] = 6; // TCP
-    memcpy(rst + 12, &daddr, 4);
-    memcpy(rst + 16, &saddr, 4);
-    rst[10] = 0; rst[11] = 0;   // checksum 欄位先歸零
-    uint16_t csum = checksum16(rst, 20);
-    rst[10] = csum >> 8; rst[11] = csum & 0xFF;
-
-    size_t u = 20;
-    memcpy(rst + u, &dport, 2);
-    memcpy(rst + u + 2, &sport, 2);
-    uint32_t zero = 0;
-    memcpy(rst + u + 4, &zero, 4);
-    memcpy(rst + u + 8, &ack, 4);
-    rst[u + 12] = 0x50;
-    rst[u + 13] = 0x14; // RST|ACK
-    rst[u + 14] = 0; rst[u + 15] = 0;
-    rst[u + 16] = 0; rst[u + 17] = 0;   // checksum 欄位先歸零
-    rst[u + 18] = 0; rst[u + 19] = 0;
-    uint16_t tcsum = tcpudp_checksum(daddr, saddr, 6, rst + u, 20);
-    rst[u + 16] = tcsum >> 8; rst[u + 17] = tcsum & 0xFF;
-
-    ssize_t w = write(g_tun_fd, rst, total);
-    if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun RST failed: %s", strerror(errno));
+    // 回應方向：src←(dst_ip, dst_port)，seq=0, ack=對應值
+    write_tcp_to_tun(dst, src, dport, sport, 0, ack_host, 0x14, NULL, 0);
 }
 
 // ---------- UDP 會話 ----------
 
-static void forward_udp_to_server(udp_sess_t *sess, uint32_t dst_ip, uint16_t dst_port, const unsigned char *payload, size_t plen) {
-    unsigned char frame[10 + MAX_PACKET_SIZE];
+static void handle_relay_udp(udp_sess_t *sess, const unsigned char *buf, ssize_t len);
+
+// UDP-in-TCP：將一整個 frame（長度欄 + SOCKS5 datagram）加入送出佇列。
+// 只在「未 arm EPOLLOUT」時才觸發第一次，避免重複 MOD。
+static void udp_tcp_append(udp_sess_t *sess, const unsigned char *frame, size_t flen) {
+    if (sess->tx_len + flen > sess->tx_cap) {
+        LOGE("udp-in-tcp tx 佇列滿，丟棄 datagram");
+        return;
+    }
+    if (sess->tx_len == 0) sess->tx_off = 0;
+    memcpy(sess->tx_buf + sess->tx_off + sess->tx_len, frame, flen);
+    sess->tx_len += flen;
+    if (!sess->tx_armed) {
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR;
+        ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, sess->control_fd, &ev) == 0) sess->tx_armed = 1;
+    }
+}
+
+// 排空送出佇列；回傳 <0 = 連線已死
+static int udp_tcp_flush(udp_sess_t *sess) {
+    while (sess->tx_len > 0) {
+        ssize_t n = send(sess->control_fd, sess->tx_buf + sess->tx_off, sess->tx_len, MSG_NOSIGNAL);
+        if (n > 0) {
+            sess->tx_off += (size_t)n;
+            sess->tx_len -= (size_t)n;
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
+        } else {
+            return -1;
+        }
+    }
+    if (sess->tx_len == 0) {
+        sess->tx_off = 0;
+        if (sess->tx_armed) {
+            struct epoll_event ev;
+            ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR;
+            ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
+            if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, sess->control_fd, &ev) == 0) sess->tx_armed = 0;
+        }
+    }
+    return 0;
+}
+
+// 從 control_fd 讀入並解析 frames；回傳 <0 = 連線已死
+static int udp_tcp_read(udp_sess_t *sess) {
+    // 1. 讀入可用位元組
+    for (;;) {
+        if (sess->rx_len == 0) sess->rx_off = 0;
+        size_t space = sess->rx_cap - sess->rx_off - sess->rx_len;
+        if (space == 0) return -1; // frame 長度欄異常（>rx_cap）→ 協定違規
+        ssize_t n = recv(sess->control_fd, sess->rx_buf + sess->rx_off + sess->rx_len, space, 0);
+        if (n > 0) {
+            sess->rx_len += (size_t)n;
+            continue;
+        }
+        if (n == 0) return -1; // EOF
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        return -1;
+    }
+    // 2. 解析 frames
+    for (;;) {
+        if (sess->rx_want < 0) {
+            if (sess->rx_len < 2) break;
+            int L = (sess->rx_buf[sess->rx_off] << 8) | sess->rx_buf[sess->rx_off + 1];
+            if (L < 4 || L > (int)sess->rx_cap) return -1;
+            sess->rx_off += 2;
+            sess->rx_len -= 2;
+            sess->rx_want = L;
+        }
+        if ((size_t)sess->rx_want > sess->rx_len) break;
+        handle_relay_udp(sess, sess->rx_buf + sess->rx_off, sess->rx_want);
+        sess->rx_off += sess->rx_want;
+        sess->rx_len -= sess->rx_want;
+        sess->rx_want = -1;
+    }
+    if (sess->rx_len == 0) sess->rx_off = 0;
+    return 0;
+}
+
+static void forward_udp_to_server(udp_sess_t *sess, const ip_addr_t *dst, uint16_t dst_port, const unsigned char *payload, size_t plen) {
+    unsigned char frame[2 + 22 + MAX_PACKET_SIZE];
     if (plen > MAX_PACKET_SIZE) plen = MAX_PACKET_SIZE;
-    memset(frame, 0, 4);
-    frame[3] = 0x01; // ATYP IPv4
-    memcpy(frame + 4, &dst_ip, 4);
-    memcpy(frame + 8, &dst_port, 2);
-    memcpy(frame + 10, payload, plen);
-    ssize_t sent = sendto(sess->relay_fd, frame, 10 + plen, MSG_NOSIGNAL,
-                          (struct sockaddr *)&sess->relay_addr, sizeof(sess->relay_addr));
-    if (sent < 0) LOGE("relay sendto 失敗: %s", strerror(errno));
+    size_t off = 2;
+    memset(frame + 2, 0, 4);
+    if (dst->family == AF_INET6) {
+        frame[2 + 3] = 0x04; // ATYP IPv6
+        memcpy(frame + 2 + 4, dst->ip, 16);
+        memcpy(frame + 2 + 20, &dst_port, 2);
+        off = 2 + 22;
+    } else {
+        frame[2 + 3] = 0x01; // ATYP IPv4
+        memcpy(frame + 2 + 4, dst->ip, 4);
+        memcpy(frame + 2 + 8, &dst_port, 2);
+        off = 2 + 10;
+    }
+    memcpy(frame + off, payload, plen);
+    int datalen = (int)(off - 2 + plen);
+    frame[0] = (unsigned char)(datalen >> 8);
+    frame[1] = (unsigned char)(datalen & 0xFF);
+
+    if (sess->udp_tcp) {
+        // UDP-in-TCP：frame 直接進控制連線的送出佇列
+        udp_tcp_append(sess, frame, 2 + (size_t)datalen);
+    } else {
+        ssize_t sent = sendto(sess->relay_fd, frame + 2, (size_t)datalen, MSG_NOSIGNAL,
+                              (struct sockaddr *)&sess->relay_addr, sizeof(sess->relay_addr));
+        if (sent < 0) LOGE("relay sendto 失敗: %s", strerror(errno));
+    }
 }
 
 static void *udp_session_thread(void *arg);
 
-static void handle_tun_udp(const unsigned char *pkt, size_t len, int ihl, uint32_t src_ip, uint32_t dst_ip) {
-    size_t u = ihl;
+static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const ip_addr_t *src_ip, const ip_addr_t *dst_ip) {
+    size_t u = t;
     if (u + 8 > len) return;
     uint16_t sport, dport, ulen;
     memcpy(&sport, pkt + u, 2);
@@ -295,12 +460,12 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, int ihl, uint32
     int created = 0;
     pthread_mutex_lock(&g_udp_hash_lock);
     for (udp_sess_t *s = g_udp_hash[idx]; s; s = s->next) {
-        if (s->src_ip == src_ip && s->src_port == sport && !s->closed) { sess = s; break; }
+        if (ip_addr_eq(&s->src_ip, src_ip) && s->src_port == sport && !s->closed) { sess = s; break; }
     }
     if (!sess && atomic_load(&g_udp_session_count) < MAX_UDP_SESSIONS) {
         sess = calloc(1, sizeof(udp_sess_t));
         if (sess) {
-            sess->src_ip = src_ip;
+            sess->src_ip = *src_ip;
             sess->src_port = sport;
             sess->control_fd = -1;
             sess->relay_fd = -1;
@@ -316,9 +481,9 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, int ihl, uint32
     if (!sess) return;
 
     if (created) {
-        char b1[16], b2[16];
-        strcpy(b1, inet_ntoa(*(struct in_addr *)&src_ip));
-        strcpy(b2, inet_ntoa(*(struct in_addr *)&dst_ip));
+        char b1[64], b2[64];
+        ip_to_str(src_ip, b1, sizeof b1);
+        ip_to_str(dst_ip, b2, sizeof b2);
         LOGI("udp session 建立 src=%s:%d dst=%s:%d",
              b1, ntohs(sport), b2, ntohs(dport));
         // 首次封包：啟動 handshake 線程；同時緩衝此封包，完成後立即轉發（不用等 App 重傳）
@@ -328,15 +493,15 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, int ihl, uint32
             if (sess->pend_data) {
                 memcpy(sess->pend_data, pkt + u + 8, payload_len);
                 sess->pend_len = (uint16_t)payload_len;
-                sess->pend_ip = dst_ip;
+                sess->pend_ip = *dst_ip;
                 sess->pend_port = dport;
             }
         }
-        pthread_t t;
+        pthread_t th;
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        int rc = pthread_create(&t, &attr, udp_session_thread, sess);
+        int rc = pthread_create(&th, &attr, udp_session_thread, sess);
         pthread_attr_destroy(&attr);
         if (rc != 0) {
             // 線程建立失敗：移除會話，避免永久卡在 connecting
@@ -347,7 +512,7 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, int ihl, uint32
                 *pp = sess->next;
                 sess->closed = 1;
                 pthread_mutex_unlock(&g_udp_hash_lock);
-                free(sess->pend_data);
+                udp_sess_free_bufs(sess);
                 free(sess);
                 atomic_fetch_sub(&g_udp_session_count, 1);
             } else {
@@ -365,7 +530,7 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, int ihl, uint32
             if (sess->pend_data) {
                 memcpy(sess->pend_data, pkt + u + 8, payload_len);
                 sess->pend_len = (uint16_t)payload_len;
-                sess->pend_ip = dst_ip;
+                sess->pend_ip = *dst_ip;
                 sess->pend_port = dport;
             }
         }
@@ -393,6 +558,13 @@ static int recv_all(int fd, unsigned char *buf, size_t len) {
         off += (size_t)n;
     }
     return 0;
+}
+
+// 釋放 session 的動態緩衝（pend / udp-in-tcp 收發佇列）；呼叫者仍需 free(sess)
+static void udp_sess_free_bufs(udp_sess_t *sess) {
+    if (sess->pend_data) { free(sess->pend_data); sess->pend_data = NULL; }
+    if (sess->tx_buf) { free(sess->tx_buf); sess->tx_buf = NULL; }
+    if (sess->rx_buf) { free(sess->rx_buf); sess->rx_buf = NULL; }
 }
 
 // 每當 App 送出第一個 UDP 封包，為該 (src_ip, src_port) 建立 SOCKS5 UDP 會話
@@ -433,29 +605,69 @@ static void *udp_session_thread(void *arg) {
 
     // 3. UDP ASSOCIATE
     unsigned char req[10] = {0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
-    if (send_all(cfd, req, 10) < 0) goto fail;
-    if (recv_all(cfd, buf, 4) < 0) goto fail;
-    if (buf[0] != 0x05 || buf[1] != 0x00) goto fail;
-    int atyp = buf[3];
-    if (atyp == 0x01) {
-        if (recv_all(cfd, buf, 6) < 0) goto fail;
-        relay.sin_family = AF_INET;
-        memcpy(&relay.sin_addr, buf, 4);
-        memcpy(&relay.sin_port, buf + 4, 2);
+    int udp_tcp = 0;
+    if (g_udp_in_tcp) {
+        // 先嘗試 UDP-in-TCP（自訂擴充指令 0x04）
+        req[1] = 0x04;
+        if (send_all(cfd, req, 10) < 0) goto fail;
+        if (recv_all(cfd, buf, 4) < 0) goto fail;
+        if (buf[0] != 0x05) goto fail;
+        if (buf[1] == 0x00) {
+            // 伺服器支援：relay 就是這條 TCP 連線，吃掉 BND.ADDR/PORT 即可
+            int atyp_r = buf[3];
+            if (atyp_r == 0x01) {
+                if (recv_all(cfd, buf, 6) < 0) goto fail;
+            } else if (atyp_r == 0x04) {
+                if (recv_all(cfd, buf, 18) < 0) goto fail;
+            } else {
+                goto fail;
+            }
+            udp_tcp = 1;
+        } else {
+            // 伺服器不支援 0x04：同一連線退回標準 UDP ASSOCIATE（0x03）
+            LOGI("伺服器不支援 UDP-in-TCP (REP=%d)，退回 UDP-in-UDP", buf[1]);
+            req[1] = 0x03;
+            if (send_all(cfd, req, 10) < 0) goto fail;
+            if (recv_all(cfd, buf, 4) < 0) goto fail;
+            if (buf[0] != 0x05 || buf[1] != 0x00) goto fail;
+        }
     } else {
-        // P1：只支援 IPv4 relay 位址（自家伺服器固定回 v4）
-        LOGE("UDP ASSOCIATE 回覆 ATYP=%d 不支援", atyp);
-        goto fail;
+        if (send_all(cfd, req, 10) < 0) goto fail;
+        if (recv_all(cfd, buf, 4) < 0) goto fail;
+        if (buf[0] != 0x05 || buf[1] != 0x00) goto fail;
     }
 
-    // 4. UDP relay socket（Java protect，未 connect，由 sendto 指定目標）
-    rfd = request_java_socket(g_srv_host, g_srv_port, 1);
-    if (rfd < 0) goto fail;
-    if (!g_running) goto fail;
+    if (!udp_tcp) {
+        int atyp = buf[3];
+        if (atyp == 0x01) {
+            if (recv_all(cfd, buf, 6) < 0) goto fail;
+            relay.sin_family = AF_INET;
+            memcpy(&relay.sin_addr, buf, 4);
+            memcpy(&relay.sin_port, buf + 4, 2);
+        } else {
+            // P1：只支援 IPv4 relay 位址（自家伺服器固定回 v4）
+            LOGE("UDP ASSOCIATE 回覆 ATYP=%d 不支援", atyp);
+            goto fail;
+        }
+
+        // 4. UDP relay socket（Java protect，未 connect，由 sendto 指定目標）
+        rfd = request_java_socket(g_srv_host, g_srv_port, 1);
+        if (rfd < 0) goto fail;
+        if (!g_running) goto fail;
+        set_nonblocking(rfd);
+    } else {
+        // UDP-in-TCP：初始化 frame 串流的收發緩衝
+        sess->udp_tcp = 1;
+        sess->tx_cap = 65536;
+        sess->tx_buf = malloc(sess->tx_cap);
+        sess->rx_cap = 8192;
+        sess->rx_buf = malloc(sess->rx_cap);
+        sess->rx_want = -1;
+        if (!sess->tx_buf || !sess->rx_buf) goto fail;
+    }
 
     if (!g_running) goto fail;
     set_nonblocking(cfd);
-    set_nonblocking(rfd);
     sess->control_fd = cfd;
     sess->relay_fd = rfd;
     sess->relay_addr = relay;
@@ -467,44 +679,55 @@ static void *udp_session_thread(void *arg) {
     // 注意：epoll_data 是 union，data.fd 與 data.ptr 共用記憶體。
     // 因此把 fd 號碼存進 data.fd 後，讀 data.ptr 會得到垃圾指標；
     // 改用「指標低 bit」區分事件來源：control 存原指標，relay 存指標|1。
-    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR; ev.data.ptr = sess;
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
-    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP; ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, rfd, &ev) < 0) { epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, cfd, NULL); goto fail; }
+    if (udp_tcp) {
+        // UDP-in-TCP：control_fd 兼任 relay，以 tag=1 註冊
+        ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR; ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
+    } else {
+        ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR; ev.data.ptr = sess;
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
+        ev.events = EPOLLIN | EPOLLERR | EPOLLHUP; ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, rfd, &ev) < 0) { epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, cfd, NULL); goto fail; }
+    }
 
     // 立即轉發 handshake 期間緩衝的首包（不需等 App 重傳）
     pthread_mutex_lock(&g_udp_hash_lock);
     unsigned char *pd = sess->pend_data;
     size_t pl = sess->pend_len;
-    uint32_t pip = sess->pend_ip;
+    ip_addr_t pip = sess->pend_ip;
     uint16_t pport = sess->pend_port;
     sess->pend_data = NULL;
     sess->pend_len = 0;
     pthread_mutex_unlock(&g_udp_hash_lock);
     if (pd) {
-        forward_udp_to_server(sess, pip, pport, pd, pl);
+        forward_udp_to_server(sess, &pip, pport, pd, pl);
         free(pd);
     }
 
     atomic_fetch_sub(&g_handshake_inflight, 1);
-    LOGI("udp handshake 完成: relay=%s:%d", inet_ntoa(relay.sin_addr), ntohs(relay.sin_port));
+    if (udp_tcp) LOGI("udp handshake 完成: UDP-in-TCP (relay 走同一 TCP)");
+    else LOGI("udp handshake 完成: relay=%s:%d", inet_ntoa(relay.sin_addr), ntohs(relay.sin_port));
     jni_detach_thread();
     return NULL;
 
 fail:
-    LOGI("udp handshake 失敗 (src=%s:%d)", inet_ntoa(*(struct in_addr *)&sess->src_ip), ntohs(sess->src_port));
+    {
+        char b1[64];
+        ip_to_str(&sess->src_ip, b1, sizeof b1);
+        LOGI("udp handshake 失敗 (src=%s:%d)", b1, ntohs(sess->src_port));
+    }
     if (cfd >= 0) { release_java_socket(cfd); close(cfd); }
     if (rfd >= 0) { release_java_socket(rfd); close(rfd); }
     // 從 hash 移除並釋放（誰 unlink 誰 free，避免雙重釋放）
     pthread_mutex_lock(&g_udp_hash_lock);
-    unsigned idx = udp_hash_idx(sess->src_ip, sess->src_port);
+    unsigned idx = udp_hash_idx(&sess->src_ip, sess->src_port);
     udp_sess_t **pp = &g_udp_hash[idx];
     while (*pp && *pp != sess) pp = &(*pp)->next;
     if (*pp) {
         *pp = sess->next;
         sess->closed = 1;
         pthread_mutex_unlock(&g_udp_hash_lock);
-        free(sess->pend_data);
+        udp_sess_free_bufs(sess);
         free(sess);
         atomic_fetch_sub(&g_udp_session_count, 1);
     } else {
@@ -517,17 +740,26 @@ fail:
 
 // relay 回應 → 還原成 IP 封包寫回 TUN
 static void handle_relay_udp(udp_sess_t *sess, const unsigned char *buf, ssize_t len) {
-    if (len < 10) return;
+    if (len < 4) return;
     int atyp = buf[3];
     if (atyp == 0x01) {
-        uint32_t remote;
+        if (len < 10) return;
+        ip_addr_t remote = { .family = AF_INET };
+        memcpy(remote.ip, buf + 4, 4);
         uint16_t rport;
-        memcpy(&remote, buf + 4, 4);
         memcpy(&rport, buf + 8, 2);
         size_t plen = (size_t)len - 10;
-        write_ipv4_udp_to_tun(sess, remote, rport, buf + 10, plen);
+        write_udp_to_tun(sess, &remote, rport, buf + 10, plen);
+    } else if (atyp == 0x04) {
+        if (len < 22) return;
+        ip_addr_t remote = { .family = AF_INET6 };
+        memcpy(remote.ip, buf + 4, 16);
+        uint16_t rport;
+        memcpy(&rport, buf + 20, 2);
+        size_t plen = (size_t)len - 22;
+        write_udp_to_tun(sess, &remote, rport, buf + 22, plen);
     } else {
-        // P1：domain / IPv6 回應丟棄
+        // domain 回應丟棄
     }
 }
 
@@ -550,27 +782,40 @@ static void close_session_fds(udp_sess_t *sess) {
 
 // 送出 TCP 封包給 App（以 App 觀點：saddr/daddr 為 IP 位址，sport/dport 為埠）
 // seq/ack 以 host byte order 傳入，內部轉網路序寫出
-static ssize_t write_tcp_to_tun(uint32_t saddr, uint32_t daddr,
+static ssize_t write_tcp_to_tun(const ip_addr_t *saddr, const ip_addr_t *daddr,
                                 uint16_t sport, uint16_t dport,
                                 uint32_t seq, uint32_t ack, uint8_t flags,
                                 const unsigned char *payload, size_t plen) {
-    if (20 + 20 + plen > TUN_MTU) { LOGE("tcp 封包過大 (%zu)，丟棄", plen); return -1; }
+    int is6 = (saddr->family == AF_INET6);
+    size_t ip_hlen = is6 ? 40 : 20;
+    if (ip_hlen + 20 + plen > TUN_MTU) { LOGE("tcp 封包過大 (%zu)，丟棄", plen); return -1; }
     unsigned char pkt[TUN_MTU];
-    size_t total = 20 + 20 + plen;
+    size_t total = ip_hlen + 20 + plen;
 
-    pkt[0] = 0x45; pkt[1] = 0;
-    pkt[2] = (total >> 8) & 0xFF; pkt[3] = total & 0xFF;
-    pkt[4] = 0; pkt[5] = 0;
-    pkt[6] = 0; pkt[7] = 0;
-    pkt[8] = 64;
-    pkt[9] = 6;
-    memcpy(pkt + 12, &saddr, 4);
-    memcpy(pkt + 16, &daddr, 4);
-    pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
-    uint16_t csum = checksum16(pkt, 20);
-    pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
+    if (is6) {
+        pkt[0] = 0x60;
+        pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;
+        size_t pl = 20 + plen;
+        pkt[4] = (pl >> 8) & 0xFF; pkt[5] = pl & 0xFF;
+        pkt[6] = 6;
+        pkt[7] = 64;
+        memcpy(pkt + 8, saddr->ip, 16);
+        memcpy(pkt + 24, daddr->ip, 16);
+    } else {
+        pkt[0] = 0x45; pkt[1] = 0;
+        pkt[2] = (total >> 8) & 0xFF; pkt[3] = total & 0xFF;
+        pkt[4] = 0; pkt[5] = 0;
+        pkt[6] = 0; pkt[7] = 0;
+        pkt[8] = 64;
+        pkt[9] = 6;
+        memcpy(pkt + 12, saddr->ip, 4);
+        memcpy(pkt + 16, daddr->ip, 4);
+        pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
+        uint16_t csum = checksum16(pkt, 20);
+        pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
+    }
 
-    size_t u = 20;
+    size_t u = ip_hlen;
     memcpy(pkt + u, &sport, 2);
     memcpy(pkt + u + 2, &dport, 2);
     uint32_t seq_n = htonl(seq);
@@ -583,7 +828,7 @@ static ssize_t write_tcp_to_tun(uint32_t saddr, uint32_t daddr,
     pkt[u + 16] = 0; pkt[u + 17] = 0;
     pkt[u + 18] = 0; pkt[u + 19] = 0;
     if (plen) memcpy(pkt + u + 20, payload, plen);
-    uint16_t tcsum = tcpudp_checksum(saddr, daddr, 6, pkt + u, 20 + plen);
+    uint16_t tcsum = transport_checksum(saddr->family, saddr->ip, daddr->ip, 6, pkt + u, 20 + plen);
     pkt[u + 16] = tcsum >> 8; pkt[u + 17] = tcsum & 0xFF;
 
     ssize_t w = write(g_tun_fd, pkt, total);
@@ -593,21 +838,35 @@ static ssize_t write_tcp_to_tun(uint32_t saddr, uint32_t daddr,
 
 static void send_tcp_synack(tcp_sess_t *sess) {
     if (g_tun_fd < 0) return;
+    int is6 = (sess->src_ip.family == AF_INET6);
+    size_t ip_hlen = is6 ? 40 : 20;
     unsigned char pkt[TUN_MTU];
-    size_t total = 20 + 32;                     // 20 IP + 32 TCP（MSS + WS 選項）
-    pkt[0] = 0x45; pkt[1] = 0;
-    pkt[2] = (total >> 8) & 0xFF; pkt[3] = total & 0xFF;
-    pkt[4] = 0; pkt[5] = 0;
-    pkt[6] = 0; pkt[7] = 0;
-    pkt[8] = 64;
-    pkt[9] = 6;
-    memcpy(pkt + 12, &sess->dst_ip, 4);
-    memcpy(pkt + 16, &sess->src_ip, 4);
-    pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
-    uint16_t csum = checksum16(pkt, 20);
-    pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
+    size_t total = ip_hlen + 32;                     // 32-byte TCP（MSS + WS 選項）
 
-    size_t u = 20;
+    if (is6) {
+        pkt[0] = 0x60;
+        pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;
+        size_t pl = 32;
+        pkt[4] = (pl >> 8) & 0xFF; pkt[5] = pl & 0xFF;
+        pkt[6] = 6;
+        pkt[7] = 64;
+        memcpy(pkt + 8, sess->dst_ip.ip, 16);
+        memcpy(pkt + 24, sess->src_ip.ip, 16);
+    } else {
+        pkt[0] = 0x45; pkt[1] = 0;
+        pkt[2] = (total >> 8) & 0xFF; pkt[3] = total & 0xFF;
+        pkt[4] = 0; pkt[5] = 0;
+        pkt[6] = 0; pkt[7] = 0;
+        pkt[8] = 64;
+        pkt[9] = 6;
+        memcpy(pkt + 12, sess->dst_ip.ip, 4);
+        memcpy(pkt + 16, sess->src_ip.ip, 4);
+        pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
+        uint16_t csum = checksum16(pkt, 20);
+        pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
+    }
+
+    size_t u = ip_hlen;
     memcpy(pkt + u, &sess->dst_port, 2);
     memcpy(pkt + u + 2, &sess->src_port, 2);
     uint32_t isn_n = htonl(sess->srv_isn);
@@ -620,13 +879,13 @@ static void send_tcp_synack(tcp_sess_t *sess) {
     pkt[u + 16] = 0; pkt[u + 17] = 0;   // checksum 欄位先歸零
     pkt[u + 18] = 0; pkt[u + 19] = 0;
     pkt[u + 20] = 0x02; pkt[u + 21] = 0x04;   // kind=2(MSS) len=4
-    uint16_t mss = htons((uint16_t)(TUN_MTU - 40));
-    memcpy(pkt + u + 22, &mss, 2);            // MSS=TUN_MTU-40
+    uint16_t mss = htons((uint16_t)(TUN_MTU - (is6 ? 60 : 40)));
+    memcpy(pkt + u + 22, &mss, 2);            // MSS 依 family 調整（v6 多 20 bytes header）
     pkt[u + 24] = 0x01; pkt[u + 25] = 0x01;   // NOP NOP
     pkt[u + 26] = 0x03; pkt[u + 27] = 0x03;   // kind=3(WS) len=3
     pkt[u + 28] = 0x0A;                        // shift=10（與 App 提議相同）
     pkt[u + 29] = 0; pkt[u + 30] = 0; pkt[u + 31] = 0;
-    uint16_t tcsum = tcpudp_checksum(sess->dst_ip, sess->src_ip, 6, pkt + u, 32);
+    uint16_t tcsum = transport_checksum(sess->src_ip.family, sess->dst_ip.ip, sess->src_ip.ip, 6, pkt + u, 32);
     pkt[u + 16] = tcsum >> 8; pkt[u + 17] = tcsum & 0xFF;
 
     ssize_t w = write(g_tun_fd, pkt, total);
@@ -635,17 +894,17 @@ static void send_tcp_synack(tcp_sess_t *sess) {
 }
 
 static void send_tcp_ack(tcp_sess_t *sess) {
-    write_tcp_to_tun(sess->dst_ip, sess->src_ip, sess->dst_port, sess->src_port,
+    write_tcp_to_tun(&sess->dst_ip, &sess->src_ip, sess->dst_port, sess->src_port,
                      sess->srv_next, sess->app_next, 0x10, NULL, 0);
 }
 
 static void send_tcp_fin(tcp_sess_t *sess) {
-    write_tcp_to_tun(sess->dst_ip, sess->src_ip, sess->dst_port, sess->src_port,
+    write_tcp_to_tun(&sess->dst_ip, &sess->src_ip, sess->dst_port, sess->src_port,
                      sess->srv_next, sess->app_next, 0x11, NULL, 0);
 }
 
 static void send_session_rst(tcp_sess_t *sess) {
-    write_tcp_to_tun(sess->dst_ip, sess->src_ip, sess->dst_port, sess->src_port,
+    write_tcp_to_tun(&sess->dst_ip, &sess->src_ip, sess->dst_port, sess->src_port,
                      0, sess->app_next, 0x14, NULL, 0);
 }
 
@@ -701,7 +960,7 @@ static void tcp_session_destroy(tcp_sess_t *sess) {
         close(fd);
         atomic_store(&sess->srv_fd, -1);
     }
-    unsigned idx = tcp_hash_idx(sess->src_ip, sess->src_port);
+    unsigned idx = tcp_hash_idx(&sess->src_ip, sess->src_port);
     tcp_sess_t **pp = &g_tcp_hash[idx];
     while (*pp && *pp != sess) pp = &(*pp)->next;
     if (*pp) *pp = sess->next;
@@ -756,11 +1015,12 @@ static void set_tun_epoll_out(int enable) {
 // server→App：把緩衝的資料切成 TCP segment 寫回 TUN
 static void flush_tcp_srv_buf(tcp_sess_t *sess) {
     while (sess->srv_len > 0) {
+        size_t seg_max = (sess->src_ip.family == AF_INET6) ? (TUN_MTU - 60) : (TUN_MTU - 40);
         size_t chunk = sess->srv_len;
-        if (chunk > TUN_MTU - 40) chunk = TUN_MTU - 40;
+        if (chunk > seg_max) chunk = seg_max;
         // 流量控制：App 通告 window 已滿 → 暫停送出，等 App ACK 開窗
         if (sess->srv_next - sess->app_acked >= sess->app_win) break;
-        ssize_t w = write_tcp_to_tun(sess->dst_ip, sess->src_ip, sess->dst_port, sess->src_port,
+        ssize_t w = write_tcp_to_tun(&sess->dst_ip, &sess->src_ip, sess->dst_port, sess->src_port,
                                      sess->srv_next, sess->app_next, 0x18,
                                      sess->srv_buf + sess->srv_off, chunk);
         if (w < 0) { set_tun_epoll_out(1); return; }
@@ -877,10 +1137,19 @@ static void *tcp_connect_thread(void *arg) {
         goto fail;
     }
 
-    unsigned char req[10] = {0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
-    memcpy(req + 4, &sess->dst_ip, 4);
-    memcpy(req + 8, &sess->dst_port, 2);
-    if (net_send_all(sfd, req, 10) < 0) goto fail;
+    unsigned char req[22] = {0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+    int req_len;
+    if (sess->dst_ip.family == AF_INET6) {
+        req[3] = 0x04; // ATYP IPv6
+        memcpy(req + 4, sess->dst_ip.ip, 16);
+        memcpy(req + 20, &sess->dst_port, 2);
+        req_len = 22;
+    } else {
+        memcpy(req + 4, sess->dst_ip.ip, 4);
+        memcpy(req + 8, &sess->dst_port, 2);
+        req_len = 10;
+    }
+    if (net_send_all(sfd, req, req_len) < 0) goto fail;
     if (net_recv_all(sfd, buf, 4) < 0) goto fail;
     if (buf[0] != 0x05 || buf[1] != 0x00) goto fail;
     int atyp = buf[3];
@@ -907,13 +1176,16 @@ static void *tcp_connect_thread(void *arg) {
         goto fail;
     }
     if (g_kick_pipe[1] >= 0) { char k = 1; write(g_kick_pipe[1], &k, 1); }
-    LOGI("tcp connect 完成 -> %s:%d", inet_ntoa(*(struct in_addr *)&sess->dst_ip), ntohs(sess->dst_port));
+    char b1[64];
+    ip_to_str(&sess->dst_ip, b1, sizeof b1);
+    LOGI("tcp connect 完成 -> %s:%d", b1, ntohs(sess->dst_port));
     atomic_fetch_sub(&g_handshake_inflight, 1);
     jni_detach_thread();
     return NULL;
 
 fail:
-    LOGI("tcp connect 失敗 -> %s:%d", inet_ntoa(*(struct in_addr *)&sess->dst_ip), ntohs(sess->dst_port));
+    ip_to_str(&sess->dst_ip, b1, sizeof b1);
+    LOGI("tcp connect 失敗 -> %s:%d", b1, ntohs(sess->dst_port));
     if (sfd >= 0) { release_java_socket(sfd); close(sfd); }
     if (g_tun_fd >= 0) send_session_rst(sess);
     atomic_store(&sess->handshake_failed, 1);
@@ -924,9 +1196,8 @@ fail:
 }
 
 // 處理來自 TUN 的 TCP 封包（P2 TCP 狀態機）
-static void handle_tun_tcp(const unsigned char *pkt, size_t len, int ihl,
-                           uint32_t src_ip, uint32_t dst_ip) {
-    size_t t = (size_t)ihl;
+static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
+                           const ip_addr_t *src_ip, const ip_addr_t *dst_ip) {
     if (t + 20 > len) return;
     uint16_t sport, dport;
     uint32_t seq;
@@ -946,7 +1217,7 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, int ihl,
     unsigned idx = tcp_hash_idx(src_ip, sport);
     tcp_sess_t *sess = NULL;
     for (tcp_sess_t *s = g_tcp_hash[idx]; s; s = s->next) {
-        if (s->src_ip == src_ip && s->src_port == sport && !s->closed) { sess = s; break; }
+        if (ip_addr_eq(&s->src_ip, src_ip) && s->src_port == sport && !s->closed) { sess = s; break; }
     }
 
     if (!sess) {
@@ -957,8 +1228,8 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, int ihl,
         }
         sess = calloc(1, sizeof(tcp_sess_t));
         if (!sess) return;
-        sess->src_ip = src_ip; sess->src_port = sport;
-        sess->dst_ip = dst_ip; sess->dst_port = dport;
+        sess->src_ip = *src_ip; sess->src_port = sport;
+        sess->dst_ip = *dst_ip; sess->dst_port = dport;
         atomic_store(&sess->srv_fd, -1);
         sess->app_isn = seq_host;
         sess->app_next = seq_host + 1;
@@ -979,9 +1250,9 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, int ihl,
         g_tcp_hash[idx] = sess;
         atomic_fetch_add(&g_tcp_session_count, 1);
 
-        char b1[16], b2[16];
-        strcpy(b1, inet_ntoa(*(struct in_addr *)&src_ip));
-        strcpy(b2, inet_ntoa(*(struct in_addr *)&dst_ip));
+        char b1[64], b2[64];
+        ip_to_str(src_ip, b1, sizeof b1);
+        ip_to_str(dst_ip, b2, sizeof b2);
         LOGI("tcp session 建立 src=%s:%d -> dst=%s:%d",
              b1, ntohs(sport), b2, ntohs(dport));
         send_tcp_synack(sess);
@@ -998,7 +1269,7 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, int ihl,
     if (atomic_load(&sess->handshake_failed)) {
         if ((flags & 0x02) && !(flags & 0x10)) {
             close_tcp_session(sess, 0);                    // 取代失敗的舊會話
-            handle_tun_tcp(pkt, len, ihl, src_ip, dst_ip);
+            handle_tun_tcp(pkt, len, t, src_ip, dst_ip);
         }
         return;
     }
@@ -1017,8 +1288,10 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, int ihl,
     }
 
     if (flags & 0x04) {                                    // RST
+        char b1[64];
+        ip_to_str(src_ip, b1, sizeof b1);
         LOGI("tcp RST from app state=%d %s:%d", atomic_load(&sess->state),
-             inet_ntoa(*(struct in_addr *)&src_ip), ntohs(sport));
+             b1, ntohs(sport));
         close_tcp_session(sess, 0);
         return;
     }
@@ -1168,17 +1441,27 @@ static void handle_tun_packet(const unsigned char *pkt, size_t len) {
     int ver = pkt[0] >> 4;
     if (ver == 4) {
         uint8_t proto;
-        uint32_t saddr, daddr;
+        ip_addr_t saddr, daddr;
         int ihl;
         if (parse_ipv4(pkt, len, &proto, &saddr, &daddr, &ihl) < 0) return;
         if (proto == 17) {
-            handle_tun_udp(pkt, len, ihl, saddr, daddr);
+            handle_tun_udp(pkt, len, (size_t)ihl, &saddr, &daddr);
         } else if (proto == 6) {
-            handle_tun_tcp(pkt, len, ihl, saddr, daddr);
+            handle_tun_tcp(pkt, len, (size_t)ihl, &saddr, &daddr);
         }
         return;
     }
-    // P1：IPv6 封包丟棄
+    if (ver == 6) {
+        uint8_t proto;
+        ip_addr_t saddr, daddr;
+        if (parse_ipv6(pkt, len, &proto, &saddr, &daddr) < 0) return;
+        if (proto == 17) {
+            handle_tun_udp(pkt, len, 40, &saddr, &daddr);
+        } else if (proto == 6) {
+            handle_tun_tcp(pkt, len, 40, &saddr, &daddr);
+        }
+        return;
+    }
 }
 
 static void read_tun_packets(void) {
@@ -1242,12 +1525,22 @@ static void *engine_loop(void *arg) {
                 // 控制通道握手後不應有流量；任何事件（含 FIN）皆視為斷線
                 fatal = 1;
             } else if (!fatal && is_relay) {
-                unsigned char buf[MAX_PACKET_SIZE + 64];
-                ssize_t r = recvfrom(sess->relay_fd, buf, sizeof buf, 0, NULL, NULL);
-                if (r > 0) {
-                    handle_relay_udp(sess, buf, r);
-                } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    fatal = 1;
+                if (sess->udp_tcp) {
+                    // UDP-in-TCP：cfd 同時是控制與 relay
+                    if (ev & EPOLLOUT) {
+                        if (udp_tcp_flush(sess) < 0) fatal = 1;
+                    }
+                    if (!fatal && (ev & EPOLLIN)) {
+                        if (udp_tcp_read(sess) < 0) fatal = 1;
+                    }
+                } else {
+                    unsigned char buf[MAX_PACKET_SIZE + 64];
+                    ssize_t r = recvfrom(sess->relay_fd, buf, sizeof buf, 0, NULL, NULL);
+                    if (r > 0) {
+                        handle_relay_udp(sess, buf, r);
+                    } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        fatal = 1;
+                    }
                 }
             }
 
@@ -1255,13 +1548,13 @@ static void *engine_loop(void *arg) {
                 pthread_mutex_lock(&g_udp_hash_lock);
                 if (!sess->closed) {
                     sess->closed = 1;
-                    unsigned idx = udp_hash_idx(sess->src_ip, sess->src_port);
+                    unsigned idx = udp_hash_idx(&sess->src_ip, sess->src_port);
                     udp_sess_t **pp = &g_udp_hash[idx];
                     while (*pp && *pp != sess) pp = &(*pp)->next;
                     if (*pp) *pp = sess->next;
                     pthread_mutex_unlock(&g_udp_hash_lock);
                     close_session_fds(sess);
-                    free(sess->pend_data);
+                    udp_sess_free_bufs(sess);
                     free(sess);
                     atomic_fetch_sub(&g_udp_session_count, 1);
                 } else {
@@ -1293,7 +1586,7 @@ static void *engine_loop(void *arg) {
             pthread_mutex_unlock(&g_udp_hash_lock);
             for (int i = 0; i < gc; i++) {
                 close_session_fds(garbage[i]);
-                free(garbage[i]->pend_data);
+                udp_sess_free_bufs(garbage[i]);
                 free(garbage[i]);
                 atomic_fetch_sub(&g_udp_session_count, 1);
             }
@@ -1343,6 +1636,7 @@ shutdown:
     while (to_close) {
         udp_sess_t *n = to_close->next;
         close_session_fds(to_close);
+        udp_sess_free_bufs(to_close);
         free(to_close);
         to_close = n;
     }
@@ -1368,7 +1662,7 @@ shutdown:
 
 // ---------- 對外介面 ----------
 
-int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass) {
+int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass, int udp_in_tcp) {
     if (g_running) return -1;
 
     g_tun_fd = tun_fd;
@@ -1378,6 +1672,7 @@ int tun_socks_start(int tun_fd, const char *host, int port, const char *user, co
     g_auth_enabled = (user && user[0]) || (pass && pass[0]);
     strncpy(g_auth_user, user ? user : "", sizeof(g_auth_user) - 1);
     strncpy(g_auth_pass, pass ? pass : "", sizeof(g_auth_pass) - 1);
+    g_udp_in_tcp = udp_in_tcp ? 1 : 0;
 
     set_nonblocking(g_tun_fd);
 

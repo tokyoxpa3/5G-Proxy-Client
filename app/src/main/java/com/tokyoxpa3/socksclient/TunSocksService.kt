@@ -40,12 +40,13 @@ class TunSocksService : VpnService() {
         const val EXTRA_PORT = "TUNNEL_PORT"
         const val EXTRA_USER = "TUNNEL_USER"
         const val EXTRA_PASS = "TUNNEL_PASS"
+        const val EXTRA_UDP_IN_TCP = "TUNNEL_UDP_IN_TCP"
 
         @Volatile
         var isRunning = false
 
         @Volatile
-        var lastStatus = "未啟動"
+        var lastStatus = ""
     }
 
     private val activeSockets = ConcurrentHashMap<Int, Any>()
@@ -57,6 +58,7 @@ class TunSocksService : VpnService() {
         super.onCreate()
         isRunning = false
         DebugLog.init(this)
+        lastStatus = getString(R.string.status_not_started)
         createNotificationChannel()
         NativeEngine.onSocketClosed = { fd ->
             val socket = activeSockets.remove(fd)
@@ -91,11 +93,12 @@ class TunSocksService : VpnService() {
         val port = intent?.getIntExtra(EXTRA_PORT, 1080) ?: 1080
         val user = intent?.getStringExtra(EXTRA_USER)?.trim().orEmpty()
         val pass = intent?.getStringExtra(EXTRA_PASS)?.trim().orEmpty()
+        val udpInTcp = intent?.getBooleanExtra(EXTRA_UDP_IN_TCP, false) ?: false
         if (host.isEmpty() || port <= 0 || port > 65535) {
-            fail("參數錯誤：請檢查伺服器位址與連接埠")
+            fail(getString(R.string.err_bad_params))
             return
         }
-        Log.i(TAG, "startTunnel called: host=$host port=$port user=$user")
+        Log.i(TAG, "startTunnel called: host=$host port=$port user=$user udpInTcp=$udpInTcp")
 
         try {
             // 一進服務就進入前台，避免 startForegroundService 5 秒限制
@@ -105,16 +108,16 @@ class TunSocksService : VpnService() {
                 android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             )
 
-            publishStatus("解析伺服器位址…")
+            publishStatus(getString(R.string.status_resolving))
             // 必須在 VPN 建立前解析，避免自己的 DNS 查詢被隧道捕捉
             val serverIp = try {
                 InetAddress.getByName(host).hostAddress
             } catch (e: Exception) {
-                fail("無法解析伺服器位址：${e.message}")
+                fail(getString(R.string.err_resolve_host, e.message))
                 return
             }
             if (serverIp == null) {
-                fail("無法解析伺服器位址：$host")
+                fail(getString(R.string.err_resolve_host, host))
                 return
             }
             Log.d(TAG, "Server resolved to $serverIp")
@@ -123,31 +126,47 @@ class TunSocksService : VpnService() {
             builder.setSession(getString(R.string.app_name))
             builder.setMtu(4096)
             builder.addAddress("10.8.0.2", 32)
+            builder.addAddress("fd00::2", 128)
             builder.addRoute("0.0.0.0", 0)
             builder.addRoute("::", 0)
             builder.addDnsServer("8.8.8.8")
             builder.addDnsServer("1.1.1.1")
 
+            // Per-App 模式：被勾選的 App 走手機本機網路（繞過隧道）
+            getSharedPreferences("tunnel_config", MODE_PRIVATE)
+                .getStringSet(AppListActivity.KEY_EXCLUDED, emptySet())
+                ?.forEach { pkg ->
+                    if (pkg.isNotBlank()) {
+                        try {
+                            builder.addDisallowedApplication(pkg)
+                            Log.d(TAG, "Excluding app from tunnel: $pkg")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "addDisallowedApplication($pkg) failed: ${e.message}")
+                        }
+                    }
+                }
+
             val tunFd = builder.establish()
             if (tunFd == null) {
-                fail("VPN 建立失敗（未授權？）")
+                fail(getString(R.string.err_vpn_establish))
                 return
             }
 
             NativeEngine.socketProvider = { h, p, isUdp -> createProtectedSocket(h, p, isUdp) }
             NativeEngine.registerInstance()
             Log.d(TAG, "Calling native startTunnel")
-            val result = NativeEngine.startTunnel(tunFd.detachFd(), serverIp, port, user, pass)
+            val result = NativeEngine.startTunnel(tunFd.detachFd(), serverIp, port, user, pass, udpInTcp)
             Log.d(TAG, "native startTunnel result: $result")
 
             isRunning = true
-            publishStatus("✅ 隧道已啟用 ($host:$port)")
+            publishStatus(getString(R.string.status_tunnel_active, host, port))
             val nm = getSystemService(NotificationManager::class.java)
             nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.notification_running)))
         } catch (e: Exception) {
             Log.e(TAG, "startTunnel failed", e)
-            DebugLog.recordError("啟動失敗：${e.message}")
-            fail("啟動失敗：${e.message}")
+            val msg = getString(R.string.err_start, e.message)
+            DebugLog.recordError(msg)
+            fail(msg)
         }
     }
 
@@ -159,7 +178,7 @@ class TunSocksService : VpnService() {
     }
 
     private fun stopTunnel() {
-        publishStatus("正在停止…")
+        publishStatus(getString(R.string.status_stopping))
         serviceScope.launch {
             try {
                 NativeEngine.stopTunnel()
@@ -176,7 +195,7 @@ class TunSocksService : VpnService() {
             }
             activeSockets.clear()
             isRunning = false
-            publishStatus("已停止")
+            publishStatus(getString(R.string.status_stopped))
             try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (e: Exception) {}
             stopSelf()
         }

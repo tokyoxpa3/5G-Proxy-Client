@@ -42,6 +42,6 @@ object NativeEngine {
         onSocketClosed?.invoke(fd)
     }
 
-    external fun startTunnel(fd: Int, host: String, port: Int, user: String, pass: String): String
+    external fun startTunnel(fd: Int, host: String, port: Int, user: String, pass: String, udpInTcp: Boolean): String
     external fun stopTunnel(): String
 }

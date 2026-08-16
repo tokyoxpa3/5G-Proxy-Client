@@ -1,8 +1,58 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">5G Proxy Client</string>
-    <string name="notification_channel_name">隧道狀態</string>
-    <string name="notification_connecting">連線中…</string>
-    <string name="notification_running">隧道已啟用</string>
-    <string name="notification_stopped">已停止</string>
+
+    <!-- Notifications -->
+    <string name="notification_channel_name">Tunnel Status</string>
+    <string name="notification_connecting">Connecting…</string>
+    <string name="notification_running">Tunnel active</string>
+    <string name="notification_stopped">Stopped</string>
+
+    <!-- Status -->
+    <string name="status_not_started">Not started</string>
+    <string name="status_resolving">Resolving server address…</string>
+    <string name="status_tunnel_active">✅ Tunnel active (%1$s:%2$d)</string>
+    <string name="status_stopping">Stopping…</string>
+    <string name="status_stopped">Stopped</string>
+
+    <!-- Last crash / error -->
+    <string name="last_crash_prefix">⚠️ Last crash:\n%1$s</string>
+    <string name="last_error_prefix">⚠️ Last error:\n%1$s</string>
+
+    <!-- Input hints -->
+    <string name="hint_host">Server IP (e.g. 192.168.1.100)</string>
+    <string name="hint_port">Port (e.g. 1080)</string>
+    <string name="hint_user">Username (optional)</string>
+    <string name="hint_pass">Password (optional)</string>
+
+    <!-- Buttons -->
+    <string name="btn_start_tunnel">🚀 Start Tunnel</string>
+    <string name="btn_stop_tunnel">🛑 Stop Tunnel</string>
+    <string name="btn_select_apps">🚫 Excluded Apps</string>
+
+    <!-- App list -->
+    <string name="applist_title">Excluded Apps</string>
+    <string name="applist_hint">Checked apps use the phone\'s direct network (bypass the tunnel).</string>
+
+    <!-- Section labels -->
+    <string name="label_server">SOCKS5 Server</string>
+    <string name="label_auth">Authentication (optional)</string>
+    <string name="label_udp_in_tcp">UDP relay over TCP (UDP-in-TCP)</string>
+
+    <!-- Toasts -->
+    <string name="toast_invalid_input">Please enter a valid server address and port</string>
+    <string name="toast_starting">Starting tunnel…</string>
+    <string name="toast_allow_vpn">Please allow the VPN connection in the system dialog</string>
+    <string name="toast_start_failed">Start failed: %1$s</string>
+    <string name="toast_vpn_denied">VPN permission not granted</string>
+    <string name="toast_service_start_failed">Service start failed: %1$s</string>
+
+    <!-- Errors -->
+    <string name="err_bad_params">Invalid parameters: please check the server address and port</string>
+    <string name="err_resolve_host">Failed to resolve server address: %1$s</string>
+    <string name="err_vpn_establish">VPN setup failed (not authorized?)</string>
+    <string name="err_start">Start failed: %1$s</string>
+
+    <!-- Debug log -->
+    <string name="debug_crash_detail">Time: %1$s\nThread: %2$s\nType: %3$s\nMessage: %4$s\nStack:\n%5$s</string>
 </resources>
