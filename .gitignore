@@ -6,6 +6,8 @@ app/build/
 # Build logs
 build_log.txt
 build_err.txt
+build_rel_log.txt
+build_rel_err.txt
 
 # Local configuration file (sdk.dir)
 local.properties
