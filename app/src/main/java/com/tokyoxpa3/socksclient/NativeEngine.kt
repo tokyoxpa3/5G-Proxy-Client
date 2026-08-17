@@ -16,7 +16,8 @@ object NativeEngine {
             System.loadLibrary("socksclient")
             libraryLoaded = true
             Log.d(TAG, "Native library loaded successfully")
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // UnsatisfiedLinkError 是 Error 不是 Exception——不接住會直接閃退
             Log.e(TAG, "Failed to load native library: ${e.message}")
             libraryLoaded = false
         }

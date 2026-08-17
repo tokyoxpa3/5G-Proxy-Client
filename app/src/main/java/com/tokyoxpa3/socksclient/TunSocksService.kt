@@ -152,6 +152,12 @@ class TunSocksService : VpnService() {
                 return
             }
 
+            // native lib 載入失敗（如 16KB page 裝置未對齊）時，直接報錯而不是崩潰
+            if (!NativeEngine.isLibraryLoaded()) {
+                fail(getString(R.string.err_native_lib))
+                return
+            }
+
             NativeEngine.socketProvider = { h, p, isUdp -> createProtectedSocket(h, p, isUdp) }
             NativeEngine.registerInstance()
             Log.d(TAG, "Calling native startTunnel")
@@ -276,7 +282,11 @@ class TunSocksService : VpnService() {
     private fun publishStatus(text: String) {
         lastStatus = text
         Log.i(TAG, "Status: $text")
-        sendBroadcast(Intent(ACTION_STATUS).putExtra("status", text))
+        // RECEIVER_NOT_EXPORTED 的 receiver 只收「顯式（setPackage）intent」，
+        // 不加 package 在 Android 14+ 收不到
+        sendBroadcast(
+            Intent(ACTION_STATUS).setPackage(packageName).putExtra("status", text)
+        )
     }
 
     override fun onDestroy() {

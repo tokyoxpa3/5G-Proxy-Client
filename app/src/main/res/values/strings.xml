@@ -51,6 +51,7 @@
     <string name="err_bad_params">Invalid parameters: please check the server address and port</string>
     <string name="err_resolve_host">Failed to resolve server address: %1$s</string>
     <string name="err_vpn_establish">VPN setup failed (not authorized?)</string>
+    <string name="err_native_lib">Native engine failed to load on this device</string>
     <string name="err_start">Start failed: %1$s</string>
 
     <!-- Debug log -->

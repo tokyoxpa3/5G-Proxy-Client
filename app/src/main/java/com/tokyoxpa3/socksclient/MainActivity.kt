@@ -51,7 +51,13 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        registerReceiver(statusReceiver, IntentFilter(TunSocksService.ACTION_STATUS))
+        // Android 14+ (targetSdk 34)：context-registered receiver 必須指定 export flag，
+        // 否則 SecurityException 直接崩潰（小米 Pad Mini / Android 15 上閃退的主因）
+        registerReceiver(
+            statusReceiver,
+            IntentFilter(TunSocksService.ACTION_STATUS),
+            Context.RECEIVER_NOT_EXPORTED
+        )
         updateStatus(TunSocksService.lastStatus)
     }
 

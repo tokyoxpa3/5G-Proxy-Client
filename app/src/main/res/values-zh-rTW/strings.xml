@@ -46,6 +46,7 @@
     <string name="err_bad_params">參數錯誤：請檢查伺服器位址與連接埠</string>
     <string name="err_resolve_host">無法解析伺服器位址：%1$s</string>
     <string name="err_vpn_establish">VPN 建立失敗（未授權？）</string>
+    <string name="err_native_lib">此裝置無法載入原生引擎</string>
     <string name="err_start">啟動失敗：%1$s</string>
 
     <!-- Debug log -->
