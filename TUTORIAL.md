@@ -12,9 +12,6 @@
 | **Server 端** | 5G Proxy Pro（`com.tokyoxpa3.androidproxy`） | 小米手機 192.168.1.178 | 鎖定 5G 網路，在 Wi-Fi 內網開 SOCKS5 代理 |
 | **Client 端** | 5G Proxy Client（`com.tokyoxpa3.socksclient`） | 三星手機 192.168.1.192 | 建立 TUN 隧道，把全部流量導向 Server 的代理 |
 
-> 重要：`192.168.1.178:35577` 與 `192.168.1.192:39013` 是**遠端 ADB 控制埠**（供開發者用 adb 操作手機），**不是**代理連接埠！
-> 代理連接埠由 5G Proxy Pro App 內的「代理端口」設定（預設 **1080**），請以 App 畫面上顯示的「Wi-Fi 代理」為準。
-
 ### 整體架構
 
 ![整體架構](docs/figures/fig1_architecture.png)
@@ -47,7 +44,6 @@
 ![Server 初始畫面](docs/shots/server_initial_annotated.png)
 
 1. **代理端口**：設為要對外提供的埠（預設 `1080`；本教學沿用 `1080`）
-   - 不要使用 35577 / 39013（那是遠端 ADB 用的埠）
 2. **使用者 / 密碼**：兩欄都留空 = 開放代理；**兩欄都填**才會啟用認證（RFC 1929）
 3. 點 **「🚀 一鍵開啟 5G 代理」**
 
