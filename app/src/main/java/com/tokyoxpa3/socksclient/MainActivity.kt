@@ -39,6 +39,7 @@ class MainActivity : Activity() {
     private lateinit var etDns2: EditText
     private lateinit var etProfileName: EditText
     private lateinit var cbUdpInTcp: CheckBox
+    private lateinit var cbRemoteDns: CheckBox
     private lateinit var cbAutoStart: CheckBox
     private lateinit var modeGroup: RadioGroup
     private lateinit var btnToggle: Button
@@ -176,6 +177,10 @@ class MainActivity : Activity() {
             text = getString(R.string.label_udp_in_tcp)
             setPadding(0, 8, 0, 0)
         }
+        cbRemoteDns = CheckBox(this).apply {
+            text = getString(R.string.label_remote_dns)
+            setPadding(0, 8, 0, 0)
+        }
         cbAutoStart = CheckBox(this).apply {
             text = getString(R.string.label_auto_start)
             setPadding(0, 8, 0, 0)
@@ -220,6 +225,7 @@ class MainActivity : Activity() {
         root.addView(btnToggle)
         root.addView(label(getString(R.string.label_other)))
         root.addView(cbUdpInTcp)
+        root.addView(cbRemoteDns)
         root.addView(cbAutoStart)
         root.addView(label(getString(R.string.label_profiles)))
         root.addView(etProfileName)
@@ -241,6 +247,7 @@ class MainActivity : Activity() {
         etDns1.setText(prefs.getString("dns1", "8.8.8.8"))
         etDns2.setText(prefs.getString("dns2", "1.1.1.1"))
         cbUdpInTcp.isChecked = prefs.getBoolean("udp_in_tcp", false)
+        cbRemoteDns.isChecked = prefs.getBoolean("remote_dns", false)
         cbAutoStart.isChecked = prefs.getBoolean("auto_start", false)
         // 勾選/取消當下立即存檔，確保重開機使用最新設定（不必等到按下「啟動」）
         cbAutoStart.setOnCheckedChangeListener { _, checked ->
@@ -288,6 +295,7 @@ class MainActivity : Activity() {
                 .putString(Config.KEY_DNS1, dns1)
                 .putString(Config.KEY_DNS2, dns2)
                 .putBoolean(Config.KEY_UDP_IN_TCP, cbUdpInTcp.isChecked)
+                .putBoolean(Config.KEY_REMOTE_DNS, cbRemoteDns.isChecked)
                 .putBoolean(Config.KEY_AUTO_START, cbAutoStart.isChecked)
                 .putInt(Config.KEY_MODE, modeGroup.checkedRadioButtonId)
                 .apply()
@@ -339,6 +347,7 @@ class MainActivity : Activity() {
             putExtra(TunSocksService.EXTRA_USER, etUser.text.toString().trim())
             putExtra(TunSocksService.EXTRA_PASS, etPass.text.toString().trim())
             putExtra(TunSocksService.EXTRA_UDP_IN_TCP, cbUdpInTcp.isChecked)
+            putExtra(TunSocksService.EXTRA_REMOTE_DNS, cbRemoteDns.isChecked)
         }
         try {
             if (android.os.Build.VERSION.SDK_INT >= 26) {
@@ -366,6 +375,7 @@ class MainActivity : Activity() {
                     etDns1.setText(p.dns1)
                     etDns2.setText(p.dns2)
                     cbUdpInTcp.isChecked = p.udpInTcp
+                    cbRemoteDns.isChecked = p.remoteDns
                     modeGroup.check(p.mode)
                     etProfileName.setText(p.name)
                 }
@@ -404,6 +414,7 @@ class MainActivity : Activity() {
         user = etUser.text.toString().trim(),
         pass = etPass.text.toString().trim(),
         udpInTcp = cbUdpInTcp.isChecked,
+        remoteDns = cbRemoteDns.isChecked,
         dns1 = etDns1.text.toString().trim(),
         dns2 = etDns2.text.toString().trim(),
         mode = modeGroup.checkedRadioButtonId

@@ -16,17 +16,17 @@ jobject g_native_engine_instance = NULL;
 static jmethodID g_mid_createSocket = NULL;
 static jmethodID g_mid_notifyClosed = NULL;
 
-extern int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass, int udp_in_tcp);
+extern int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass, int udp_in_tcp, int remote_dns);
 extern void tun_socks_stop(void);
 
 static pthread_t g_tunnel_thread;
 static int g_tunnel_running = 0;
 
-typedef struct { int fd; char host[256]; int port; char user[128]; char pass[128]; int udp_in_tcp; } TunnelArgs;
+typedef struct { int fd; char host[256]; int port; char user[128]; char pass[128]; int udp_in_tcp; int remote_dns; } TunnelArgs;
 
 static void *tunnel_thread_func(void *arg) {
     TunnelArgs *args = (TunnelArgs *)arg;
-    tun_socks_start(args->fd, args->host, args->port, args->user, args->pass, args->udp_in_tcp);
+    tun_socks_start(args->fd, args->host, args->port, args->user, args->pass, args->udp_in_tcp, args->remote_dns);
     free(args);
     // 注意：不可在此清 g_tunnel_running，否則 stop 會 join 不到本線程
     return NULL;
@@ -98,7 +98,7 @@ JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
     g_mid_notifyClosed = (*env)->GetMethodID(env, cls, "notifySocketClosed", "(I)V");
 }
 
-JNIEXPORT jstring JNICALL native_start_tunnel(JNIEnv *env, jobject thiz, jint fd, jstring host, jint port, jstring user, jstring pass, jboolean udp_in_tcp) {
+JNIEXPORT jstring JNICALL native_start_tunnel(JNIEnv *env, jobject thiz, jint fd, jstring host, jint port, jstring user, jstring pass, jboolean udp_in_tcp, jboolean remote_dns) {
     if (g_tunnel_running) return (*env)->NewStringUTF(env, "Already running");
 
     TunnelArgs *args = calloc(1, sizeof(TunnelArgs));
@@ -106,6 +106,7 @@ JNIEXPORT jstring JNICALL native_start_tunnel(JNIEnv *env, jobject thiz, jint fd
     args->fd = (int)fd;
     args->port = (int)port;
     args->udp_in_tcp = udp_in_tcp ? 1 : 0;
+    args->remote_dns = remote_dns ? 1 : 0;
 
     const char *chost = host ? (*env)->GetStringUTFChars(env, host, NULL) : NULL;
     const char *cuser = user ? (*env)->GetStringUTFChars(env, user, NULL) : NULL;
@@ -138,7 +139,7 @@ JNIEXPORT jstring JNICALL native_stop_tunnel(JNIEnv *env, jobject thiz) {
 
 static const JNINativeMethod gMethods[] = {
     {"nativeRegisterInstance", "()V", (void *)native_register_instance},
-    {"startTunnel", "(ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Z)Ljava/lang/String;", (void *)native_start_tunnel},
+    {"startTunnel", "(ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;ZZ)Ljava/lang/String;", (void *)native_start_tunnel},
     {"stopTunnel", "()Ljava/lang/String;", (void *)native_stop_tunnel},
 };
 

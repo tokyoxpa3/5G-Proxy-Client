@@ -54,6 +54,7 @@
     <string name="label_auth">認證（可選）</string>
     <string name="label_dns">DNS（可選）</string>
     <string name="label_udp_in_tcp">UDP relay 走 TCP（UDP-in-TCP）</string>
+    <string name="label_remote_dns">Remote DNS（由伺服器端解析網域）</string>
     <string name="label_mode">隧道模式</string>
     <string name="label_mode_global">🌐 全局（所有流量）</string>
     <string name="label_mode_allowlist">🎯 指定 App（僅勾選者走隧道）</string>

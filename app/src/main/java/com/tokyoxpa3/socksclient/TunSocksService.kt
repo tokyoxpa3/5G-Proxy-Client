@@ -45,6 +45,7 @@ class TunSocksService : VpnService() {
         const val EXTRA_USER = "TUNNEL_USER"
         const val EXTRA_PASS = "TUNNEL_PASS"
         const val EXTRA_UDP_IN_TCP = "TUNNEL_UDP_IN_TCP"
+        const val EXTRA_REMOTE_DNS = "TUNNEL_REMOTE_DNS"
         const val EXTRA_BOOT_START = "TUNNEL_BOOT_START"
 
         private const val BACKGROUND_RETRY_DELAY_MS = 10_000L
@@ -129,12 +130,14 @@ class TunSocksService : VpnService() {
         var user = intent?.getStringExtra(EXTRA_USER)?.trim().orEmpty()
         var pass = intent?.getStringExtra(EXTRA_PASS)?.trim().orEmpty()
         var udpInTcp = intent?.getBooleanExtra(EXTRA_UDP_IN_TCP, false) ?: false
+        var remoteDns = intent?.getBooleanExtra(EXTRA_REMOTE_DNS, false) ?: false
         if (host.isEmpty()) {
             host = prefs.getString(Config.KEY_HOST, "") ?: ""
             port = prefs.getString(Config.KEY_PORT, "1080")?.toIntOrNull() ?: 1080
             user = prefs.getString(Config.KEY_USER, "") ?: ""
             pass = prefs.getString(Config.KEY_PASS, "") ?: ""
             udpInTcp = prefs.getBoolean(Config.KEY_UDP_IN_TCP, false)
+            remoteDns = prefs.getBoolean(Config.KEY_REMOTE_DNS, false)
             Log.i(TAG, "Using saved config: host=$host port=$port")
         }
         if (host.isEmpty() || port <= 0 || port > 65535) {
@@ -149,9 +152,10 @@ class TunSocksService : VpnService() {
             .putString(Config.KEY_USER, user)
             .putString(Config.KEY_PASS, pass)
             .putBoolean(Config.KEY_UDP_IN_TCP, udpInTcp)
+            .putBoolean(Config.KEY_REMOTE_DNS, remoteDns)
             .apply()
 
-        Log.i(TAG, "startTunnel: host=$host port=$port user=$user udpInTcp=$udpInTcp")
+        Log.i(TAG, "startTunnel: host=$host port=$port user=$user udpInTcp=$udpInTcp remoteDns=$remoteDns")
 
         try {
             // 一進服務就進入前台，避免 startForegroundService 5 秒限制
@@ -234,7 +238,7 @@ class TunSocksService : VpnService() {
             NativeEngine.socketProvider = { h, p, isUdp -> createProtectedSocket(h, p, isUdp) }
             NativeEngine.registerInstance()
             Log.d(TAG, "Calling native startTunnel")
-            val result = NativeEngine.startTunnel(tunFd.detachFd(), serverIp, port, user, pass, udpInTcp)
+            val result = NativeEngine.startTunnel(tunFd.detachFd(), serverIp, port, user, pass, udpInTcp, remoteDns)
             Log.d(TAG, "native startTunnel result: $result")
 
             isRunning = true

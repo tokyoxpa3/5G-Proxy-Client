@@ -54,6 +54,7 @@
     <string name="label_auth">Authentication (optional)</string>
     <string name="label_dns">DNS (optional)</string>
     <string name="label_udp_in_tcp">UDP relay over TCP (UDP-in-TCP)</string>
+    <string name="label_remote_dns">Remote DNS (resolve domains on proxy server)</string>
     <string name="label_mode">Tunnel Mode</string>
     <string name="label_mode_global">🌐 Global (all traffic)</string>
     <string name="label_mode_allowlist">🎯 Per-App (only checked apps)</string>

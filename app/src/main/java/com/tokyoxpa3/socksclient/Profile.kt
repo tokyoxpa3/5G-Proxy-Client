@@ -10,6 +10,7 @@ data class Profile(
     val user: String,
     val pass: String,
     val udpInTcp: Boolean,
+    val remoteDns: Boolean,
     val dns1: String,
     val dns2: String,
     val mode: Int
@@ -21,6 +22,7 @@ data class Profile(
         put("user", user)
         put("pass", pass)
         put("udp_in_tcp", udpInTcp)
+        put("remote_dns", remoteDns)
         put("dns1", dns1)
         put("dns2", dns2)
         put("mode", mode)
@@ -34,6 +36,7 @@ data class Profile(
             user = o.optString("user", ""),
             pass = o.optString("pass", ""),
             udpInTcp = o.optBoolean("udp_in_tcp", false),
+            remoteDns = o.optBoolean("remote_dns", false),
             dns1 = o.optString("dns1", "8.8.8.8"),
             dns2 = o.optString("dns2", "1.1.1.1"),
             mode = o.optInt("mode", Config.MODE_GLOBAL)

@@ -15,6 +15,7 @@ object Config {
     const val KEY_USER = "user"
     const val KEY_PASS = "pass"
     const val KEY_UDP_IN_TCP = "udp_in_tcp"
+    const val KEY_REMOTE_DNS = "remote_dns"
     const val KEY_DNS1 = "dns1"
     const val KEY_DNS2 = "dns2"
     const val KEY_MODE = "tunnel_mode"      // 0=global 1=allowlist 2=exclude
