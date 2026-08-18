@@ -41,9 +41,7 @@ class MainActivity : Activity() {
     private lateinit var cbUdpInTcp: CheckBox
     private lateinit var cbAutoStart: CheckBox
     private lateinit var modeGroup: RadioGroup
-    private lateinit var btnStart: Button
-    private lateinit var btnStop: Button
-    private lateinit var btnRestart: Button
+    private lateinit var btnToggle: Button
     private lateinit var btnSelectApps: Button
     private lateinit var btnSaveProfile: Button
     private lateinit var btnDeleteProfile: Button
@@ -153,14 +151,15 @@ class MainActivity : Activity() {
         }
         etProfileName = EditText(this).apply { hint = getString(R.string.hint_profile_name) }
 
-        btnStart = Button(this).apply { text = getString(R.string.btn_start_tunnel) }
-        btnStop = Button(this).apply {
-            text = getString(R.string.btn_stop_tunnel)
-            isEnabled = false
-        }
-        btnRestart = Button(this).apply {
-            text = getString(R.string.btn_restart_tunnel)
-            isEnabled = false
+        btnToggle = Button(this).apply {
+            text = getString(R.string.btn_start_tunnel)
+            setOnClickListener {
+                if (TunSocksService.isRunning) {
+                    startService(Config.stopIntent(this@MainActivity))
+                } else {
+                    attemptStart()
+                }
+            }
         }
         btnSelectApps = Button(this).apply {
             text = getString(R.string.btn_select_apps)
@@ -216,10 +215,9 @@ class MainActivity : Activity() {
         root.addView(etPass)
         root.addView(label(getString(R.string.label_mode)))
         root.addView(modeGroup)
-        root.addView(btnStart)
-        root.addView(btnStop)
-        root.addView(btnRestart)
+        // App 按鈕貼近「僅排除以下 App」選項
         root.addView(btnSelectApps)
+        root.addView(btnToggle)
         root.addView(label(getString(R.string.label_other)))
         root.addView(cbUdpInTcp)
         root.addView(cbAutoStart)
@@ -250,15 +248,9 @@ class MainActivity : Activity() {
         }
         modeGroup.check(prefs.getInt("tunnel_mode", Config.MODE_GLOBAL))
 
-        btnStart.setOnClickListener { attemptStart() }
-
-        btnStop.setOnClickListener {
-            startService(Config.stopIntent(this))
-        }
-
-        btnRestart.setOnClickListener {
+        btnToggle.setOnClickListener {
             if (TunSocksService.isRunning) {
-                startService(Config.startIntent(this, restart = true))
+                startService(Config.stopIntent(this))
             } else {
                 attemptStart()
             }
@@ -448,9 +440,8 @@ class MainActivity : Activity() {
 
     private fun updateStatus(text: String?) {
         tvStatus.text = text ?: ""
+        // 啟動/停止共用單一按鈕：執行中顯示「停止隧道」，停止時顯示「啟動隧道」
         val running = TunSocksService.isRunning
-        btnStart.isEnabled = !running
-        btnStop.isEnabled = running
-        btnRestart.isEnabled = running
+        btnToggle.text = getString(if (running) R.string.btn_stop_tunnel else R.string.btn_start_tunnel)
     }
 }

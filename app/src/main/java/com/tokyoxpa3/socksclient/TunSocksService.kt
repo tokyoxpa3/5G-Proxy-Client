@@ -28,8 +28,8 @@ class TunSocksService : VpnService() {
     companion object {
         const val TAG = "TunSocksService"
         const val NOTIFICATION_ID = 2001
-        const val CHANNEL_ID = "tun_socks_channel"
-        const val FLASH_CHANNEL_ID = "tun_socks_flash_channel"
+        const val CHANNEL_ID = "tun_socks_channel_v2"
+        const val FLASH_CHANNEL_ID = "tun_socks_flash_channel_v2"
 
         const val ACTION_START = "com.tokyoxpa3.socksclient.START"
         const val ACTION_STOP = "com.tokyoxpa3.socksclient.STOP"
@@ -460,6 +460,8 @@ class TunSocksService : VpnService() {
             getString(R.string.notification_channel_name),
             NotificationManager.IMPORTANCE_LOW
         )
+        // 常駐隧道通知不顯示桌面角標數字（Samsung 桌面會把通知數當作待辦數字）
+        channel.setShowBadge(false)
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(channel)
         // 開機「閃一下」用高重要性 channel：Samsung 對低重要性通知不會啟動 full-screen intent
@@ -470,6 +472,7 @@ class TunSocksService : VpnService() {
         )
         flashChannel.setSound(null, null)
         flashChannel.setVibrationPattern(LongArray(0))
+        flashChannel.setShowBadge(false)
         nm.createNotificationChannel(flashChannel)
     }
 
