@@ -5,6 +5,7 @@
 - **TCP**：內建完整的 TCP 狀態機（於使用者空間實作），透過 SOCKS5 **CONNECT** 轉發
 - **UDP / DNS / QUIC**：透過 SOCKS5 **UDP ASSOCIATE** relay，讓 DNS 與 HTTP/3（QUIC）都能穿透
   - 預設 **UDP-in-UDP**（RFC 1928），可切換 **UDP-in-TCP**（自訂擴充指令 0x04，relay 走同一條 TCP，不受 UDP 優先權/壅塞影響）
+- **Remote DNS（fakedns）**：攔截 DNS 查詢並回覆保留網段（198.18.0.0/15）的 fake IP，TCP/UDP 皆以網域（ATYP=0x03）向伺服器撥號、由伺服器端解析——伺服器不需要實作 UDP relay 也能解析網域（需 SOCKS5 伺服器支援 domain 目標）
 - **IPv4 + IPv6 雙棧**：TUN 同時配置 `10.8.0.2/32` 與 `fd00::2/128`，UDP/TCP 皆支援 v6
 - **Per-App 模式**：三種模式任選
   - 🌐 全局（所有流量走隧道）
@@ -50,7 +51,7 @@
 | `app/src/main/cpp/jni_bridge.c` | JNI 橋接（socket 取得、引擎生命週期） |
 | `app/src/main/java/.../TunSocksService.kt` | VpnService + 前台服務 + `protect()` + per-App 排除套用 |
 | `app/src/main/java/.../NativeEngine.kt` | 原生引擎的 JNI 宣告 |
-| `app/src/main/java/.../MainActivity.kt` | 設定頁面（伺服器 / 連接埠 / 認證 / UDP-in-TCP 開關） |
+| `app/src/main/java/.../MainActivity.kt` | 設定頁面（伺服器 / 連接埠 / 認證 / UDP-in-TCP / Remote DNS 開關） |
 | `app/src/main/java/.../AppListActivity.kt` | 排除 App 選擇器（勾選 = 走本機網路） |
 
 ---
@@ -59,7 +60,7 @@
 
 1. 準備一個 **SOCKS5 伺服器**（任何標準 SOCKS5 伺服器皆可；開啟「UDP relay 走 TCP」時建議搭配配套的 5G-Proxy-Pro 伺服器，該專案支援擴充指令 0x04）
 2. 安裝 APK 並開啟 App
-3. 填入伺服器 IP 與連接埠（預設 `1080`），認證可留空；需要時勾選「UDP relay 走 TCP（UDP-in-TCP）」
+3. 填入伺服器 IP 與連接埠（預設 `1080`），認證可留空；需要時勾選「UDP relay 走 TCP（UDP-in-TCP）」或「Remote DNS（由伺服器端解析網域）」
 4. 點「🚀 啟動隧道」並允許 VPN 權限
 5. 裝置的所有流量即透過 SOCKS5 伺服器對外
 

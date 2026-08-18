@@ -24,6 +24,7 @@
 
 - **TCP**：透過 SOCKS5 CONNECT 轉發（使用者空間 TCP 狀態機，含流量控制）
 - **UDP / DNS / QUIC**：透過 SOCKS5 UDP ASSOCIATE relay；與 5G Proxy Pro 搭配時建議勾選「UDP relay 走 TCP（UDP-in-TCP）」（自訂擴充指令 0x04），UDP 資料走同一條 TCP，不受 UDP 壅塞影響
+- **Remote DNS**：勾選後攔截 DNS 查詢、以網域（ATYP=0x03）向伺服器撥號，由伺服器端解析；伺服器不需要實作 UDP relay 也能解析網域
 - **Per-App 排除**：「Excluded Apps」勾選的 App 走手機本機網路（繞過隧道）
 
 ---
