@@ -1029,16 +1029,10 @@ static void tcp_session_destroy(tcp_sess_t *sess) {
         return;
     }
     *pp = sess->next;
-    if (atomic_load(&sess->thread_done)) {
-        free(sess->app_buf);
-        free(sess->srv_buf);
-        free(sess);
-        atomic_fetch_sub(&g_tcp_session_count, 1);
-    } else {
-        LOGI("tcp session 待線程結束後釋放");
-        sess->next = g_tcp_graveyard;
-        g_tcp_graveyard = sess;
-    }
+    // 一律移入 graveyard，由 tcp_graveyard_collect()（每批 epoll 事件處理完）統一 free。
+    // 若 thread_done==1 時立即 free，本批事件中殘留的同 session 事件會讀到已釋放記憶體（UAF）。
+    sess->next = g_tcp_graveyard;
+    g_tcp_graveyard = sess;
 }
 
 static void tcp_graveyard_collect(void) {
@@ -1511,6 +1505,53 @@ static void handle_tcp_event(tcp_sess_t *sess, uint32_t ev, time_t now) {
     }
 }
 
+// ---------- ICMP Echo 回應（本機 ping 也通） ----------
+
+// IPv4 ICMP echo request → 本機直接回 echo reply（不經過 SOCKS5）
+static void handle_icmp4(const unsigned char *pkt, size_t len, int ihl,
+                         const ip_addr_t *saddr, const ip_addr_t *daddr) {
+    size_t t = (size_t)ihl;
+    if (t + 8 > len) return;
+    if (pkt[t] != 8 || pkt[t + 1] != 0) return;   // 僅處理 echo request
+    if (len > TUN_MTU) return;
+    unsigned char reply[TUN_MTU];
+    memcpy(reply, pkt, len);
+    // 交換 IP 來源/目的，重算 IP checksum
+    memcpy(reply + 12, daddr->ip, 4);
+    memcpy(reply + 16, saddr->ip, 4);
+    reply[8] = 64;
+    reply[10] = 0; reply[11] = 0;
+    uint16_t csum = checksum16(reply, (size_t)ihl);
+    reply[10] = csum >> 8; reply[11] = csum & 0xFF;
+    // echo reply，重算 ICMP checksum
+    reply[t] = 0;
+    reply[t + 2] = 0; reply[t + 3] = 0;
+    uint16_t icsum = checksum16(reply + t, len - t);
+    reply[t + 2] = icsum >> 8; reply[t + 3] = icsum & 0xFF;
+    ssize_t w = write(g_tun_fd, reply, len);
+    if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun icmp4 failed: %s", strerror(errno));
+}
+
+// IPv6 ICMPv6 echo request → 本機回 echo reply
+static void handle_icmp6(const unsigned char *pkt, size_t len,
+                         const ip_addr_t *saddr, const ip_addr_t *daddr) {
+    if (len < 48 || len > TUN_MTU) return;
+    if (pkt[40] != 128 || pkt[41] != 0) return;   // 僅處理 echo request
+    unsigned char reply[TUN_MTU];
+    memcpy(reply, pkt, len);
+    // 交換 IPv6 來源/目的
+    memcpy(reply + 8, daddr->ip, 16);
+    memcpy(reply + 24, saddr->ip, 16);
+    reply[7] = 64;
+    // echo reply，重算 ICMPv6 checksum（含 pseudo-header）
+    reply[40] = 129;
+    reply[42] = 0; reply[43] = 0;
+    uint16_t icsum = tcpudp_checksum6(daddr->ip, saddr->ip, 58, reply + 40, len - 40);
+    reply[42] = icsum >> 8; reply[43] = icsum & 0xFF;
+    ssize_t w = write(g_tun_fd, reply, len);
+    if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun icmp6 failed: %s", strerror(errno));
+}
+
 // ---------- TUN 讀取與主迴圈 ----------
 
 static void handle_tun_packet(const unsigned char *pkt, size_t len) {
@@ -1525,6 +1566,8 @@ static void handle_tun_packet(const unsigned char *pkt, size_t len) {
             handle_tun_udp(pkt, len, (size_t)ihl, &saddr, &daddr);
         } else if (proto == 6) {
             handle_tun_tcp(pkt, len, (size_t)ihl, &saddr, &daddr);
+        } else if (proto == 1) {
+            handle_icmp4(pkt, len, ihl, &saddr, &daddr);
         }
         return;
     }
@@ -1536,6 +1579,8 @@ static void handle_tun_packet(const unsigned char *pkt, size_t len) {
             handle_tun_udp(pkt, len, 40, &saddr, &daddr);
         } else if (proto == 6) {
             handle_tun_tcp(pkt, len, 40, &saddr, &daddr);
+        } else if (proto == 58) {
+            handle_icmp6(pkt, len, &saddr, &daddr);
         }
         return;
     }

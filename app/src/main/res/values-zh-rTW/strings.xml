@@ -7,6 +7,8 @@
     <string name="notification_connecting">連線中…</string>
     <string name="notification_running">隧道已啟用</string>
     <string name="notification_stopped">已停止</string>
+    <string name="notification_action_stop">停止</string>
+    <string name="notification_action_restart">重啟</string>
 
     <!-- Status -->
     <string name="status_not_started">未啟動</string>
@@ -14,6 +16,8 @@
     <string name="status_tunnel_active">✅ 隧道已啟用 (%1$s:%2$d)</string>
     <string name="status_stopping">正在停止…</string>
     <string name="status_stopped">已停止</string>
+    <string name="status_restarting">正在重啟…</string>
+    <string name="status_start_retrying">啟動失敗，重試中…（第 %1$d 次）</string>
 
     <!-- Last crash / error -->
     <string name="last_crash_prefix">⚠️ 上次發生崩潰：\n%1$s</string>
@@ -24,15 +28,39 @@
     <string name="hint_port">連接埠（例：1080）</string>
     <string name="hint_user">使用者名稱（可留空）</string>
     <string name="hint_pass">密碼（可留空）</string>
+    <string name="hint_dns1">主要 DNS（例：8.8.8.8）</string>
+    <string name="hint_dns2">次要 DNS（例：1.1.1.1）</string>
+    <string name="hint_profile_name">設定檔名稱（例：家裡）</string>
 
     <!-- Buttons -->
     <string name="btn_start_tunnel">🚀 啟動隧道</string>
     <string name="btn_stop_tunnel">🛑 停止隧道</string>
+    <string name="btn_restart_tunnel">🔄 重啟隧道</string>
+    <string name="btn_select_apps">📱 App</string>
+    <string name="btn_save_profile">💾 儲存設定檔</string>
+    <string name="btn_delete_profile">🗑️ 刪除設定檔</string>
+    <string name="btn_load_profile">載入設定檔</string>
+
+    <!-- App list -->
+    <string name="applist_title">App 清單</string>
+    <string name="applist_hint_global">目前為全局模式 — 所有 App 都會走隧道。</string>
+    <string name="applist_hint_allowlist">白名單模式：只有「勾選」的 App 會走隧道。</string>
+    <string name="applist_hint_exclude">排除模式：勾選的 App 走手機本機網路（繞過隧道）。</string>
+    <string name="applist_search_hint">搜尋 App…</string>
+    <string name="applist_empty">找不到 App</string>
 
     <!-- Section labels -->
     <string name="label_server">SOCKS5 伺服器</string>
     <string name="label_auth">認證（可選）</string>
+    <string name="label_dns">DNS（可選）</string>
     <string name="label_udp_in_tcp">UDP relay 走 TCP（UDP-in-TCP）</string>
+    <string name="label_mode">隧道模式</string>
+    <string name="label_mode_global">🌐 全局（所有流量）</string>
+    <string name="label_mode_allowlist">🎯 指定 App（僅勾選者走隧道）</string>
+    <string name="label_mode_exclude">🚫 排除勾選的 App</string>
+    <string name="label_auto_start">開機自動啟動隧道</string>
+    <string name="label_other">其他設定</string>
+    <string name="label_profiles">設定檔</string>
 
     <!-- Toasts -->
     <string name="toast_invalid_input">請輸入有效的伺服器位址與連接埠</string>
@@ -41,6 +69,12 @@
     <string name="toast_start_failed">啟動失敗：%1$s</string>
     <string name="toast_vpn_denied">未取得 VPN 權限</string>
     <string name="toast_service_start_failed">服務啟動失敗：%1$s</string>
+    <string name="toast_profile_saved">設定檔已儲存</string>
+    <string name="toast_profile_deleted">設定檔已刪除</string>
+    <string name="toast_profile_name_empty">請輸入設定檔名稱</string>
+    <string name="toast_profile_not_found">找不到設定檔</string>
+    <string name="toast_notification_permission">請允許通知以查看隧道狀態</string>
+    <string name="toast_tile_vpn_needed">請先允許 VPN 連線</string>
 
     <!-- Errors -->
     <string name="err_bad_params">參數錯誤：請檢查伺服器位址與連接埠</string>
@@ -48,6 +82,16 @@
     <string name="err_vpn_establish">VPN 建立失敗（未授權？）</string>
     <string name="err_native_lib">此裝置無法載入原生引擎</string>
     <string name="err_start">啟動失敗：%1$s</string>
+    <string name="err_start_retry_exhausted">重試多次仍無法啟動。請檢查網路與伺服器。</string>
+    <string name="err_invalid_dns">無效的 DNS 位址：%1$s</string>
+
+    <!-- Quick Settings tile -->
+    <string name="tile_label">代理</string>
+    <string name="tile_state_active">隧道已開啟</string>
+    <string name="tile_state_inactive">隧道已關閉</string>
+
+    <!-- Boot receiver -->
+    <string name="boot_autostart_disabled">開機自啟未啟用 — 請開啟 5G Proxy Client 以啟用</string>
 
     <!-- Debug log -->
     <string name="debug_crash_detail">時間: %1$s\n線程: %2$s\n類型: %3$s\n訊息: %4$s\n堆疊:\n%5$s</string>
