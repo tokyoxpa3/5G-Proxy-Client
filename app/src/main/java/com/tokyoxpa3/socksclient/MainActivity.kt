@@ -22,6 +22,8 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import android.widget.AdapterView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
 class MainActivity : Activity() {
 
@@ -253,6 +255,13 @@ class MainActivity : Activity() {
             addView(root)
         }
         setContentView(scroll)
+
+        // targetSdk 35 強制 edge-to-edge，把系統列 insets 加進 ScrollView padding，避免內容被狀態列/導覽列遮住
+        ViewCompat.setOnApplyWindowInsetsListener(scroll) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
+        }
 
         val prefs = getSharedPreferences("tunnel_config", MODE_PRIVATE)
         etHost.setText(prefs.getString("host", ""))

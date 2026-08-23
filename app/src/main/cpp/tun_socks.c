@@ -135,7 +135,8 @@ typedef struct udp_sess {
     uint16_t src_port;      // App 端來源 Port（網路序）
     int control_fd;         // 通往伺服器的 TCP 控制連線（Java protect）
     int relay_fd;           // 伺服器 UDP relay 的 socket（Java protect）；UDP-in-TCP 時為 -1
-    struct sockaddr_in relay_addr;
+    struct sockaddr_storage relay_addr;   // 伺服器 UDP relay 位址（v4/v6）
+    socklen_t relay_len;                  // relay_addr 有效長度（0 = 未設定）
     int state;              // 0=handshake 中 1=就緒
     int closed;
     time_t last_active;
@@ -327,14 +328,29 @@ static int parse_ipv4(const unsigned char *pkt, size_t len, uint8_t *proto, ip_a
     return 0;
 }
 
-// 注意：不處理 IPv6 extension header（常見無 ext header 的封包可正常運作）
-static int parse_ipv6(const unsigned char *pkt, size_t len, uint8_t *proto, ip_addr_t *saddr, ip_addr_t *daddr) {
+// 沿 IPv6 extension header 鏈走到真正的 L4 協定，輸出傳輸層偏移 l4off。
+// 支援 Hop-by-Hop(0)/Routing(43)/Destination(60)/AH(51)；Fragment(44) 需重組，直接丟棄。
+static int parse_ipv6(const unsigned char *pkt, size_t len, uint8_t *proto, ip_addr_t *saddr, ip_addr_t *daddr, size_t *l4off) {
     if (len < 40) return -1;
     if ((pkt[0] >> 4) != 6) return -1;
-    *proto = pkt[6];
     saddr->family = AF_INET6; memcpy(saddr->ip, pkt + 8, 16);
     daddr->family = AF_INET6; memcpy(daddr->ip, pkt + 24, 16);
-    return 0;
+
+    size_t off = 40;
+    uint8_t nh = pkt[6];
+    for (int hops = 0; hops < 8; hops++) {
+        if (nh == 17 || nh == 6 || nh == 58) { *proto = nh; *l4off = off; return 0; }
+        if (nh == 44) return -1;                   // Fragment：無法重組，直接丟棄
+        if (off + 8 > len) return -1;
+        size_t hlen;
+        if (nh == 51)                              hlen = ((size_t)pkt[off + 1] + 2) * 4;   // AH
+        else if (nh == 0 || nh == 43 || nh == 60)  hlen = ((size_t)pkt[off + 1] + 1) * 8;   // Hop-by-Hop / Routing / Destination
+        else return -1;                                                                      // 不認識的 ext header
+        if (hlen < 8 || off + hlen > len) return -1;
+        nh = pkt[off];
+        off += hlen;
+    }
+    return -1;                                      // 超過層數上限
 }
 
 // 回覆 App 的 IP 封包（relay 回應 → TUN）；_ex 版本以顯式位址取代 session
@@ -456,6 +472,90 @@ static void send_tcp_rst(const ip_addr_t *src, const ip_addr_t *dst, const unsig
 // ---------- UDP 會話 ----------
 
 static void handle_relay_udp(udp_sess_t *sess, const unsigned char *buf, ssize_t len);
+
+// ---------- handshake 執行緒池 ----------
+// 以固定 worker 數取代 per-session detached thread，避免連線尖峰時大量建立執行緒。
+// submit 遞增 g_handshake_inflight、job 結尾遞減；關閉時確定性排空並 join worker。
+#define HS_POOL_WORKERS 16
+
+typedef struct hs_job {
+    void *(*fn)(void *);
+    void *arg;
+    struct hs_job *next;
+} hs_job_t;
+
+static pthread_t g_hs_workers[HS_POOL_WORKERS];
+static int g_hs_worker_count = 0;
+static pthread_mutex_t g_hs_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_hs_cond = PTHREAD_COND_INITIALIZER;
+static hs_job_t *g_hs_head = NULL;
+static hs_job_t *g_hs_tail = NULL;
+static int g_hs_running = 0;
+
+static void *hs_worker(void *arg) {
+    (void)arg;
+    jni_attach_thread();
+    for (;;) {
+        pthread_mutex_lock(&g_hs_lock);
+        while (g_hs_running && !g_hs_head)
+            pthread_cond_wait(&g_hs_cond, &g_hs_lock);
+        if (!g_hs_running && !g_hs_head) {
+            pthread_mutex_unlock(&g_hs_lock);
+            break;
+        }
+        hs_job_t *job = g_hs_head;
+        g_hs_head = job->next;
+        if (!g_hs_head) g_hs_tail = NULL;
+        pthread_mutex_unlock(&g_hs_lock);
+        job->fn(job->arg);
+        free(job);
+    }
+    jni_detach_thread();
+    return NULL;
+}
+
+static void hs_pool_start(void) {
+    if (g_hs_running) return;
+    g_hs_running = 1;
+    g_hs_worker_count = 0;
+    for (int i = 0; i < HS_POOL_WORKERS; i++) {
+        if (pthread_create(&g_hs_workers[g_hs_worker_count], NULL, hs_worker, NULL) == 0)
+            g_hs_worker_count++;
+    }
+}
+
+static void hs_pool_stop(void) {
+    if (!g_hs_running) return;
+    pthread_mutex_lock(&g_hs_lock);
+    g_hs_running = 0;
+    pthread_cond_broadcast(&g_hs_cond);
+    pthread_mutex_unlock(&g_hs_lock);
+    for (int i = 0; i < g_hs_worker_count; i++)
+        pthread_join(g_hs_workers[i], NULL);
+    g_hs_worker_count = 0;
+}
+
+static int hs_submit(void *(*fn)(void *), void *arg) {
+    hs_job_t *job = malloc(sizeof(*job));
+    if (!job) return -1;
+    job->fn = fn;
+    job->arg = arg;
+    job->next = NULL;
+    atomic_fetch_add(&g_handshake_inflight, 1);
+    pthread_mutex_lock(&g_hs_lock);
+    if (!g_hs_running) {
+        pthread_mutex_unlock(&g_hs_lock);
+        atomic_fetch_sub(&g_handshake_inflight, 1);
+        free(job);
+        return -1;
+    }
+    if (g_hs_tail) g_hs_tail->next = job;
+    else g_hs_head = job;
+    g_hs_tail = job;
+    pthread_cond_signal(&g_hs_cond);
+    pthread_mutex_unlock(&g_hs_lock);
+    return 0;
+}
 
 // UDP-in-TCP：將一整個 frame（長度欄 + SOCKS5 datagram）加入送出佇列。
 // 只在「未 arm EPOLLOUT」時才觸發第一次，避免重複 MOD。
@@ -586,7 +686,7 @@ static void forward_udp_to_server(udp_sess_t *sess, const ip_addr_t *dst, uint16
         udp_tcp_append(sess, frame, 2 + (size_t)datalen);
     } else {
         ssize_t sent = sendto(sess->relay_fd, frame + 2, (size_t)datalen, MSG_NOSIGNAL,
-                              (struct sockaddr *)&sess->relay_addr, sizeof(sess->relay_addr));
+                              (struct sockaddr *)&sess->relay_addr, sess->relay_len);
         if (sent < 0) LOGE("relay sendto 失敗: %s", strerror(errno));
     }
 }
@@ -735,14 +835,8 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
                 sess->pend_port = dport;
             }
         }
-        pthread_t th;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        int rc = pthread_create(&th, &attr, udp_session_thread, sess);
-        pthread_attr_destroy(&attr);
-        if (rc != 0) {
-            // 線程建立失敗：移除會話，避免永久卡在 connecting
+        if (hs_submit(udp_session_thread, sess) != 0) {
+            // 提交失敗：移除會話，避免永久卡在 connecting
             pthread_mutex_lock(&g_udp_hash_lock);
             udp_sess_t **pp = &g_udp_hash[idx];
             while (*pp && *pp != sess) pp = &(*pp)->next;
@@ -807,12 +901,11 @@ static void udp_sess_free_bufs(udp_sess_t *sess) {
 
 // 每當 App 送出第一個 UDP 封包，為該 (src_ip, src_port) 建立 SOCKS5 UDP 會話
 static void *udp_session_thread(void *arg) {
-    jni_attach_thread();
-    atomic_fetch_add(&g_handshake_inflight, 1);
     udp_sess_t *sess = (udp_sess_t *)arg;
     unsigned char buf[320];
     int cfd = -1, rfd = -1;
-    struct sockaddr_in relay = {0};
+    struct sockaddr_storage relay = {0};
+    socklen_t relay_len = 0;
     int network_fail = 1;   // 網路層失敗旗標（同 tcp_connect_thread）
 
     // 1. TCP 控制連線（Java 已 connect + protect）
@@ -882,11 +975,20 @@ static void *udp_session_thread(void *arg) {
         int atyp = buf[3];
         if (atyp == 0x01) {
             if (recv_all(cfd, buf, 6) < 0) goto fail;
-            relay.sin_family = AF_INET;
-            memcpy(&relay.sin_addr, buf, 4);
-            memcpy(&relay.sin_port, buf + 4, 2);
+            struct sockaddr_in *r4 = (struct sockaddr_in *)&relay;
+            r4->sin_family = AF_INET;
+            memcpy(&r4->sin_addr, buf, 4);
+            memcpy(&r4->sin_port, buf + 4, 2);
+            relay_len = sizeof(struct sockaddr_in);
+        } else if (atyp == 0x04) {
+            if (recv_all(cfd, buf, 18) < 0) goto fail;
+            struct sockaddr_in6 *r6 = (struct sockaddr_in6 *)&relay;
+            r6->sin6_family = AF_INET6;
+            memcpy(&r6->sin6_addr, buf, 16);
+            memcpy(&r6->sin6_port, buf + 16, 2);
+            relay_len = sizeof(struct sockaddr_in6);
         } else {
-            // P1：只支援 IPv4 relay 位址（自家伺服器固定回 v4）
+            // 不支援其他 ATYP（0x03 網域 relay 位址極少見，且此處無法解析）
             LOGE("UDP ASSOCIATE 回覆 ATYP=%d 不支援", atyp);
             network_fail = 0;
             goto fail;
@@ -913,6 +1015,7 @@ static void *udp_session_thread(void *arg) {
     sess->control_fd = cfd;
     sess->relay_fd = rfd;
     sess->relay_addr = relay;
+    sess->relay_len = relay_len;
 
     // 在註冊 epoll 前先轉發 handshake 期間緩衝的首包，
     // 避免線程與 engine 並發操作 tx_buf（UDP-in-TCP）
@@ -952,9 +1055,21 @@ static void *udp_session_thread(void *arg) {
     atomic_store(&sess->thread_done, 1);   // 先標記，engine 才可安全 free（shutdown 等 inflight==0）
     atomic_fetch_sub(&g_handshake_inflight, 1);
     if (udp_tcp) LOGI("udp handshake 完成: UDP-in-TCP (relay 走同一 TCP)");
-    else LOGI("udp handshake 完成: relay=%s:%d", inet_ntoa(relay.sin_addr), ntohs(relay.sin_port));
+    else {
+        char rbuf[64];
+        uint16_t rport = 0;
+        if (relay_len == sizeof(struct sockaddr_in)) {
+            struct sockaddr_in *r4 = (struct sockaddr_in *)&relay;
+            inet_ntop(AF_INET, &r4->sin_addr, rbuf, sizeof rbuf);
+            rport = ntohs(r4->sin_port);
+        } else {
+            struct sockaddr_in6 *r6 = (struct sockaddr_in6 *)&relay;
+            inet_ntop(AF_INET6, &r6->sin6_addr, rbuf, sizeof rbuf);
+            rport = ntohs(r6->sin6_port);
+        }
+        LOGI("udp handshake 完成: relay=%s:%d", rbuf, rport);
+    }
     notify_server_event(1);
-    jni_detach_thread();
     return NULL;
 
 fail:
@@ -981,7 +1096,6 @@ fail:
     pthread_mutex_unlock(&g_udp_hash_lock);
     atomic_store(&sess->thread_done, 1);
     atomic_fetch_sub(&g_handshake_inflight, 1);
-    jni_detach_thread();
     return NULL;
 }
 
@@ -1445,8 +1559,6 @@ static void tcp_engine_sweep(void) {
 
 // SOCKS5 CONNECT 背景線程：完成後註冊 epoll 並 kick 引擎送出緩衝資料
 static void *tcp_connect_thread(void *arg) {
-    jni_attach_thread();
-    atomic_fetch_add(&g_handshake_inflight, 1);
     tcp_sess_t *sess = (tcp_sess_t *)arg;
     unsigned char buf[320];
     int sfd = -1;
@@ -1546,7 +1658,6 @@ fail:
 done:
     atomic_store(&sess->thread_done, 1);   // 先標記，engine 才可安全 free（shutdown 等 inflight==0）
     atomic_fetch_sub(&g_handshake_inflight, 1);
-    jni_detach_thread();
     return NULL;
 }
 
@@ -1622,12 +1733,7 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
              b1, ntohs(sport), b2, ntohs(dport));
         send_tcp_synack(sess);
 
-        pthread_t th; pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        int rc = pthread_create(&th, &attr, tcp_connect_thread, sess);
-        pthread_attr_destroy(&attr);
-        if (rc != 0) close_tcp_session(sess, 1);
+        if (hs_submit(tcp_connect_thread, sess) != 0) close_tcp_session(sess, 1);
         return;
     }
 
@@ -1850,13 +1956,14 @@ static void handle_tun_packet(const unsigned char *pkt, size_t len) {
     if (ver == 6) {
         uint8_t proto;
         ip_addr_t saddr, daddr;
-        if (parse_ipv6(pkt, len, &proto, &saddr, &daddr) < 0) return;
+        size_t l4off;
+        if (parse_ipv6(pkt, len, &proto, &saddr, &daddr, &l4off) < 0) return;
         if (proto == 17) {
-            handle_tun_udp(pkt, len, 40, &saddr, &daddr);
+            handle_tun_udp(pkt, len, l4off, &saddr, &daddr);
         } else if (proto == 6) {
-            handle_tun_tcp(pkt, len, 40, &saddr, &daddr);
+            handle_tun_tcp(pkt, len, l4off, &saddr, &daddr);
         } else if (proto == 58) {
-            handle_icmp6(pkt, len, &saddr, &daddr);
+            if (l4off == 40) handle_icmp6(pkt, len, &saddr, &daddr);
         }
         return;
     }
@@ -2022,6 +2129,9 @@ shutdown:
         }
     }
 
+    // 排空並 join handshake worker，確保之後 free session 不會有 worker 仍在用
+    hs_pool_stop();
+
     // 線程已全部結束（thread_done 皆已設定）：清空兩階段釋放清單
     tcp_graveyard_collect();
     udp_graveyard_collect();
@@ -2117,9 +2227,11 @@ int tun_socks_start(int tun_fd, const char *host, int port, const char *user, co
     ev.events = EPOLLIN; ev.data.fd = g_tun_fd;
     epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_tun_fd, &ev);
 
+    hs_pool_start();
     g_running = 1;
     if (pthread_create(&g_engine_thread, NULL, engine_loop, NULL) != 0) {
         g_running = 0;
+        hs_pool_stop();
         if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
         if (g_shutdown_pipe[0] != -1) { close(g_shutdown_pipe[0]); g_shutdown_pipe[0] = -1; }
         if (g_shutdown_pipe[1] != -1) { close(g_shutdown_pipe[1]); g_shutdown_pipe[1] = -1; }
@@ -2140,6 +2252,7 @@ void tun_socks_stop(void) {
         for (int k = 0; k < 10; k++) write(g_shutdown_pipe[1], &stop_sig, 1);
     }
     pthread_join(g_engine_thread, NULL);
+    hs_pool_stop();   // 安全網：引擎關閉路徑已 join，此為 idempotent no-op
     if (g_shutdown_pipe[0] != -1) { close(g_shutdown_pipe[0]); g_shutdown_pipe[0] = -1; }
     if (g_shutdown_pipe[1] != -1) { close(g_shutdown_pipe[1]); g_shutdown_pipe[1] = -1; }
     if (g_kick_pipe[0] != -1) { close(g_kick_pipe[0]); g_kick_pipe[0] = -1; }
