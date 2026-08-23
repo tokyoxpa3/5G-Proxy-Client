@@ -2,6 +2,13 @@
 #define TCP_PACKET_H
 #include <stddef.h>
 #include <stdint.h>
+#ifdef _WIN32
+#include <BaseTSD.h>
+typedef SSIZE_T ssize_t;
+#else
+#include <unistd.h>
+#include <sys/types.h>
+#endif
 
 #ifndef AF_INET
 #define AF_INET 2
