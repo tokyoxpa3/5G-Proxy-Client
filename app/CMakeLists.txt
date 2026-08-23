@@ -15,6 +15,9 @@ set(SOURCE_FILES
     src/main/cpp/jni_bridge.c
     src/main/cpp/tun_socks.c
     src/main/cpp/checksum.c
+    src/main/cpp/socks5_codec.c
+    src/main/cpp/dns_synth.c
+    src/main/cpp/tcp_packet.c
 )
 
 add_library(socksclient SHARED

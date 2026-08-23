@@ -35,26 +35,7 @@
 #define UDP_HASH_BUCKETS 256
 #define MAX_UDP_SESSIONS 512
 
-static int g_tun_fd = -1;
-static int g_shutdown_pipe[2] = {-1, -1};
-static volatile int g_running = 0;
-static int g_epoll_fd = -1;
 static pthread_t g_engine_thread;
-
-static char g_srv_host[256];
-static int g_srv_port = 1080;
-static char g_auth_user[128];
-static char g_auth_pass[128];
-static int g_auth_enabled = 0;
-static int g_udp_in_tcp = 0;    // 1 = UDP relay 走 TCP frame（cmd=0x04 擴充）
-static int g_remote_dns = 0;    // 1 = Remote DNS（fakedns）：攔截 DNS、以網域撥號
-
-static atomic_int g_udp_session_count = 0;
-static atomic_int g_handshake_inflight = 0;
-
-// 流量統計（payload bytes 累計，供通知列即時顯示）
-static atomic_ullong g_bytes_to_server = 0;    // App → SOCKS5 伺服器
-static atomic_ullong g_bytes_from_server = 0;  // SOCKS5 伺服器 → App
 
 // ---------- 位址抽象（v4 / v6 共用 session 結構） ----------
 
@@ -112,23 +93,17 @@ typedef struct tcp_sess {
     int srv_fin_sent;       // 已送 FIN 給 App
     unsigned char *app_buf; size_t app_off, app_len, app_cap;  // App→server 待送（off=已送出前綴）
     unsigned char *srv_buf; size_t srv_off, srv_len, srv_cap;  // server→App 待送（off=已寫 TUN 前綴）
+    unsigned char *dns_rx_buf; size_t dns_rx_len, dns_rx_cap;  // DNS-over-TCP 攔截：inbound 串流緩衝
+    int dns_tcp;                 // 1 = DNS-over-TCP 攔截（port 53，本機合成 fake 回覆）
     time_t last_active;
     struct tcp_sess *next;  // hash chain
 } tcp_sess_t;
 
-static tcp_sess_t *g_tcp_hash[TCP_HASH_BUCKETS];
-static atomic_int g_tcp_session_count = 0;
-static int g_kick_pipe[2] = {-1, -1};
-static int g_tun_want_out = 0;
 
 static unsigned tcp_hash_idx(const ip_addr_t *ip, uint16_t port) {
     return (ip_hash32(ip) ^ (uint32_t)port) % TCP_HASH_BUCKETS;
 }
 
-static uint32_t tcp_isn_counter = 0;
-static uint32_t next_tcp_isn(void) {
-    return ((uint32_t)time(NULL) ^ 0x5F3759DF) + (++tcp_isn_counter) * 2654435761u;
-}
 
 typedef struct udp_sess {
     ip_addr_t src_ip;       // App 端來源 IP（v4/v6）
@@ -154,11 +129,7 @@ typedef struct udp_sess {
     struct udp_sess *next;  // hash chain
 } udp_sess_t;
 
-static udp_sess_t *g_udp_hash[UDP_HASH_BUCKETS];
 static pthread_mutex_t g_udp_hash_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static udp_sess_t *g_udp_graveyard = NULL;   // 線程未結束前暫存待釋放 session（受 g_udp_hash_lock 保護）
-static tcp_sess_t *g_tcp_graveyard = NULL;   // 同上（僅 engine 單執行緒存取）
 
 static void udp_sess_free_bufs(udp_sess_t *sess);
 
@@ -181,6 +152,63 @@ typedef struct {
     int in_use;
 } fake_dns_entry_t;
 
+// ---------- 引擎 context ----------
+// 所有可變狀態收在單一 struct：啟動時可整體重置、停止後不殘留（流量統計 / fakedns 快取）。
+// 目前為單一實例（單一隧道）；日後加單元測試 harness 時可改為動態配置並傳指標。
+#define HS_POOL_WORKERS 16
+
+struct hs_job;  // 前置宣告：engine_ctx_t 僅存放其指標
+
+typedef struct {
+    // lifecycle / config
+    int tun_fd;
+    int shutdown_pipe[2];
+    volatile int running;
+    int epoll_fd;
+    char srv_host[256];
+    int srv_port;
+    char auth_user[128];
+    char auth_pass[128];
+    int auth_enabled;
+    int udp_in_tcp;    // 1 = UDP relay 走 TCP frame（cmd=0x04 擴充）
+    int remote_dns;    // 1 = Remote DNS（fakedns）：攔截 DNS、以網域撥號
+
+    // 流量統計（payload bytes 累計，供通知列即時顯示）
+    atomic_ullong bytes_to_server;    // App → SOCKS5 伺服器
+    atomic_ullong bytes_from_server;  // SOCKS5 伺服器 → App
+    atomic_int udp_session_count;
+    atomic_int handshake_inflight;
+
+    // TCP
+    tcp_sess_t *tcp_hash[TCP_HASH_BUCKETS];
+    atomic_int tcp_session_count;
+    int kick_pipe[2];
+    int tun_want_out;
+    uint32_t isn_counter;
+    tcp_sess_t *tcp_graveyard;
+
+    // UDP
+    udp_sess_t *udp_hash[UDP_HASH_BUCKETS];
+    udp_sess_t *udp_graveyard;
+
+    // Remote DNS（fakedns）
+    fake_dns_entry_t fake_dns[FAKE_DNS_ENTRIES];
+    unsigned fake_dns_next;
+
+    // handshake 執行緒池
+    pthread_t hs_workers[HS_POOL_WORKERS];
+    int hs_worker_count;
+    struct hs_job *hs_head;
+    struct hs_job *hs_tail;
+    int hs_running;
+} engine_ctx_t;
+
+static engine_ctx_t g;
+
+static uint32_t next_tcp_isn(void) {
+    return ((uint32_t)time(NULL) ^ 0x5F3759DF) + (++g.isn_counter) * 2654435761u;
+}
+
 // 由 entry 索引產生穩定的 fake IPv6：fd00::5e<idx+1>（16-bit 索引放最後兩 byte，
 // byte13=0x5E 標記避免撞上 TUN 本機位址 fd00::2）
 static void fake_dns_build_ip6(int idx, unsigned char out[16]) {
@@ -191,8 +219,6 @@ static void fake_dns_build_ip6(int idx, unsigned char out[16]) {
     out[15] = (unsigned char)((idx + 1) & 0xFF);
 }
 
-static fake_dns_entry_t g_fake_dns[FAKE_DNS_ENTRIES];
-static unsigned g_fake_dns_next = 0;
 static pthread_mutex_t g_fake_dns_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // 取得 fake IP 對應的 32-bit 鍵（非 v4 回傳 0）
@@ -210,7 +236,7 @@ static uint32_t fake_dns_alloc(const char *domain, unsigned char ip6_out[16]) {
     pthread_mutex_lock(&g_fake_dns_lock);
     // 1. 同網域已有映射 → 直接回傳（刷新 last_used）
     for (int i = 0; i < FAKE_DNS_ENTRIES; i++) {
-        fake_dns_entry_t *e = &g_fake_dns[i];
+        fake_dns_entry_t *e = &g.fake_dns[i];
         if (e->in_use && strcmp(e->domain, domain) == 0) {
             e->last_used = now;
             fake = e->fake_ip;
@@ -220,15 +246,15 @@ static uint32_t fake_dns_alloc(const char *domain, unsigned char ip6_out[16]) {
     }
     // 2. 依序尋找空位或已閒置逾時的項目
     for (int round = 0; round < FAKE_DNS_ENTRIES; round++) {
-        unsigned idx = (g_fake_dns_next + (unsigned)round) % FAKE_DNS_ENTRIES;
-        fake_dns_entry_t *e = &g_fake_dns[idx];
+        unsigned idx = (g.fake_dns_next + (unsigned)round) % FAKE_DNS_ENTRIES;
+        fake_dns_entry_t *e = &g.fake_dns[idx];
         if (!e->in_use || now - e->last_used > FAKE_DNS_IDLE_SEC) {
             e->in_use = 1;
             e->fake_ip = htonl(FAKE_IP_BASE + idx + 1);
             strncpy(e->domain, domain, sizeof(e->domain) - 1);
             e->domain[sizeof(e->domain) - 1] = '\0';
             e->last_used = now;
-            g_fake_dns_next = (idx + 1) % FAKE_DNS_ENTRIES;
+            g.fake_dns_next = (idx + 1) % FAKE_DNS_ENTRIES;
             fake = e->fake_ip;
             fake_dns_build_ip6((int)idx, e->fake_ip6);
             if (ip6_out) memcpy(ip6_out, e->fake_ip6, 16);
@@ -239,14 +265,14 @@ static uint32_t fake_dns_alloc(const char *domain, unsigned char ip6_out[16]) {
     {
         unsigned oldest = 0;
         for (int i = 1; i < FAKE_DNS_ENTRIES; i++)
-            if (g_fake_dns[i].last_used < g_fake_dns[oldest].last_used) oldest = (unsigned)i;
-        fake_dns_entry_t *e = &g_fake_dns[oldest];
+            if (g.fake_dns[i].last_used < g.fake_dns[oldest].last_used) oldest = (unsigned)i;
+        fake_dns_entry_t *e = &g.fake_dns[oldest];
         e->in_use = 1;
         e->fake_ip = htonl(FAKE_IP_BASE + oldest + 1);
         strncpy(e->domain, domain, sizeof(e->domain) - 1);
         e->domain[sizeof(e->domain) - 1] = '\0';
         e->last_used = now;
-        g_fake_dns_next = (oldest + 1) % FAKE_DNS_ENTRIES;
+        g.fake_dns_next = (oldest + 1) % FAKE_DNS_ENTRIES;
         fake = e->fake_ip;
         fake_dns_build_ip6((int)oldest, e->fake_ip6);
         if (ip6_out) memcpy(ip6_out, e->fake_ip6, 16);
@@ -260,7 +286,7 @@ out:
 static int fake_dns_lookup(uint32_t fake_ip, char *domain, size_t dn) {
     pthread_mutex_lock(&g_fake_dns_lock);
     for (int i = 0; i < FAKE_DNS_ENTRIES; i++) {
-        fake_dns_entry_t *e = &g_fake_dns[i];
+        fake_dns_entry_t *e = &g.fake_dns[i];
         if (e->in_use && e->fake_ip == fake_ip) {
             e->last_used = time(NULL);
             strncpy(domain, e->domain, dn - 1);
@@ -278,7 +304,7 @@ static uint32_t fake_dns_find_domain(const char *domain) {
     uint32_t fake = 0;
     pthread_mutex_lock(&g_fake_dns_lock);
     for (int i = 0; i < FAKE_DNS_ENTRIES; i++) {
-        fake_dns_entry_t *e = &g_fake_dns[i];
+        fake_dns_entry_t *e = &g.fake_dns[i];
         if (e->in_use && strcasecmp(e->domain, domain) == 0) {
             e->last_used = time(NULL);
             fake = e->fake_ip;
@@ -293,7 +319,7 @@ static uint32_t fake_dns_find_domain(const char *domain) {
 static int fake_dns_lookup6(const unsigned char ip6[16], char *domain, size_t dn) {
     pthread_mutex_lock(&g_fake_dns_lock);
     for (int i = 0; i < FAKE_DNS_ENTRIES; i++) {
-        fake_dns_entry_t *e = &g_fake_dns[i];
+        fake_dns_entry_t *e = &g.fake_dns[i];
         if (e->in_use && memcmp(e->fake_ip6, ip6, 16) == 0) {
             e->last_used = time(NULL);
             strncpy(domain, e->domain, dn - 1);
@@ -384,7 +410,7 @@ static void write_ipv4_udp_to_tun_ex(const ip_addr_t *app_ip, uint16_t app_port,
     uint16_t ucsum = tcpudp_checksum4(remote->ip, app_ip->ip, 17, pkt + u, 8 + plen);
     pkt[u + 6] = ucsum >> 8; pkt[u + 7] = ucsum & 0xFF;
 
-    ssize_t w = write(g_tun_fd, pkt, total);
+    ssize_t w = write(g.tun_fd, pkt, total);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun failed: %s", strerror(errno));
 }
 
@@ -414,7 +440,7 @@ static void write_ipv6_udp_to_tun_ex(const ip_addr_t *app_ip, uint16_t app_port,
     uint16_t ucsum = tcpudp_checksum6(remote->ip, app_ip->ip, 17, pkt + u, 8 + plen);
     pkt[u + 6] = ucsum >> 8; pkt[u + 7] = ucsum & 0xFF;
 
-    ssize_t w = write(g_tun_fd, pkt, total);
+    ssize_t w = write(g.tun_fd, pkt, total);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun failed: %s", strerror(errno));
 }
 
@@ -428,7 +454,7 @@ static void write_ipv6_udp_to_tun(udp_sess_t *sess, const ip_addr_t *remote, uin
 
 static void write_udp_to_tun(udp_sess_t *sess, const ip_addr_t *remote, uint16_t remote_port, const unsigned char *payload, size_t plen) {
     if (remote->family != sess->src_ip.family) { LOGE("relay 回應 family 不符，丟棄"); return; }
-    atomic_fetch_add(&g_bytes_from_server, (unsigned long long)plen);
+    atomic_fetch_add(&g.bytes_from_server, (unsigned long long)plen);
     if (sess->src_ip.family == AF_INET6) write_ipv6_udp_to_tun(sess, remote, remote_port, payload, plen);
     else write_ipv4_udp_to_tun(sess, remote, remote_port, payload, plen);
 }
@@ -475,8 +501,8 @@ static void handle_relay_udp(udp_sess_t *sess, const unsigned char *buf, ssize_t
 
 // ---------- handshake 執行緒池 ----------
 // 以固定 worker 數取代 per-session detached thread，避免連線尖峰時大量建立執行緒。
-// submit 遞增 g_handshake_inflight、job 結尾遞減；關閉時確定性排空並 join worker。
-#define HS_POOL_WORKERS 16
+// submit 遞增 g.handshake_inflight、job 結尾遞減；關閉時確定性排空並 join worker。
+// HS_POOL_WORKERS 定義已移至上方 engine_ctx_t（供 struct 陣列維度使用）。
 
 typedef struct hs_job {
     void *(*fn)(void *);
@@ -484,28 +510,23 @@ typedef struct hs_job {
     struct hs_job *next;
 } hs_job_t;
 
-static pthread_t g_hs_workers[HS_POOL_WORKERS];
-static int g_hs_worker_count = 0;
 static pthread_mutex_t g_hs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_hs_cond = PTHREAD_COND_INITIALIZER;
-static hs_job_t *g_hs_head = NULL;
-static hs_job_t *g_hs_tail = NULL;
-static int g_hs_running = 0;
 
 static void *hs_worker(void *arg) {
     (void)arg;
     jni_attach_thread();
     for (;;) {
         pthread_mutex_lock(&g_hs_lock);
-        while (g_hs_running && !g_hs_head)
+        while (g.hs_running && !g.hs_head)
             pthread_cond_wait(&g_hs_cond, &g_hs_lock);
-        if (!g_hs_running && !g_hs_head) {
+        if (!g.hs_running && !g.hs_head) {
             pthread_mutex_unlock(&g_hs_lock);
             break;
         }
-        hs_job_t *job = g_hs_head;
-        g_hs_head = job->next;
-        if (!g_hs_head) g_hs_tail = NULL;
+        hs_job_t *job = g.hs_head;
+        g.hs_head = job->next;
+        if (!g.hs_head) g.hs_tail = NULL;
         pthread_mutex_unlock(&g_hs_lock);
         job->fn(job->arg);
         free(job);
@@ -515,24 +536,24 @@ static void *hs_worker(void *arg) {
 }
 
 static void hs_pool_start(void) {
-    if (g_hs_running) return;
-    g_hs_running = 1;
-    g_hs_worker_count = 0;
+    if (g.hs_running) return;
+    g.hs_running = 1;
+    g.hs_worker_count = 0;
     for (int i = 0; i < HS_POOL_WORKERS; i++) {
-        if (pthread_create(&g_hs_workers[g_hs_worker_count], NULL, hs_worker, NULL) == 0)
-            g_hs_worker_count++;
+        if (pthread_create(&g.hs_workers[g.hs_worker_count], NULL, hs_worker, NULL) == 0)
+            g.hs_worker_count++;
     }
 }
 
 static void hs_pool_stop(void) {
-    if (!g_hs_running) return;
+    if (!g.hs_running) return;
     pthread_mutex_lock(&g_hs_lock);
-    g_hs_running = 0;
+    g.hs_running = 0;
     pthread_cond_broadcast(&g_hs_cond);
     pthread_mutex_unlock(&g_hs_lock);
-    for (int i = 0; i < g_hs_worker_count; i++)
-        pthread_join(g_hs_workers[i], NULL);
-    g_hs_worker_count = 0;
+    for (int i = 0; i < g.hs_worker_count; i++)
+        pthread_join(g.hs_workers[i], NULL);
+    g.hs_worker_count = 0;
 }
 
 static int hs_submit(void *(*fn)(void *), void *arg) {
@@ -541,17 +562,17 @@ static int hs_submit(void *(*fn)(void *), void *arg) {
     job->fn = fn;
     job->arg = arg;
     job->next = NULL;
-    atomic_fetch_add(&g_handshake_inflight, 1);
+    atomic_fetch_add(&g.handshake_inflight, 1);
     pthread_mutex_lock(&g_hs_lock);
-    if (!g_hs_running) {
+    if (!g.hs_running) {
         pthread_mutex_unlock(&g_hs_lock);
-        atomic_fetch_sub(&g_handshake_inflight, 1);
+        atomic_fetch_sub(&g.handshake_inflight, 1);
         free(job);
         return -1;
     }
-    if (g_hs_tail) g_hs_tail->next = job;
-    else g_hs_head = job;
-    g_hs_tail = job;
+    if (g.hs_tail) g.hs_tail->next = job;
+    else g.hs_head = job;
+    g.hs_tail = job;
     pthread_cond_signal(&g_hs_cond);
     pthread_mutex_unlock(&g_hs_lock);
     return 0;
@@ -577,7 +598,7 @@ static void udp_tcp_append(udp_sess_t *sess, const unsigned char *frame, size_t 
         struct epoll_event ev;
         ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR;
         ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, sess->control_fd, &ev) == 0) sess->tx_armed = 1;
+        if (epoll_ctl(g.epoll_fd, EPOLL_CTL_MOD, sess->control_fd, &ev) == 0) sess->tx_armed = 1;
     }
 }
 
@@ -600,7 +621,7 @@ static int udp_tcp_flush(udp_sess_t *sess) {
             struct epoll_event ev;
             ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR;
             ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
-            if (epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, sess->control_fd, &ev) == 0) sess->tx_armed = 0;
+            if (epoll_ctl(g.epoll_fd, EPOLL_CTL_MOD, sess->control_fd, &ev) == 0) sess->tx_armed = 0;
         }
     }
     return 0;
@@ -649,11 +670,11 @@ static void forward_udp_to_server(udp_sess_t *sess, const ip_addr_t *dst, uint16
     memset(frame + 2, 0, 4);
     char dom[256];
     int use_domain = 0;
-    if (g_remote_dns && dst->family == AF_INET) {
+    if (g.remote_dns && dst->family == AF_INET) {
         uint32_t k;
         memcpy(&k, dst->ip, 4);
         use_domain = fake_dns_lookup(k, dom, sizeof dom);
-    } else if (g_remote_dns && dst->family == AF_INET6) {
+    } else if (g.remote_dns && dst->family == AF_INET6) {
         // fake IPv6 → 以網域撥號（Remote DNS 的 AAAA 路徑）
         use_domain = fake_dns_lookup6(dst->ip, dom, sizeof dom);
     }
@@ -676,7 +697,7 @@ static void forward_udp_to_server(udp_sess_t *sess, const ip_addr_t *dst, uint16
         off = 2 + 10;
     }
     memcpy(frame + off, payload, plen);
-    atomic_fetch_add(&g_bytes_to_server, (unsigned long long)plen);
+    atomic_fetch_add(&g.bytes_to_server, (unsigned long long)plen);
     int datalen = (int)(off - 2 + plen);
     frame[0] = (unsigned char)(datalen >> 8);
     frame[1] = (unsigned char)(datalen & 0xFF);
@@ -693,11 +714,12 @@ static void forward_udp_to_server(udp_sess_t *sess, const ip_addr_t *dst, uint16
 
 static void *udp_session_thread(void *arg);
 
-// 攔截 App 的 DNS 查詢（A/AAAA、單一 question、IN class）：
-// 分配 fake IP 並合成回覆寫回 TUN；回傳 1=已處理，0=放行走 relay。
-static int dns_try_intercept(const unsigned char *q, size_t qlen,
-                             const ip_addr_t *src_ip, const ip_addr_t *dst_ip,
-                             uint16_t sport, uint16_t dport) {
+// 解析並合成單一 DNS query（A/AAAA/HTTPS）的 fake 回覆，不寫 TUN。
+// always_answer=0（UDP）：僅 A/AAAA/HTTPS 攔截，其餘回 0 放行走 relay。
+// always_answer=1（TCP）：任何合法 query 都產生回覆（A/AAAA fake、其餘 NOERROR 空答）。
+// 回傳 1 = reply/rlen 有效；0 = 放行（UDP）或解析失敗。
+static int dns_build_reply(const unsigned char *q, size_t qlen, int always_answer,
+                           unsigned char *reply, size_t *rlen) {
     if (qlen < 17) return 0;
     uint16_t flags = (uint16_t)((q[2] << 8) | q[3]);
     if (flags & 0x8000) return 0;                 // 不是查詢
@@ -731,13 +753,17 @@ static int dns_try_intercept(const unsigned char *q, size_t qlen,
     uint16_t qtype = (uint16_t)((q[off] << 8) | q[off + 1]);
     uint16_t qclass = (uint16_t)((q[off + 2] << 8) | q[off + 3]);
     if (qclass != 1) return 0;                    // 僅 IN
-    if (qtype != 1 && qtype != 28 && qtype != 65) return 0;   // 僅 A / AAAA / HTTPS(65)
+    int supported = (qtype == 1 || qtype == 28 || qtype == 65);
+    if (!supported && !always_answer) return 0;
     name[nlen] = '\0';
     size_t qend = off + 4;
 
     unsigned char fake6[16];
-    uint32_t fake = fake_dns_alloc(name, fake6);
-    if (!fake) return 0;
+    uint32_t fake = 0;
+    if (qtype == 1 || qtype == 28) {
+        fake = fake_dns_alloc(name, fake6);
+        if (!fake) return 0;
+    }
 
     unsigned char r[512];
     size_t rl = 0;
@@ -770,8 +796,20 @@ static int dns_try_intercept(const unsigned char *q, size_t qlen,
         r[rl++] = 0; r[rl++] = 16;                 // RDLENGTH
         memcpy(r + rl, fake6, 16); rl += 16;
     }
-    // HTTPS（qtype=65）：回 NOERROR 空答 → App 自動退回 A/AAAA 查詢
-    write_udp_reply_to_tun(src_ip, sport, dst_ip, dport, r, rl);
+    // HTTPS（qtype=65）或 TCP 下其他型別：NOERROR 空答
+    memcpy(reply, r, rl);
+    *rlen = rl;
+    return 1;
+}
+
+// UDP 路徑：攔截 DNS 查詢並以 fake IP 回覆；回傳 1=已處理，0=放行走 relay。
+static int dns_try_intercept(const unsigned char *q, size_t qlen,
+                             const ip_addr_t *src_ip, const ip_addr_t *dst_ip,
+                             uint16_t sport, uint16_t dport) {
+    unsigned char reply[512];
+    size_t rlen = 0;
+    if (!dns_build_reply(q, qlen, 0, reply, &rlen)) return 0;
+    write_udp_reply_to_tun(src_ip, sport, dst_ip, dport, reply, rlen);
     return 1;
 }
 
@@ -788,7 +826,7 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
     if (u + 8 + payload_len > len) payload_len = len - u - 8;
 
     // Remote DNS：攔截 UDP/53 查詢，直接回覆 fake IP（不建立 relay 會話）
-    if (g_remote_dns && ntohs(dport) == 53) {
+    if (g.remote_dns && ntohs(dport) == 53) {
         if (dns_try_intercept(pkt + u + 8, payload_len, src_ip, dst_ip, sport, dport)) return;
     }
 
@@ -797,10 +835,10 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
     udp_sess_t *sess = NULL;
     int created = 0;
     pthread_mutex_lock(&g_udp_hash_lock);
-    for (udp_sess_t *s = g_udp_hash[idx]; s; s = s->next) {
+    for (udp_sess_t *s = g.udp_hash[idx]; s; s = s->next) {
         if (ip_addr_eq(&s->src_ip, src_ip) && s->src_port == sport && !s->closed) { sess = s; break; }
     }
-    if (!sess && atomic_load(&g_udp_session_count) < MAX_UDP_SESSIONS) {
+    if (!sess && atomic_load(&g.udp_session_count) < MAX_UDP_SESSIONS) {
         sess = calloc(1, sizeof(udp_sess_t));
         if (sess) {
             sess->src_ip = *src_ip;
@@ -808,9 +846,9 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
             sess->control_fd = -1;
             sess->relay_fd = -1;
             sess->last_active = time(NULL);
-            sess->next = g_udp_hash[idx];
-            g_udp_hash[idx] = sess;
-            atomic_fetch_add(&g_udp_session_count, 1);
+            sess->next = g.udp_hash[idx];
+            g.udp_hash[idx] = sess;
+            atomic_fetch_add(&g.udp_session_count, 1);
             created = 1;
         }
     }
@@ -838,7 +876,7 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
         if (hs_submit(udp_session_thread, sess) != 0) {
             // 提交失敗：移除會話，避免永久卡在 connecting
             pthread_mutex_lock(&g_udp_hash_lock);
-            udp_sess_t **pp = &g_udp_hash[idx];
+            udp_sess_t **pp = &g.udp_hash[idx];
             while (*pp && *pp != sess) pp = &(*pp)->next;
             if (*pp) {
                 *pp = sess->next;
@@ -846,7 +884,7 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
                 pthread_mutex_unlock(&g_udp_hash_lock);
                 udp_sess_free_bufs(sess);
                 free(sess);
-                atomic_fetch_sub(&g_udp_session_count, 1);
+                atomic_fetch_sub(&g.udp_session_count, 1);
             } else {
                 pthread_mutex_unlock(&g_udp_hash_lock);
             }
@@ -909,25 +947,25 @@ static void *udp_session_thread(void *arg) {
     int network_fail = 1;   // 網路層失敗旗標（同 tcp_connect_thread）
 
     // 1. TCP 控制連線（Java 已 connect + protect）
-    cfd = request_java_socket(g_srv_host, g_srv_port, 0);
+    cfd = request_java_socket(g.srv_host, g.srv_port, 0);
     if (cfd < 0) goto fail;
-    if (!g_running) { network_fail = 0; goto fail; }
+    if (!g.running) { network_fail = 0; goto fail; }
     struct timeval tv = {HANDSHAKE_TIMEOUT_SEC, 0};
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 
     // 2. SOCKS5 握手
-    buf[0] = 0x05; buf[1] = 0x01; buf[2] = g_auth_enabled ? 0x02 : 0x00;
+    buf[0] = 0x05; buf[1] = 0x01; buf[2] = g.auth_enabled ? 0x02 : 0x00;
     if (send_all(cfd, buf, 3) < 0) goto fail;
     if (recv_all(cfd, buf, 2) < 0) goto fail;
     if (buf[0] != 0x05) { network_fail = 0; goto fail; }   // 對方不是 SOCKS5
     if (buf[1] == 0x02) {
         // RFC 1929
-        size_t ul = strlen(g_auth_user), pl = strlen(g_auth_pass);
+        size_t ul = strlen(g.auth_user), pl = strlen(g.auth_pass);
         buf[0] = 0x01; buf[1] = (unsigned char)ul;
-        memcpy(buf + 2, g_auth_user, ul);
+        memcpy(buf + 2, g.auth_user, ul);
         buf[2 + ul] = (unsigned char)pl;
-        memcpy(buf + 3 + ul, g_auth_pass, pl);
+        memcpy(buf + 3 + ul, g.auth_pass, pl);
         if (send_all(cfd, buf, 3 + ul + pl) < 0) goto fail;
         if (recv_all(cfd, buf, 2) < 0) goto fail;
         if (buf[0] != 0x01 || buf[1] != 0x00) { network_fail = 0; goto fail; }   // 認證被拒
@@ -939,7 +977,7 @@ static void *udp_session_thread(void *arg) {
     // 3. UDP ASSOCIATE
     unsigned char req[10] = {0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
     int udp_tcp = 0;
-    if (g_udp_in_tcp) {
+    if (g.udp_in_tcp) {
         // 先嘗試 UDP-in-TCP（自訂擴充指令 0x04）
         req[1] = 0x04;
         if (send_all(cfd, req, 10) < 0) goto fail;
@@ -995,9 +1033,9 @@ static void *udp_session_thread(void *arg) {
         }
 
         // 4. UDP relay socket（Java protect，未 connect，由 sendto 指定目標）
-        rfd = request_java_socket(g_srv_host, g_srv_port, 1);
+        rfd = request_java_socket(g.srv_host, g.srv_port, 1);
         if (rfd < 0) goto fail;
-        if (!g_running) { network_fail = 0; goto fail; }
+        if (!g.running) { network_fail = 0; goto fail; }
         set_nonblocking(rfd);
     } else {
         // UDP-in-TCP：初始化 frame 串流的收發緩衝
@@ -1010,7 +1048,7 @@ static void *udp_session_thread(void *arg) {
         if (!sess->tx_buf || !sess->rx_buf) goto fail;
     }
 
-    if (!g_running) goto fail;
+    if (!g.running) goto fail;
     set_nonblocking(cfd);
     sess->control_fd = cfd;
     sess->relay_fd = rfd;
@@ -1044,16 +1082,16 @@ static void *udp_session_thread(void *arg) {
         unsigned int uev = EPOLLIN | EPOLLRDHUP | EPOLLERR;
         if (sess->tx_len > 0) uev |= EPOLLOUT;   // 首包已入隊：需立即排空
         ev.events = uev; ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
+        if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
     } else {
         ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR; ev.data.ptr = sess;
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
+        if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
         ev.events = EPOLLIN | EPOLLERR | EPOLLHUP; ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, rfd, &ev) < 0) { epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, cfd, NULL); goto fail; }
+        if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, rfd, &ev) < 0) { epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, cfd, NULL); goto fail; }
     }
 
     atomic_store(&sess->thread_done, 1);   // 先標記，engine 才可安全 free（shutdown 等 inflight==0）
-    atomic_fetch_sub(&g_handshake_inflight, 1);
+    atomic_fetch_sub(&g.handshake_inflight, 1);
     if (udp_tcp) LOGI("udp handshake 完成: UDP-in-TCP (relay 走同一 TCP)");
     else {
         char rbuf[64];
@@ -1079,23 +1117,23 @@ fail:
         LOGI("udp handshake 失敗 (src=%s:%d)", b1, ntohs(sess->src_port));
     }
     if (network_fail) notify_server_event(0);
-    if (cfd >= 0) { release_java_socket(cfd); close(cfd); sess->control_fd = -1; }
-    if (rfd >= 0) { release_java_socket(rfd); close(rfd); sess->relay_fd = -1; }
+    if (cfd >= 0) { release_java_socket(cfd); sess->control_fd = -1; }
+    if (rfd >= 0) { release_java_socket(rfd); sess->relay_fd = -1; }
     // 從 hash 移除；記憶體保留至線程結束（thread_done=1）後由 graveyard collect 釋放，
     // 避免 engine（handle_tun_udp）在 unlock 後仍使用 sess 造成 UAF
     pthread_mutex_lock(&g_udp_hash_lock);
     unsigned idx = udp_hash_idx(&sess->src_ip, sess->src_port);
-    udp_sess_t **pp = &g_udp_hash[idx];
+    udp_sess_t **pp = &g.udp_hash[idx];
     while (*pp && *pp != sess) pp = &(*pp)->next;
     if (*pp && !sess->closed) {
         *pp = sess->next;
         sess->closed = 1;
-        sess->next = g_udp_graveyard;
-        g_udp_graveyard = sess;
+        sess->next = g.udp_graveyard;
+        g.udp_graveyard = sess;
     }
     pthread_mutex_unlock(&g_udp_hash_lock);
     atomic_store(&sess->thread_done, 1);
-    atomic_fetch_sub(&g_handshake_inflight, 1);
+    atomic_fetch_sub(&g.handshake_inflight, 1);
     return NULL;
 }
 
@@ -1143,15 +1181,15 @@ static void handle_relay_udp(udp_sess_t *sess, const unsigned char *buf, ssize_t
 
 static void close_session_fds(udp_sess_t *sess) {
     if (sess->control_fd >= 0) {
-        if (g_epoll_fd >= 0) epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, sess->control_fd, NULL);
+        if (g.epoll_fd >= 0) epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, sess->control_fd, NULL);
+        // fd 由 Java 端（activeSockets）唯一 close：native 只移除 epoll 註冊並交還，
+        // 避免 detachFd 後 Java Socket 與 native 對同一 fd 雙重 close（fd 可能已被重用）。
         release_java_socket(sess->control_fd);
-        close(sess->control_fd);
         sess->control_fd = -1;
     }
     if (sess->relay_fd >= 0) {
-        if (g_epoll_fd >= 0) epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, sess->relay_fd, NULL);
+        if (g.epoll_fd >= 0) epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, sess->relay_fd, NULL);
         release_java_socket(sess->relay_fd);
-        close(sess->relay_fd);
         sess->relay_fd = -1;
     }
 }
@@ -1163,14 +1201,14 @@ static void close_session_fds(udp_sess_t *sess) {
 // 呼叫端須先關閉 fds（或先呼叫 close_session_fds），且已自 hash unlink。
 static void udp_sess_release(udp_sess_t *sess) {
     pthread_mutex_lock(&g_udp_hash_lock);
-    sess->next = g_udp_graveyard;
-    g_udp_graveyard = sess;
+    sess->next = g.udp_graveyard;
+    g.udp_graveyard = sess;
     pthread_mutex_unlock(&g_udp_hash_lock);
 }
 
 static void udp_graveyard_collect(void) {
     pthread_mutex_lock(&g_udp_hash_lock);
-    udp_sess_t **pp = &g_udp_graveyard;
+    udp_sess_t **pp = &g.udp_graveyard;
     while (*pp) {
         udp_sess_t *s = *pp;
         if (atomic_load(&s->thread_done)) {
@@ -1179,7 +1217,7 @@ static void udp_graveyard_collect(void) {
             close_session_fds(s);
             udp_sess_free_bufs(s);
             free(s);
-            atomic_fetch_sub(&g_udp_session_count, 1);
+            atomic_fetch_sub(&g.udp_session_count, 1);
             pthread_mutex_lock(&g_udp_hash_lock);
         } else {
             pp = &s->next;
@@ -1242,13 +1280,13 @@ static ssize_t write_tcp_to_tun(const ip_addr_t *saddr, const ip_addr_t *daddr,
     uint16_t tcsum = transport_checksum(saddr->family, saddr->ip, daddr->ip, 6, pkt + u, 20 + plen);
     pkt[u + 16] = tcsum >> 8; pkt[u + 17] = tcsum & 0xFF;
 
-    ssize_t w = write(g_tun_fd, pkt, total);
+    ssize_t w = write(g.tun_fd, pkt, total);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun tcp failed: %s", strerror(errno));
     return w;
 }
 
 static void send_tcp_synack(tcp_sess_t *sess) {
-    if (g_tun_fd < 0) return;
+    if (g.tun_fd < 0) return;
     int is6 = (sess->src_ip.family == AF_INET6);
     size_t ip_hlen = is6 ? 40 : 20;
     unsigned char pkt[TUN_MTU];
@@ -1300,7 +1338,7 @@ static void send_tcp_synack(tcp_sess_t *sess) {
     uint16_t tcsum = transport_checksum(sess->src_ip.family, sess->dst_ip.ip, sess->src_ip.ip, 6, pkt + u, 32);
     pkt[u + 16] = tcsum >> 8; pkt[u + 17] = tcsum & 0xFF;
 
-    ssize_t w = write(g_tun_fd, pkt, total);
+    ssize_t w = write(g.tun_fd, pkt, total);
     if (w < 0) LOGE("write tun SYN-ACK failed: %s (errno=%d)", strerror(errno), errno);
     else if (w != (ssize_t)total) LOGI("write tun SYN-ACK partial %zd/%zu", w, total);
 }
@@ -1328,7 +1366,7 @@ static void send_session_rst(tcp_sess_t *sess) {
                      0, sess->app_next, 0x14, NULL, 0, 0);
 }
 
-// ---------- 背景連線用 IO（poll 短循環 + g_running 檢查） ----------
+// ---------- 背景連線用 IO（poll 短循環 + g.running 檢查） ----------
 
 static int wait_fd(int fd, short events, int timeout_ms) {
     int waited = 0;
@@ -1338,7 +1376,7 @@ static int wait_fd(int fd, short events, int timeout_ms) {
         if (r > 0) return 0;
         if (r < 0) return -1;
         waited += 100;
-        if (!g_running) return -1;
+        if (!g.running) return -1;
     }
     return -1;
 }
@@ -1378,13 +1416,12 @@ static int net_recv_all(int fd, unsigned char *buf, size_t len) {
 static void tcp_session_destroy(tcp_sess_t *sess) {
     int fd = atomic_load(&sess->srv_fd);
     if (fd >= 0) {
-        if (g_epoll_fd >= 0) epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        if (g.epoll_fd >= 0) epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, fd, NULL);
         release_java_socket(fd);
-        close(fd);
         atomic_store(&sess->srv_fd, -1);
     }
     unsigned idx = tcp_hash_idx(&sess->src_ip, sess->src_port);
-    tcp_sess_t **pp = &g_tcp_hash[idx];
+    tcp_sess_t **pp = &g.tcp_hash[idx];
     while (*pp && *pp != sess) pp = &(*pp)->next;
     if (!*pp) {
         // 已不在 hash（可能已進 graveyard）→ 防止 double free
@@ -1394,20 +1431,21 @@ static void tcp_session_destroy(tcp_sess_t *sess) {
     *pp = sess->next;
     // 一律移入 graveyard，由 tcp_graveyard_collect()（每批 epoll 事件處理完）統一 free。
     // 若 thread_done==1 時立即 free，本批事件中殘留的同 session 事件會讀到已釋放記憶體（UAF）。
-    sess->next = g_tcp_graveyard;
-    g_tcp_graveyard = sess;
+    sess->next = g.tcp_graveyard;
+    g.tcp_graveyard = sess;
 }
 
 static void tcp_graveyard_collect(void) {
-    tcp_sess_t **pp = &g_tcp_graveyard;
+    tcp_sess_t **pp = &g.tcp_graveyard;
     while (*pp) {
         tcp_sess_t *s = *pp;
         if (atomic_load(&s->thread_done)) {
             *pp = s->next;
             free(s->app_buf);
             free(s->srv_buf);
+            free(s->dns_rx_buf);
             free(s);
-            atomic_fetch_sub(&g_tcp_session_count, 1);
+            atomic_fetch_sub(&g.tcp_session_count, 1);
         } else {
             pp = &s->next;
         }
@@ -1432,7 +1470,7 @@ static void set_srv_events(tcp_sess_t *sess) {
     ev.events = EPOLLERR | EPOLLRDHUP | (sess->srv_in_off ? 0 : EPOLLIN)
               | (sess->want_out ? EPOLLOUT : 0);
     ev.data.ptr = (tcp_sess_t *)((uintptr_t)sess | 3);
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+    epoll_ctl(g.epoll_fd, EPOLL_CTL_MOD, fd, &ev);
 }
 
 static void set_srv_out(tcp_sess_t *sess, int enable) {
@@ -1448,12 +1486,12 @@ static void set_srv_in(tcp_sess_t *sess, int enable) {
 }
 
 static void set_tun_epoll_out(int enable) {
-    if (g_tun_want_out == enable || g_tun_fd < 0 || g_epoll_fd < 0) return;
-    g_tun_want_out = enable;
+    if (g.tun_want_out == enable || g.tun_fd < 0 || g.epoll_fd < 0) return;
+    g.tun_want_out = enable;
     struct epoll_event ev;
     ev.events = EPOLLIN | (enable ? EPOLLOUT : 0);
-    ev.data.fd = g_tun_fd;
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_MOD, g_tun_fd, &ev);
+    ev.data.fd = g.tun_fd;
+    epoll_ctl(g.epoll_fd, EPOLL_CTL_MOD, g.tun_fd, &ev);
 }
 
 // server→App：把緩衝的資料切成 TCP segment 寫回 TUN
@@ -1493,7 +1531,7 @@ static void flush_tcp_app_buf(tcp_sess_t *sess) {
     while (sess->app_len > 0) {
         ssize_t n = send(fd, sess->app_buf + sess->app_off, sess->app_len, MSG_NOSIGNAL);
         if (n > 0) {
-            atomic_fetch_add(&g_bytes_to_server, (unsigned long long)n);
+            atomic_fetch_add(&g.bytes_to_server, (unsigned long long)n);
             sess->app_off += (size_t)n;
             sess->app_len -= (size_t)n;
             if (sess->app_len == 0) sess->app_off = 0;
@@ -1529,7 +1567,7 @@ static unsigned char *app_buf_reserve(tcp_sess_t *sess, size_t need) {
 static void flush_all_tcp(void) {
     int any_pending = 0;
     for (int b = 0; b < TCP_HASH_BUCKETS; b++) {
-        tcp_sess_t *s = g_tcp_hash[b];
+        tcp_sess_t *s = g.tcp_hash[b];
         while (s) {
             tcp_sess_t *n = s->next;
             if (!s->closed && atomic_load(&s->state) == 1) {
@@ -1550,7 +1588,7 @@ static void tcp_engine_sweep(void) {
     tcp_sess_t *garbage[128];
     int gc = 0;
     for (int b = 0; b < TCP_HASH_BUCKETS && gc < 128; b++) {
-        for (tcp_sess_t *s = g_tcp_hash[b]; s && gc < 128; s = s->next) {
+        for (tcp_sess_t *s = g.tcp_hash[b]; s && gc < 128; s = s->next) {
             if (!s->closed && atomic_load(&s->handshake_failed)) { s->closed = 1; garbage[gc++] = s; }
         }
     }
@@ -1565,21 +1603,21 @@ static void *tcp_connect_thread(void *arg) {
     int fd_stored = 0;   // srv_fd 是否已交由 engine 管理（之後線程不再 close）
     int network_fail = 1;   // 網路層失敗旗標：伺服器明確拒絕（auth/REP≠0/非 SOCKS5）時清除，不觸發自動重連
 
-    sfd = request_java_socket(g_srv_host, g_srv_port, 0);
+    sfd = request_java_socket(g.srv_host, g.srv_port, 0);
     if (sfd < 0) goto fail;
-    if (!g_running) { network_fail = 0; goto fail; }
+    if (!g.running) { network_fail = 0; goto fail; }
     set_nonblocking(sfd);
 
-    buf[0] = 0x05; buf[1] = 0x01; buf[2] = g_auth_enabled ? 0x02 : 0x00;
+    buf[0] = 0x05; buf[1] = 0x01; buf[2] = g.auth_enabled ? 0x02 : 0x00;
     if (net_send_all(sfd, buf, 3) < 0) goto fail;
     if (net_recv_all(sfd, buf, 2) < 0) goto fail;
     if (buf[0] != 0x05) { network_fail = 0; goto fail; }   // 對方不是 SOCKS5：重連無益
     if (buf[1] == 0x02) {
-        size_t ul = strlen(g_auth_user), pl = strlen(g_auth_pass);
+        size_t ul = strlen(g.auth_user), pl = strlen(g.auth_pass);
         buf[0] = 0x01; buf[1] = (unsigned char)ul;
-        memcpy(buf + 2, g_auth_user, ul);
+        memcpy(buf + 2, g.auth_user, ul);
         buf[2 + ul] = (unsigned char)pl;
-        memcpy(buf + 3 + ul, g_auth_pass, pl);
+        memcpy(buf + 3 + ul, g.auth_pass, pl);
         if (net_send_all(sfd, buf, 3 + ul + pl) < 0) goto fail;
         if (net_recv_all(sfd, buf, 2) < 0) goto fail;
         if (buf[0] != 0x01 || buf[1] != 0x00) { network_fail = 0; goto fail; }   // 認證被拒
@@ -1632,13 +1670,13 @@ static void *tcp_connect_thread(void *arg) {
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR;
     ev.data.ptr = (tcp_sess_t *)((uintptr_t)sess | 3);
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, sfd, &ev) < 0) {
+    if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, sfd, &ev) < 0) {
         // fd 已交予 engine（srv_fd=sfd），engine 銷毀時會關閉，線程不再 close
         atomic_store(&sess->handshake_failed, 1);
-        if (g_kick_pipe[1] >= 0) { char k = 1; write(g_kick_pipe[1], &k, 1); }
+        if (g.kick_pipe[1] >= 0) { char k = 1; write(g.kick_pipe[1], &k, 1); }
         goto done;
     }
-    if (g_kick_pipe[1] >= 0) { char k = 1; write(g_kick_pipe[1], &k, 1); }
+    if (g.kick_pipe[1] >= 0) { char k = 1; write(g.kick_pipe[1], &k, 1); }
     char b1[64];
     ip_to_str(&sess->dst_ip, b1, sizeof b1);
     LOGI("tcp connect 完成 -> %s:%d", b1, ntohs(sess->dst_port));
@@ -1650,15 +1688,74 @@ fail:
     LOGI("tcp connect 失敗 -> %s:%d", b1, ntohs(sess->dst_port));
     if (network_fail) notify_server_event(0);
     // 只有 store 前（fd_stored==0）的失敗才由線程 close；store 後 fd 屬 engine 所有
-    if (sfd >= 0 && !fd_stored) { release_java_socket(sfd); close(sfd); }
-    if (g_tun_fd >= 0) send_session_rst(sess);
+    if (sfd >= 0 && !fd_stored) { release_java_socket(sfd); }
+    if (g.tun_fd >= 0) send_session_rst(sess);
     atomic_store(&sess->handshake_failed, 1);
-    if (g_kick_pipe[1] >= 0) { char k = 1; write(g_kick_pipe[1], &k, 1); }
+    if (g.kick_pipe[1] >= 0) { char k = 1; write(g.kick_pipe[1], &k, 1); }
 
 done:
     atomic_store(&sess->thread_done, 1);   // 先標記，engine 才可安全 free（shutdown 等 inflight==0）
-    atomic_fetch_sub(&g_handshake_inflight, 1);
+    atomic_fetch_sub(&g.handshake_inflight, 1);
     return NULL;
+}
+
+// DNS-over-TCP：把 [2-byte 長度前綴 + DNS 回覆] 排入 srv_buf（server→app 緩衝）
+static void dns_tcp_emit(tcp_sess_t *sess, const unsigned char *reply, size_t rlen) {
+    size_t total = 2 + rlen;
+    if (sess->srv_buf == NULL) sess->srv_buf = malloc(TCP_SRV_BUF_CAP);
+    if (!sess->srv_buf) { close_tcp_session(sess, 1); return; }
+    if (sess->srv_off > 0 && sess->srv_len > 0) {
+        memmove(sess->srv_buf, sess->srv_buf + sess->srv_off, sess->srv_len);
+        sess->srv_off = 0;
+    }
+    if (sess->srv_off + sess->srv_len + total > TCP_SRV_BUF_CAP) {
+        close_tcp_session(sess, 1);   // DNS 回覆極小，緩衝滿視為異常
+        return;
+    }
+    unsigned char *dst = sess->srv_buf + sess->srv_off + sess->srv_len;
+    dst[0] = (unsigned char)(rlen >> 8);
+    dst[1] = (unsigned char)(rlen & 0xFF);
+    memcpy(dst + 2, reply, rlen);
+    sess->srv_len += total;
+}
+
+// 處理 DNS-over-TCP 的 inbound 串流（[2-byte 長度 + DNS message] 重複）：
+// 對每個完整 query 合成 fake 回覆並排入 srv_buf；全部回覆後送 FIN 關閉。
+static void dns_tcp_ingest(tcp_sess_t *sess, const unsigned char *data, size_t len) {
+    // 1. 追加到累積緩衝
+    size_t need = sess->dns_rx_len + len;
+    if (need > sess->dns_rx_cap) {
+        size_t ncap = sess->dns_rx_cap ? sess->dns_rx_cap * 2 : 1024;
+        while (ncap < need) ncap *= 2;
+        unsigned char *nb = realloc(sess->dns_rx_buf, ncap);
+        if (!nb) { close_tcp_session(sess, 1); return; }
+        sess->dns_rx_buf = nb;
+        sess->dns_rx_cap = ncap;
+    }
+    memcpy(sess->dns_rx_buf + sess->dns_rx_len, data, len);
+    sess->dns_rx_len = need;
+
+    // 2. 解析完整 frame 並合成回覆
+    size_t off = 0;
+    while (off + 2 <= sess->dns_rx_len) {
+        size_t mlen = ((size_t)sess->dns_rx_buf[off] << 8) | sess->dns_rx_buf[off + 1];
+        if (off + 2 + mlen > sess->dns_rx_len) break;   // 不完整，等後續
+        unsigned char reply[512];
+        size_t rlen = 0;
+        if (dns_build_reply(sess->dns_rx_buf + off + 2, mlen, 1, reply, &rlen))
+            dns_tcp_emit(sess, reply, rlen);
+        off += 2 + mlen;
+    }
+    // 3. 移除已處理的前綴
+    if (off > 0) {
+        memmove(sess->dns_rx_buf, sess->dns_rx_buf + off, sess->dns_rx_len - off);
+        sess->dns_rx_len -= off;
+    }
+
+    // 4. ACK 收到的資料；若已無殘留 query，回覆排空後送 FIN
+    sess->app_next += (uint32_t)len;
+    send_tcp_ack(sess);
+    if (sess->dns_rx_len == 0) sess->srv_eof = 1;
 }
 
 // 處理來自 TUN 的 TCP 封包（P2 TCP 狀態機）
@@ -1682,13 +1779,13 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
 
     unsigned idx = tcp_hash_idx(src_ip, sport);
     tcp_sess_t *sess = NULL;
-    for (tcp_sess_t *s = g_tcp_hash[idx]; s; s = s->next) {
+    for (tcp_sess_t *s = g.tcp_hash[idx]; s; s = s->next) {
         if (ip_addr_eq(&s->src_ip, src_ip) && s->src_port == sport && !s->closed) { sess = s; break; }
     }
 
     if (!sess) {
         if (!(flags & 0x02) || (flags & 0x10)) return;   // 僅 SYN 可建立（SYN+ACK 忽略）
-        if (atomic_load(&g_tcp_session_count) >= MAX_TCP_SESSIONS) {
+        if (atomic_load(&g.tcp_session_count) >= MAX_TCP_SESSIONS) {
             send_tcp_rst(src_ip, dst_ip, pkt + t, len - t);   // 滿載 → RST
             return;
         }
@@ -1696,7 +1793,7 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
         if (!sess) return;
         sess->src_ip = *src_ip; sess->src_port = sport;
         sess->dst_ip = *dst_ip; sess->dst_port = dport;
-        if (g_remote_dns) {
+        if (g.remote_dns) {
             // fake IP（v4/v6）→ 記錄網域，connect 線程以 ATYP=0x03 撥號（由伺服器端解析）
             if (dst_ip->family == AF_INET) {
                 uint32_t k;
@@ -1722,9 +1819,9 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
             else break;
         }
         sess->last_active = time(NULL);
-        sess->next = g_tcp_hash[idx];
-        g_tcp_hash[idx] = sess;
-        atomic_fetch_add(&g_tcp_session_count, 1);
+        sess->next = g.tcp_hash[idx];
+        g.tcp_hash[idx] = sess;
+        atomic_fetch_add(&g.tcp_session_count, 1);
 
         char b1[64], b2[64];
         ip_to_str(src_ip, b1, sizeof b1);
@@ -1733,6 +1830,13 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
              b1, ntohs(sport), b2, ntohs(dport));
         send_tcp_synack(sess);
 
+        // Remote DNS：攔截 DNS-over-TCP（連到 DNS 伺服器 literal IP 的 53/tcp），
+        // 由本機合成 fake 回覆，不建立 SOCKS5 連線，避免網域洩漏到真實 DNS。
+        if (g.remote_dns && ntohs(dport) == 53 && sess->dst_domain[0] == 0) {
+            sess->dns_tcp = 1;
+            atomic_store(&sess->state, 1);
+            return;
+        }
         if (hs_submit(tcp_connect_thread, sess) != 0) close_tcp_session(sess, 1);
         return;
     }
@@ -1787,6 +1891,11 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
     }
 
     if (payload_len > 0) {
+        if (sess->dns_tcp) {
+            dns_tcp_ingest(sess, pkt + t + (size_t)tcp_hlen, payload_len);
+            flush_tcp_srv_buf(sess);
+            return;
+        }
         if (atomic_load(&sess->state) == 0) {
             // CONNECT 中：緩衝並 ACK（避免等 app 重傳），建立後由 kick 觸發送出
             unsigned char *dst = app_buf_reserve(sess, payload_len);
@@ -1869,7 +1978,7 @@ static void handle_tcp_event(tcp_sess_t *sess, uint32_t ev, time_t now) {
             if (want > TCP_READ_CHUNK) want = TCP_READ_CHUNK;
             ssize_t r = recv(sfd, sess->srv_buf + used, want, 0);
             if (r > 0) {
-                atomic_fetch_add(&g_bytes_from_server, (unsigned long long)r);
+                atomic_fetch_add(&g.bytes_from_server, (unsigned long long)r);
                 sess->srv_len += (size_t)r;
                 flush_tcp_srv_buf(sess);
                 if (sess->closed) return;
@@ -1910,7 +2019,7 @@ static void handle_icmp4(const unsigned char *pkt, size_t len, int ihl,
     reply[t + 2] = 0; reply[t + 3] = 0;
     uint16_t icsum = checksum16(reply + t, len - t);
     reply[t + 2] = icsum >> 8; reply[t + 3] = icsum & 0xFF;
-    ssize_t w = write(g_tun_fd, reply, len);
+    ssize_t w = write(g.tun_fd, reply, len);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun icmp4 failed: %s", strerror(errno));
 }
 
@@ -1930,8 +2039,215 @@ static void handle_icmp6(const unsigned char *pkt, size_t len,
     reply[42] = 0; reply[43] = 0;
     uint16_t icsum = tcpudp_checksum6(daddr->ip, saddr->ip, 58, reply + 40, len - 40);
     reply[42] = icsum >> 8; reply[43] = icsum & 0xFF;
-    ssize_t w = write(g_tun_fd, reply, len);
+    ssize_t w = write(g.tun_fd, reply, len);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun icmp6 failed: %s", strerror(errno));
+}
+
+// ICMPv6 Neighbor Solicitation → 回 Neighbor Advertisement（type 135→136）。
+// TUN 為 point-to-point，但部分裝置仍會對 fd00::/8 做 NDP 解析；
+// 對 fd00::/8 的 NS 宣告擁有權，讓雙棧 App 以 fake IPv6 連線時不卡在解析。
+static void handle_icmp6_ns(const unsigned char *pkt, size_t len, const ip_addr_t *saddr) {
+    if (len < 64) return;
+    if (pkt[40] != 135 || pkt[41] != 0) return;
+    // DAD（來源為 ::）不回覆
+    int unspec = 1;
+    for (int i = 0; i < 16; i++) if (saddr->ip[i]) { unspec = 0; break; }
+    if (unspec) return;
+    const unsigned char *target = pkt + 48;
+    if (target[0] != 0xFD) return;   // 僅回應隧道空間 fd00::/8
+
+    unsigned char reply[64];
+    memset(reply, 0, sizeof(reply));
+    reply[0] = 0x60;
+    reply[4] = 0; reply[5] = 24;             // payload length
+    reply[6] = 58;                            // next header ICMPv6
+    reply[7] = 255;                           // hop limit
+    memcpy(reply + 8, target, 16);            // 來源 = 目標（宣告擁有權）
+    memcpy(reply + 24, saddr->ip, 16);        // 目的 = NS 來源
+    reply[40] = 136;                          // Neighbor Advertisement
+    reply[44] = 0x60;                         // R=0 S=1 O=1
+    memcpy(reply + 48, target, 16);
+    uint16_t csum = tcpudp_checksum6(reply + 8, reply + 24, 58, reply + 40, 24);
+    reply[42] = csum >> 8; reply[43] = csum & 0xFF;
+    ssize_t w = write(g.tun_fd, reply, sizeof(reply));
+    if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun icmp6 NA failed: %s", strerror(errno));
+}
+
+// ---------- IP 分片重組 ----------
+// TUN 內通常不會分片（TCP 以 MSS 協商、QUIC 走 PMTUD、DNS ≤ 4096），
+// 但大型 UDP datagram 仍可能被 kernel 分片。此處做有界、保守的重組：
+// 僅處理「Fragment 為首個 ext header」的一般情況，重疊/超大/逾時一律丟棄。
+#define REASM_MAX_ENTRIES 16
+#define REASM_MAX_FRAGS 16
+#define REASM_MAX_SIZE 65535
+#define REASM_TIMEOUT_SEC 5
+
+typedef struct {
+    int in_use;
+    uint8_t family;         // AF_INET / AF_INET6
+    ip_addr_t src, dst;
+    uint8_t proto;          // L4 協定（v4=IP proto；v6=Fragment 後的 next header）
+    uint32_t id;            // v4 16-bit / v6 32-bit
+    unsigned char *buf;     // malloc(REASM_MAX_SIZE)
+    size_t total_len;       // 0 = 尚未收到末片
+    int have_last;
+    size_t soff[REASM_MAX_FRAGS];
+    size_t slen[REASM_MAX_FRAGS];
+    int nseg;
+    unsigned char ip_hdr[40];
+    uint8_t ip_hdr_len;
+    time_t last_active;
+} reasm_entry_t;
+
+static reasm_entry_t g_reasm[REASM_MAX_ENTRIES];
+
+static void handle_tun_packet(const unsigned char *pkt, size_t len);
+
+static void reasm_clear_entry(int idx) {
+    if (g_reasm[idx].buf) { free(g_reasm[idx].buf); g_reasm[idx].buf = NULL; }
+    memset(&g_reasm[idx], 0, sizeof(g_reasm[idx]));
+}
+
+static void reasm_table_clear(void) {
+    for (int i = 0; i < REASM_MAX_ENTRIES; i++) reasm_clear_entry(i);
+}
+
+static int reasm_find(uint8_t family, const ip_addr_t *src, const ip_addr_t *dst,
+                      uint8_t proto, uint32_t id) {
+    for (int i = 0; i < REASM_MAX_ENTRIES; i++) {
+        if (g_reasm[i].in_use && g_reasm[i].family == family && g_reasm[i].id == id &&
+            g_reasm[i].proto == proto && ip_addr_eq(&g_reasm[i].src, src) &&
+            ip_addr_eq(&g_reasm[i].dst, dst))
+            return i;
+    }
+    return -1;
+}
+
+static int reasm_alloc(uint8_t family, const ip_addr_t *src, const ip_addr_t *dst,
+                       uint8_t proto, uint32_t id, time_t now) {
+    int idx = -1;
+    for (int i = 0; i < REASM_MAX_ENTRIES; i++) {
+        if (!g_reasm[i].in_use || now - g_reasm[i].last_active > REASM_TIMEOUT_SEC) { idx = i; break; }
+    }
+    if (idx < 0) {  // 全滿且未逾時 → LRU 淘汰最舊者
+        idx = 0;
+        for (int i = 1; i < REASM_MAX_ENTRIES; i++)
+            if (g_reasm[i].last_active < g_reasm[idx].last_active) idx = i;
+    }
+    reasm_clear_entry(idx);
+    g_reasm[idx].in_use = 1;
+    g_reasm[idx].family = family;
+    g_reasm[idx].src = *src;
+    g_reasm[idx].dst = *dst;
+    g_reasm[idx].proto = proto;
+    g_reasm[idx].id = id;
+    g_reasm[idx].last_active = now;
+    g_reasm[idx].buf = malloc(REASM_MAX_SIZE);
+    if (!g_reasm[idx].buf) { g_reasm[idx].in_use = 0; return -1; }
+    return idx;
+}
+
+// 回傳 1 = 重組完成；0 = 尚未完成；-1 = 需丟棄（重疊/不一致）
+static int reasm_insert(int idx, size_t offset, const unsigned char *data, size_t len,
+                        int mf, time_t now) {
+    reasm_entry_t *e = &g_reasm[idx];
+    if (offset + len > REASM_MAX_SIZE) { reasm_clear_entry(idx); return -1; }
+    e->last_active = now;
+    if (!mf) {
+        size_t t = offset + len;
+        if (e->have_last && e->total_len != t) { reasm_clear_entry(idx); return -1; }
+        e->total_len = t;
+        e->have_last = 1;
+    }
+    if (len > 0) {
+        if (e->nseg >= REASM_MAX_FRAGS) { reasm_clear_entry(idx); return -1; }
+        // 重疊檢查（RFC 5722：重疊的分片一律丟棄）
+        for (int i = 0; i < e->nseg; i++) {
+            size_t a = e->soff[i], b = a + e->slen[i];
+            if (offset < b && a < offset + len) { reasm_clear_entry(idx); return -1; }
+        }
+        e->soff[e->nseg] = offset;
+        e->slen[e->nseg] = len;
+        e->nseg++;
+        memcpy(e->buf + offset, data, len);
+    }
+    if (!e->have_last) return 0;
+    // 依 offset 排序 segment，確認 [0, total_len) 無間隙全覆蓋
+    for (int i = 0; i < e->nseg - 1; i++)
+        for (int j = i + 1; j < e->nseg; j++)
+            if (e->soff[j] < e->soff[i]) {
+                size_t t1 = e->soff[i], t2 = e->slen[i];
+                e->soff[i] = e->soff[j]; e->slen[i] = e->slen[j];
+                e->soff[j] = t1; e->slen[j] = t2;
+            }
+    size_t expected = 0;
+    for (int i = 0; i < e->nseg; i++) {
+        if (e->soff[i] != expected) return 0;
+        expected += e->slen[i];
+    }
+    return (expected == e->total_len) ? 1 : 0;
+}
+
+static void reasm_dispatch(uint8_t family, const ip_addr_t *src, const ip_addr_t *dst,
+                           uint8_t proto, uint32_t id,
+                           size_t offset, const unsigned char *data, size_t dlen, int mf,
+                           const unsigned char *ip_hdr, size_t ip_hdr_len) {
+    time_t now = time(NULL);
+    int idx = reasm_find(family, src, dst, proto, id);
+    if (idx < 0) idx = reasm_alloc(family, src, dst, proto, id, now);
+    if (idx < 0) return;
+    if (offset == 0 && ip_hdr_len <= sizeof(g_reasm[idx].ip_hdr)) {
+        memcpy(g_reasm[idx].ip_hdr, ip_hdr, ip_hdr_len);
+        g_reasm[idx].ip_hdr_len = (uint8_t)ip_hdr_len;
+    }
+    int done = reasm_insert(idx, offset, data, dlen, mf, now);
+    if (done <= 0) return;
+
+    reasm_entry_t *e = &g_reasm[idx];
+    unsigned char *out = malloc(e->ip_hdr_len + e->total_len);
+    if (!out) { reasm_clear_entry(idx); return; }
+    memcpy(out, e->ip_hdr, e->ip_hdr_len);
+    if (family == AF_INET) {
+        size_t outlen = e->ip_hdr_len + e->total_len;
+        out[2] = (outlen >> 8) & 0xFF; out[3] = outlen & 0xFF;
+        out[6] = 0; out[7] = 0;   // 清除 flags / fragment offset
+        out[10] = 0; out[11] = 0;
+        uint16_t csum = checksum16(out, e->ip_hdr_len);
+        out[10] = csum >> 8; out[11] = csum & 0xFF;
+        memcpy(out + e->ip_hdr_len, e->buf, e->total_len);
+        handle_tun_packet(out, outlen);
+    } else {
+        // v6：移除 Fragment header（僅處理「Fragment 為首個 ext header」的情況）
+        size_t outlen = e->ip_hdr_len + e->total_len;  // ip_hdr_len == 40
+        out[4] = (e->total_len >> 8) & 0xFF; out[5] = e->total_len & 0xFF;
+        out[6] = e->proto;  // Fragment 的 next header 即 L4 協定
+        memcpy(out + e->ip_hdr_len, e->buf, e->total_len);
+        handle_tun_packet(out, outlen);
+    }
+    free(out);
+    reasm_clear_entry(idx);
+}
+
+// IPv6：檢查首個 extension header 是否為 Fragment（最常見情況）；
+// 更深層（ext header 在 Fragment 之前）的分片由 parse_ipv6 直接丟棄。
+static int ipv6_first_frag(const unsigned char *pkt, size_t len,
+                           uint8_t *next_hdr, size_t *frag_off, int *mf, uint32_t *id) {
+    if (len < 48) return 0;
+    if (pkt[6] != 44) return 0;
+    uint16_t ff = (uint16_t)((pkt[42] << 8) | pkt[43]);
+    *next_hdr = pkt[40];
+    *frag_off = (size_t)(ff & 0x1FFF) * 8;
+    *mf = (ff & 0x0001) != 0;
+    uint32_t idn;
+    memcpy(&idn, pkt + 44, 4);
+    *id = ntohl(idn);
+    return 1;
+}
+
+static void reasm_gc(time_t now) {
+    for (int i = 0; i < REASM_MAX_ENTRIES; i++)
+        if (g_reasm[i].in_use && now - g_reasm[i].last_active > REASM_TIMEOUT_SEC)
+            reasm_clear_entry(i);
 }
 
 // ---------- TUN 讀取與主迴圈 ----------
@@ -1944,6 +2260,19 @@ static void handle_tun_packet(const unsigned char *pkt, size_t len) {
         ip_addr_t saddr, daddr;
         int ihl;
         if (parse_ipv4(pkt, len, &proto, &saddr, &daddr, &ihl) < 0) return;
+        // 分片：MF 或 offset != 0 → 交重組（常見於大型 UDP）
+        {
+            uint16_t ff = (uint16_t)((pkt[6] << 8) | pkt[7]);
+            uint16_t off = ff & 0x1FFF;
+            int mf = (ff & 0x2000) != 0;
+            if (off != 0 || mf) {
+                uint32_t id = (uint16_t)((pkt[4] << 8) | pkt[5]);
+                reasm_dispatch(AF_INET, &saddr, &daddr, proto, id,
+                               (size_t)off * 8, pkt + ihl, len - (size_t)ihl, mf,
+                               pkt, (size_t)ihl);
+                return;
+            }
+        }
         if (proto == 17) {
             handle_tun_udp(pkt, len, (size_t)ihl, &saddr, &daddr);
         } else if (proto == 6) {
@@ -1954,6 +2283,15 @@ static void handle_tun_packet(const unsigned char *pkt, size_t len) {
         return;
     }
     if (ver == 6) {
+        uint8_t fnh; size_t foff; int fmf; uint32_t fid;
+        if (ipv6_first_frag(pkt, len, &fnh, &foff, &fmf, &fid)) {
+            ip_addr_t saddr, daddr;
+            saddr.family = AF_INET6; memcpy(saddr.ip, pkt + 8, 16);
+            daddr.family = AF_INET6; memcpy(daddr.ip, pkt + 24, 16);
+            reasm_dispatch(AF_INET6, &saddr, &daddr, fnh, fid, foff,
+                           pkt + 48, len - 48, fmf, pkt, 40);
+            return;
+        }
         uint8_t proto;
         ip_addr_t saddr, daddr;
         size_t l4off;
@@ -1963,7 +2301,10 @@ static void handle_tun_packet(const unsigned char *pkt, size_t len) {
         } else if (proto == 6) {
             handle_tun_tcp(pkt, len, l4off, &saddr, &daddr);
         } else if (proto == 58) {
-            if (l4off == 40) handle_icmp6(pkt, len, &saddr, &daddr);
+            if (l4off == 40) {
+                handle_icmp6(pkt, len, &saddr, &daddr);
+                handle_icmp6_ns(pkt, len, &saddr);
+            }
         }
         return;
     }
@@ -1972,7 +2313,7 @@ static void handle_tun_packet(const unsigned char *pkt, size_t len) {
 static void read_tun_packets(void) {
     unsigned char pkt[MAX_PACKET_SIZE];
     for (;;) {
-        ssize_t n = read(g_tun_fd, pkt, sizeof pkt);
+        ssize_t n = read(g.tun_fd, pkt, sizeof pkt);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == EINTR) continue;
@@ -1989,8 +2330,8 @@ static void *engine_loop(void *arg) {
     struct epoll_event events[MAX_EVENTS];
     time_t last_gc = time(NULL);
 
-    while (g_running) {
-        int nfds = epoll_wait(g_epoll_fd, events, MAX_EVENTS, 2000);
+    while (g.running) {
+        int nfds = epoll_wait(g.epoll_fd, events, MAX_EVENTS, 2000);
         time_t now = time(NULL);
 
         if (nfds < 0) {
@@ -1999,11 +2340,11 @@ static void *engine_loop(void *arg) {
         }
 
         for (int i = 0; i < nfds; i++) {
-            if (events[i].data.fd == g_shutdown_pipe[0]) goto shutdown;
-            if (events[i].data.fd == g_tun_fd) { read_tun_packets(); flush_all_tcp(); continue; }
-            if (events[i].data.fd == g_kick_pipe[0]) {
+            if (events[i].data.fd == g.shutdown_pipe[0]) goto shutdown;
+            if (events[i].data.fd == g.tun_fd) { read_tun_packets(); flush_all_tcp(); continue; }
+            if (events[i].data.fd == g.kick_pipe[0]) {
                 char d[64];
-                while (read(g_kick_pipe[0], d, sizeof d) > 0) {}
+                while (read(g.kick_pipe[0], d, sizeof d) > 0) {}
                 tcp_engine_sweep();
                 flush_all_tcp();
                 continue;
@@ -2054,7 +2395,7 @@ static void *engine_loop(void *arg) {
                 if (!sess->closed) {
                     sess->closed = 1;
                     unsigned idx = udp_hash_idx(&sess->src_ip, sess->src_port);
-                    udp_sess_t **pp = &g_udp_hash[idx];
+                    udp_sess_t **pp = &g.udp_hash[idx];
                     while (*pp && *pp != sess) pp = &(*pp)->next;
                     if (*pp) *pp = sess->next;
                     pthread_mutex_unlock(&g_udp_hash_lock);
@@ -2069,11 +2410,12 @@ static void *engine_loop(void *arg) {
         // 閒置 GC（每 5 秒）
         if (now - last_gc >= 5) {
             last_gc = now;
+            reasm_gc(now);
             udp_sess_t *garbage[MAX_EVENTS];
             int gc = 0;
             pthread_mutex_lock(&g_udp_hash_lock);
             for (int b = 0; b < UDP_HASH_BUCKETS; b++) {
-                udp_sess_t **pp = &g_udp_hash[b];
+                udp_sess_t **pp = &g.udp_hash[b];
                 while (*pp) {
                     udp_sess_t *s = *pp;
                     // 垃圾桶滿了就跳過該 session，下一輪再收
@@ -2096,7 +2438,7 @@ static void *engine_loop(void *arg) {
             tcp_sess_t *tcp_garbage[MAX_EVENTS];
             int tgc = 0;
             for (int b = 0; b < TCP_HASH_BUCKETS && tgc < MAX_EVENTS; b++) {
-                for (tcp_sess_t *s = g_tcp_hash[b]; s && tgc < MAX_EVENTS; s = s->next) {
+                for (tcp_sess_t *s = g.tcp_hash[b]; s && tgc < MAX_EVENTS; s = s->next) {
                     int idle = !s->closed && atomic_load(&s->state) == 1 &&
                                now - s->last_active > TCP_IDLE_TIMEOUT_SEC;
                     if (s->closed || atomic_load(&s->handshake_failed) || idle) {
@@ -2118,12 +2460,12 @@ static void *engine_loop(void *arg) {
 
 shutdown:
     // 先關 TUN：VPN 立刻拆除，網路馬上還原（fd 由 native 全權關閉）
-    if (g_tun_fd >= 0) { close(g_tun_fd); g_tun_fd = -1; }
+    if (g.tun_fd >= 0) { close(g.tun_fd); g.tun_fd = -1; }
 
     // 等待 handshake 線程結束，避免釋放仍在使用的 session（最多等 5 秒）
     {
         int waited_ms = 0;
-        while (atomic_load(&g_handshake_inflight) > 0 && waited_ms < 5000) {
+        while (atomic_load(&g.handshake_inflight) > 0 && waited_ms < 5000) {
             usleep(100000);
             waited_ms += 100;
         }
@@ -2140,8 +2482,8 @@ shutdown:
     udp_sess_t *to_close = NULL;
     pthread_mutex_lock(&g_udp_hash_lock);
     for (int b = 0; b < UDP_HASH_BUCKETS; b++) {
-        udp_sess_t *s = g_udp_hash[b];
-        g_udp_hash[b] = NULL;
+        udp_sess_t *s = g.udp_hash[b];
+        g.udp_hash[b] = NULL;
         while (s) { udp_sess_t *n = s->next; s->next = to_close; to_close = s; s = n; }
     }
     pthread_mutex_unlock(&g_udp_hash_lock);
@@ -2157,8 +2499,8 @@ shutdown:
     // 注意：不可先清空 hash 再釋放——tcp_session_destroy 會回查 hash 做 unlink，
     // 預先清空會造成「不在 hash」誤判（fd 也沒關，重啟累積 leak）。
     for (int b = 0; b < TCP_HASH_BUCKETS; b++) {
-        while (g_tcp_hash[b]) {
-            tcp_sess_t *s = g_tcp_hash[b];
+        while (g.tcp_hash[b]) {
+            tcp_sess_t *s = g.tcp_hash[b];
             s->closed = 1;
             tcp_session_destroy(s);
         }
@@ -2167,7 +2509,7 @@ shutdown:
     // 5 秒等待超時的（極端情況）留在 graveyard，引擎已停止不再回收
     tcp_graveyard_collect();
 
-    if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
+    if (g.epoll_fd >= 0) { close(g.epoll_fd); g.epoll_fd = -1; }
     jni_detach_thread();
     return NULL;
 }
@@ -2177,85 +2519,102 @@ shutdown:
 // 流量統計（供 JNI 通知列顯示）：payload bytes 累計 + 目前 session 數
 void tun_socks_get_stats(unsigned long long *to_server, unsigned long long *from_server,
                          int *tcp_sessions, int *udp_sessions) {
-    if (to_server) *to_server = atomic_load(&g_bytes_to_server);
-    if (from_server) *from_server = atomic_load(&g_bytes_from_server);
-    if (tcp_sessions) *tcp_sessions = atomic_load(&g_tcp_session_count);
-    if (udp_sessions) *udp_sessions = atomic_load(&g_udp_session_count);
+    if (to_server) *to_server = atomic_load(&g.bytes_to_server);
+    if (from_server) *from_server = atomic_load(&g.bytes_from_server);
+    if (tcp_sessions) *tcp_sessions = atomic_load(&g.tcp_session_count);
+    if (udp_sessions) *udp_sessions = atomic_load(&g.udp_session_count);
+}
+
+// 每次啟動前重置隨 session 而生的計數/快取，避免上一次 session 的殘留值帶入本次
+//（例如通知列 ↑/↓ bytes 若不清零會跨 session 持續累加）。
+static void engine_ctx_reset(void) {
+    atomic_store(&g.bytes_to_server, 0);
+    atomic_store(&g.bytes_from_server, 0);
+    atomic_store(&g.udp_session_count, 0);
+    atomic_store(&g.tcp_session_count, 0);
+    atomic_store(&g.handshake_inflight, 0);
+    g.isn_counter = 0;
+    pthread_mutex_lock(&g_fake_dns_lock);
+    for (int i = 0; i < FAKE_DNS_ENTRIES; i++) g.fake_dns[i].in_use = 0;
+    g.fake_dns_next = 0;
+    pthread_mutex_unlock(&g_fake_dns_lock);
+    reasm_table_clear();
 }
 
 int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass, int udp_in_tcp, int remote_dns) {
-    if (g_running) return -1;
+    if (g.running) return -1;
+    engine_ctx_reset();
 
-    g_tun_fd = tun_fd;
-    strncpy(g_srv_host, host, sizeof(g_srv_host) - 1);
-    g_srv_host[sizeof(g_srv_host) - 1] = '\0';
-    g_srv_port = port;
-    g_auth_enabled = (user && user[0]) || (pass && pass[0]);
-    strncpy(g_auth_user, user ? user : "", sizeof(g_auth_user) - 1);
-    strncpy(g_auth_pass, pass ? pass : "", sizeof(g_auth_pass) - 1);
-    g_udp_in_tcp = udp_in_tcp ? 1 : 0;
-    g_remote_dns = remote_dns ? 1 : 0;
+    g.tun_fd = tun_fd;
+    strncpy(g.srv_host, host, sizeof(g.srv_host) - 1);
+    g.srv_host[sizeof(g.srv_host) - 1] = '\0';
+    g.srv_port = port;
+    g.auth_enabled = (user && user[0]) || (pass && pass[0]);
+    strncpy(g.auth_user, user ? user : "", sizeof(g.auth_user) - 1);
+    strncpy(g.auth_pass, pass ? pass : "", sizeof(g.auth_pass) - 1);
+    g.udp_in_tcp = udp_in_tcp ? 1 : 0;
+    g.remote_dns = remote_dns ? 1 : 0;
 
-    set_nonblocking(g_tun_fd);
+    set_nonblocking(g.tun_fd);
 
-    if (pipe(g_shutdown_pipe) < 0) return -1;
-    set_nonblocking(g_shutdown_pipe[0]);
-    set_nonblocking(g_shutdown_pipe[1]);
+    if (pipe(g.shutdown_pipe) < 0) return -1;
+    set_nonblocking(g.shutdown_pipe[0]);
+    set_nonblocking(g.shutdown_pipe[1]);
 
-    if (pipe(g_kick_pipe) < 0) {
-        close(g_shutdown_pipe[0]); close(g_shutdown_pipe[1]);
-        g_shutdown_pipe[0] = g_shutdown_pipe[1] = -1;
+    if (pipe(g.kick_pipe) < 0) {
+        close(g.shutdown_pipe[0]); close(g.shutdown_pipe[1]);
+        g.shutdown_pipe[0] = g.shutdown_pipe[1] = -1;
         return -1;
     }
-    set_nonblocking(g_kick_pipe[0]);
-    set_nonblocking(g_kick_pipe[1]);
+    set_nonblocking(g.kick_pipe[0]);
+    set_nonblocking(g.kick_pipe[1]);
 
-    g_epoll_fd = epoll_create1(0);
-    if (g_epoll_fd < 0) {
-        close(g_shutdown_pipe[0]); close(g_shutdown_pipe[1]);
-        close(g_kick_pipe[0]); close(g_kick_pipe[1]);
-        g_shutdown_pipe[0] = g_shutdown_pipe[1] = -1;
-        g_kick_pipe[0] = g_kick_pipe[1] = -1;
+    g.epoll_fd = epoll_create1(0);
+    if (g.epoll_fd < 0) {
+        close(g.shutdown_pipe[0]); close(g.shutdown_pipe[1]);
+        close(g.kick_pipe[0]); close(g.kick_pipe[1]);
+        g.shutdown_pipe[0] = g.shutdown_pipe[1] = -1;
+        g.kick_pipe[0] = g.kick_pipe[1] = -1;
         return -1;
     }
 
     struct epoll_event ev;
-    ev.events = EPOLLIN; ev.data.fd = g_shutdown_pipe[0];
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_shutdown_pipe[0], &ev);
-    ev.events = EPOLLIN; ev.data.fd = g_kick_pipe[0];
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_kick_pipe[0], &ev);
-    ev.events = EPOLLIN; ev.data.fd = g_tun_fd;
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_tun_fd, &ev);
+    ev.events = EPOLLIN; ev.data.fd = g.shutdown_pipe[0];
+    epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.shutdown_pipe[0], &ev);
+    ev.events = EPOLLIN; ev.data.fd = g.kick_pipe[0];
+    epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.kick_pipe[0], &ev);
+    ev.events = EPOLLIN; ev.data.fd = g.tun_fd;
+    epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.tun_fd, &ev);
 
     hs_pool_start();
-    g_running = 1;
+    g.running = 1;
     if (pthread_create(&g_engine_thread, NULL, engine_loop, NULL) != 0) {
-        g_running = 0;
+        g.running = 0;
         hs_pool_stop();
-        if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
-        if (g_shutdown_pipe[0] != -1) { close(g_shutdown_pipe[0]); g_shutdown_pipe[0] = -1; }
-        if (g_shutdown_pipe[1] != -1) { close(g_shutdown_pipe[1]); g_shutdown_pipe[1] = -1; }
-        if (g_kick_pipe[0] != -1) { close(g_kick_pipe[0]); g_kick_pipe[0] = -1; }
-        if (g_kick_pipe[1] != -1) { close(g_kick_pipe[1]); g_kick_pipe[1] = -1; }
-        if (g_tun_fd >= 0) { close(g_tun_fd); g_tun_fd = -1; }
+        if (g.epoll_fd >= 0) { close(g.epoll_fd); g.epoll_fd = -1; }
+        if (g.shutdown_pipe[0] != -1) { close(g.shutdown_pipe[0]); g.shutdown_pipe[0] = -1; }
+        if (g.shutdown_pipe[1] != -1) { close(g.shutdown_pipe[1]); g.shutdown_pipe[1] = -1; }
+        if (g.kick_pipe[0] != -1) { close(g.kick_pipe[0]); g.kick_pipe[0] = -1; }
+        if (g.kick_pipe[1] != -1) { close(g.kick_pipe[1]); g.kick_pipe[1] = -1; }
+        if (g.tun_fd >= 0) { close(g.tun_fd); g.tun_fd = -1; }
         return -1;
     }
-    LOGI("tunnel started: server=%s:%d auth=%d", g_srv_host, g_srv_port, g_auth_enabled);
+    LOGI("tunnel started: server=%s:%d auth=%d", g.srv_host, g.srv_port, g.auth_enabled);
     return 0;
 }
 
 void tun_socks_stop(void) {
-    if (!g_running) return;
-    g_running = 0;
-    if (g_shutdown_pipe[1] != -1) {
+    if (!g.running) return;
+    g.running = 0;
+    if (g.shutdown_pipe[1] != -1) {
         char stop_sig = 1;
-        for (int k = 0; k < 10; k++) write(g_shutdown_pipe[1], &stop_sig, 1);
+        for (int k = 0; k < 10; k++) write(g.shutdown_pipe[1], &stop_sig, 1);
     }
     pthread_join(g_engine_thread, NULL);
     hs_pool_stop();   // 安全網：引擎關閉路徑已 join，此為 idempotent no-op
-    if (g_shutdown_pipe[0] != -1) { close(g_shutdown_pipe[0]); g_shutdown_pipe[0] = -1; }
-    if (g_shutdown_pipe[1] != -1) { close(g_shutdown_pipe[1]); g_shutdown_pipe[1] = -1; }
-    if (g_kick_pipe[0] != -1) { close(g_kick_pipe[0]); g_kick_pipe[0] = -1; }
-    if (g_kick_pipe[1] != -1) { close(g_kick_pipe[1]); g_kick_pipe[1] = -1; }
+    if (g.shutdown_pipe[0] != -1) { close(g.shutdown_pipe[0]); g.shutdown_pipe[0] = -1; }
+    if (g.shutdown_pipe[1] != -1) { close(g.shutdown_pipe[1]); g.shutdown_pipe[1] = -1; }
+    if (g.kick_pipe[0] != -1) { close(g.kick_pipe[0]); g.kick_pipe[0] = -1; }
+    if (g.kick_pipe[1] != -1) { close(g.kick_pipe[1]); g.kick_pipe[1] = -1; }
     LOGI("tunnel stopped");
 }

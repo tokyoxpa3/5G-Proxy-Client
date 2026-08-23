@@ -85,7 +85,7 @@ export JAVA_HOME=<JDK 17 路徑>
 # 產出: app/build/outputs/apk/debug/app-debug.apk
 ```
 
-- 支援 ABI：`arm64-v8a`、`armeabi-v7a`
+- 支援 ABI：`arm64-v8a`、`armeabi-v7a`、`x86_64`
 - 原生碼以 `-O3` 編譯
 - 正式簽名：於專案根目錄建立 `keystore.properties`（`storeFile`/`storePassword`/`keyAlias`/`keyPassword`）後即可 `assembleRelease`；未提供時 release 不簽名，供第三方自行簽署
 
