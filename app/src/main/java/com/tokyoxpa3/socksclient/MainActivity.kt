@@ -46,6 +46,8 @@ class MainActivity : Activity() {
     private lateinit var btnSelectApps: Button
     private lateinit var btnSaveProfile: Button
     private lateinit var btnDeleteProfile: Button
+    private lateinit var btnExportProfiles: Button
+    private lateinit var btnImportProfiles: Button
     private lateinit var spinnerProfile: Spinner
     private lateinit var tvStatus: TextView
 
@@ -209,6 +211,18 @@ class MainActivity : Activity() {
         profileRow.addView(btnSaveProfile, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         profileRow.addView(btnDeleteProfile, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
+        // 匯出 / 匯入（剪貼簿 JSON 往返，方便跨裝置搬移設定）
+        btnExportProfiles = Button(this).apply { text = getString(R.string.btn_export_profiles) }
+        btnImportProfiles = Button(this).apply { text = getString(R.string.btn_import_profiles) }
+        val ioRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        ioRow.addView(btnExportProfiles, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        ioRow.addView(btnImportProfiles, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
         root.addView(label(getString(R.string.label_server)))
         root.addView(etHost)
         root.addView(etPort)
@@ -231,6 +245,7 @@ class MainActivity : Activity() {
         root.addView(etProfileName)
         root.addView(spinnerProfile)
         root.addView(profileRow)
+        root.addView(ioRow)
         root.addView(tvStatus)
 
         val scroll = ScrollView(this).apply {
@@ -254,14 +269,6 @@ class MainActivity : Activity() {
             prefs.edit().putBoolean(Config.KEY_AUTO_START, checked).apply()
         }
         modeGroup.check(prefs.getInt("tunnel_mode", Config.MODE_GLOBAL))
-
-        btnToggle.setOnClickListener {
-            if (TunSocksService.isRunning) {
-                startService(Config.stopIntent(this))
-            } else {
-                attemptStart()
-            }
-        }
 
         setupProfileUi()
 
@@ -405,6 +412,55 @@ class MainActivity : Activity() {
             Toast.makeText(this, R.string.toast_profile_deleted, Toast.LENGTH_SHORT).show()
             refreshProfileSpinner()
         }
+
+        btnExportProfiles.setOnClickListener {
+            val list = Profiles.load(this)
+            if (list.isEmpty()) {
+                Toast.makeText(this, R.string.toast_no_profiles, Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val arr = org.json.JSONArray()
+            list.forEach { arr.put(it.toJson()) }
+            val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("profiles", arr.toString()))
+            Toast.makeText(this, R.string.toast_profiles_exported, Toast.LENGTH_SHORT).show()
+        }
+
+        btnImportProfiles.setOnClickListener {
+            val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            val text = try {
+                cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
+            } catch (e: Exception) {
+                null
+            }
+            if (text.isNullOrBlank()) {
+                Toast.makeText(this, R.string.toast_profiles_invalid, Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            var imported = 0
+            try {
+                if (text.startsWith("[")) {
+                    val arr = org.json.JSONArray(text)
+                    for (i in 0 until arr.length()) {
+                        try {
+                            Profiles.save(this, Profile.fromJson(arr.getJSONObject(i)))
+                            imported++
+                        } catch (e: Exception) {
+                        }
+                    }
+                } else if (text.startsWith("{")) {
+                    Profiles.save(this, Profile.fromJson(org.json.JSONObject(text)))
+                    imported++
+                }
+            } catch (e: Exception) {
+            }
+            if (imported > 0) {
+                refreshProfileSpinner()
+                Toast.makeText(this, getString(R.string.toast_profiles_imported, imported), Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, R.string.toast_profiles_invalid, Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun currentProfile(name: String): Profile = Profile(
@@ -432,12 +488,8 @@ class MainActivity : Activity() {
         spinnerProfile.setSelection(0)
     }
 
-    private fun isValidIp(s: String): Boolean = try {
-        val a = java.net.InetAddress.getByName(s)
-        a.hostAddress != null
-    } catch (e: Exception) {
-        false
-    }
+    // 僅接受數字 IP：InetAddress.getByName 會對 hostname 發 DNS 查詢（主執行緒網路操作）
+    private fun isValidIp(s: String): Boolean = Config.isLiteralIp(s)
 
     private fun prefs() = getSharedPreferences("tunnel_config", MODE_PRIVATE)
 

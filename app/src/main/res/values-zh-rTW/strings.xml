@@ -18,6 +18,7 @@
     <string name="status_stopped">已停止</string>
     <string name="status_restarting">正在重啟…</string>
     <string name="status_start_retrying">啟動失敗，重試中…（第 %1$d 次）</string>
+    <string name="status_auto_reconnect">伺服器無回應 — %1$d 秒後自動重連…</string>
 
     <!-- Last crash / error -->
     <string name="last_crash_prefix">⚠️ 上次發生崩潰：\n%1$s</string>
@@ -40,6 +41,8 @@
     <string name="btn_save_profile">💾 儲存設定檔</string>
     <string name="btn_delete_profile">🗑️ 刪除設定檔</string>
     <string name="btn_load_profile">載入設定檔</string>
+    <string name="btn_export_profiles">📤 匯出</string>
+    <string name="btn_import_profiles">📥 匯入</string>
 
     <!-- App list -->
     <string name="applist_title">App 清單</string>
@@ -48,6 +51,7 @@
     <string name="applist_hint_exclude">排除模式：勾選的 App 走手機本機網路（繞過隧道）。</string>
     <string name="applist_search_hint">搜尋 App…</string>
     <string name="applist_empty">找不到 App</string>
+    <string name="applist_show_system">顯示系統 App</string>
 
     <!-- Section labels -->
     <string name="label_server">SOCKS5 伺服器</string>
@@ -76,6 +80,10 @@
     <string name="toast_profile_not_found">找不到設定檔</string>
     <string name="toast_notification_permission">請允許通知以查看隧道狀態</string>
     <string name="toast_tile_vpn_needed">請先允許 VPN 連線</string>
+    <string name="toast_no_profiles">沒有可匯出的設定檔</string>
+    <string name="toast_profiles_exported">設定檔已複製到剪貼簿</string>
+    <string name="toast_profiles_imported">已匯入 %1$d 個設定檔</string>
+    <string name="toast_profiles_invalid">剪貼簿中沒有有效的設定檔資料</string>
 
     <!-- Errors -->
     <string name="err_bad_params">參數錯誤：請檢查伺服器位址與連接埠</string>

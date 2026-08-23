@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  # Kotlin/JVM 單元測試 + debug APK 建置（需要 Android SDK + NDK）
+  android-build-test:
+    name: Android unit tests & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          ndk-version: '26.3.11579264'
+
+      - name: Grant gradle permission
+        run: chmod +x gradlew
+
+      - name: Run Kotlin unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Assemble debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+  # 原生 C checksum 單元測試（host 端 gcc，不需 Android）
+  native-unit-test:
+    name: Native checksum unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile & run native unit tests
+        run: |
+          set -e
+          gcc -std=c11 -Wall -Wextra -o checksum_test \
+            app/src/test/native/checksum_test.c app/src/main/cpp/checksum.c
+          ./checksum_test

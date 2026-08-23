@@ -50,6 +50,16 @@ class TunSocksService : VpnService() {
 
         private const val BACKGROUND_RETRY_DELAY_MS = 10_000L
         private const val MAX_BACKGROUND_RETRIES = 30
+
+        // 自動重連看門狗：60 秒內 ≥3 次網路層連線失敗 → 判定伺服器斷線，
+        // 以遞增延遲（10s×次數，上限 5 分鐘）自動重啟隧道；任一次成功即重置。
+        private const val SERVER_FAIL_WINDOW_MS = 60_000L
+        private const val SERVER_FAIL_THRESHOLD = 3
+        private const val AUTO_RESTART_BASE_DELAY_MS = 10_000L
+        private const val AUTO_RESTART_MAX_DELAY_MS = 300_000L
+
+        // 常駐通知流量統計更新間隔
+        private const val STATS_UPDATE_INTERVAL_MS = 3_000L
         // Samsung 開機後 establish() 需要該 App 至少一次在前台成功建立 VPN 才會放行背景呼叫；
         // 背景重試失敗幾次後，自動開啟 MainActivity（前台建立）再自動關閉
         private const val BOOT_FLASH_AFTER_RETRIES = 3
@@ -76,6 +86,29 @@ class TunSocksService : VpnService() {
     private var bootContext = false
     private var flashLaunched = false
 
+    // 啟動進行中標記：DNS 解析移到背景執行緒後，防止「解析期間按下停止／重啟」
+    // 後舊的啟動流程又回頭完成 VPN 建立（stop/restart 會清除此旗標使流程失效）
+    @Volatile
+    private var startPending = false
+
+    // 自動重連看門狗（純邏輯，可獨立測試）
+    private val serverWatchdog = ServerWatchdog(
+        clock = { android.os.SystemClock.elapsedRealtime() },
+        failWindowMs = SERVER_FAIL_WINDOW_MS,
+        failThreshold = SERVER_FAIL_THRESHOLD,
+        baseDelayMs = AUTO_RESTART_BASE_DELAY_MS,
+        maxDelayMs = AUTO_RESTART_MAX_DELAY_MS
+    )
+    private val serverEventLock = Any()
+    private var autoRestartRunnable: Runnable? = null
+
+    // 自動重啟進行中標記：讓「看門狗觸發的重啟」不重置退避計數（僅使用者/開機的全新啟動才重置）
+    @Volatile
+    private var autoRestartInProgress = false
+
+    // 常駐通知流量統計更新協程
+    private var statsJob: kotlinx.coroutines.Job? = null
+
     override fun onCreate() {
         super.onCreate()
         isRunning = false
@@ -91,6 +124,7 @@ class TunSocksService : VpnService() {
                 }
             }
         }
+        NativeEngine.onServerEvent = { ok -> onServerEvent(ok) }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -166,23 +200,44 @@ class TunSocksService : VpnService() {
             )
 
             publishStatus(getString(R.string.status_resolving))
-            // 必須在 VPN 建立前解析，避免自己的 DNS 查詢被隧道捕捉
-            val serverIp = try {
-                InetAddress.getByName(host).hostAddress
-            } catch (e: Exception) {
-                if (backgroundStart) {
-                    backgroundFail(getString(R.string.err_resolve_host, e.message))
-                } else {
-                    fail(getString(R.string.err_resolve_host, e.message))
+            // 必須在 VPN 建立前解析，避免自己的 DNS 查詢被隧道捕捉。
+            // DNS 解析是網路操作，移到 IO 執行緒避免主執行緒 ANR；完成後回主執行緒續建
+            startPending = true
+            serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                var resolved: String? = null
+                var resolveErrMsg: String? = null
+                try {
+                    resolved = InetAddress.getByName(host).hostAddress
+                } catch (e: Exception) {
+                    resolveErrMsg = e.message
                 }
-                return
+                mainHandler.post { continueStartTunnel(resolved, resolveErrMsg, backgroundStart) }
             }
+        } catch (e: Exception) {
+            startPending = false
+            Log.e(TAG, "startTunnel failed", e)
+            val msg = getString(R.string.err_start, e.message)
+            DebugLog.recordError(msg)
+            if (backgroundStart) backgroundFail(msg) else fail(msg)
+        }
+    }
+
+    // DNS 解析完成後於主執行緒接手：建立 TUN、套用 per-App、啟動原生引擎。
+    // 有效設定已回寫 prefs，此處統一從 prefs 讀取。
+    private fun continueStartTunnel(serverIp: String?, resolveErr: String?, backgroundStart: Boolean) {
+        if (!startPending) return   // 解析期間已停止／重啟 → 放棄本次啟動
+        val prefs = Config.prefs(this)
+        val host = prefs.getString(Config.KEY_HOST, "") ?: ""
+        val port = prefs.getString(Config.KEY_PORT, "1080")?.toIntOrNull() ?: 1080
+        val user = prefs.getString(Config.KEY_USER, "") ?: ""
+        val pass = prefs.getString(Config.KEY_PASS, "") ?: ""
+        val udpInTcp = prefs.getBoolean(Config.KEY_UDP_IN_TCP, false)
+        val remoteDns = prefs.getBoolean(Config.KEY_REMOTE_DNS, false)
+        try {
             if (serverIp == null) {
-                if (backgroundStart) {
-                    backgroundFail(getString(R.string.err_resolve_host, host))
-                } else {
-                    fail(getString(R.string.err_resolve_host, host))
-                }
+                startPending = false
+                val msg = getString(R.string.err_resolve_host, resolveErr ?: host)
+                if (backgroundStart) backgroundFail(msg) else fail(msg)
                 return
             }
             Log.d(TAG, "Server resolved to $serverIp")
@@ -195,7 +250,7 @@ class TunSocksService : VpnService() {
             builder.addRoute("0.0.0.0", 0)
             builder.addRoute("::", 0)
 
-            // DNS 伺服器（使用者可自訂）
+            // DNS 伺服器（使用者可自訂；先驗數字 IP 格式，避免對 hostname 觸發 DNS 查詢）
             val dnsList = Config.dnsServers(this)
             if (dnsList.isEmpty()) {
                 builder.addDnsServer("8.8.8.8")
@@ -203,7 +258,7 @@ class TunSocksService : VpnService() {
             } else {
                 dnsList.forEach { dns ->
                     try {
-                        if (InetAddress.getByName(dns).hostAddress != null) {
+                        if (Config.isLiteralIp(dns) && InetAddress.getByName(dns).hostAddress != null) {
                             builder.addDnsServer(dns)
                             Log.d(TAG, "DNS server added: $dns")
                         }
@@ -217,6 +272,7 @@ class TunSocksService : VpnService() {
 
             val tunFd = builder.establish()
             if (tunFd == null) {
+                startPending = false
                 if (backgroundStart) {
                     backgroundFail(getString(R.string.err_vpn_establish))
                 } else {
@@ -227,6 +283,7 @@ class TunSocksService : VpnService() {
 
             // native lib 載入失敗（如 16KB page 裝置未對齊）時，直接報錯而不是崩潰
             if (!NativeEngine.isLibraryLoaded()) {
+                startPending = false
                 if (backgroundStart) {
                     backgroundFail(getString(R.string.err_native_lib))
                 } else {
@@ -241,12 +298,40 @@ class TunSocksService : VpnService() {
             val result = NativeEngine.startTunnel(tunFd.detachFd(), serverIp, port, user, pass, udpInTcp, remoteDns)
             Log.d(TAG, "native startTunnel result: $result")
 
+            startPending = false
             isRunning = true
             backgroundRetryCount = 0
+            val wasAutoRestart = synchronized(serverEventLock) {
+                val w = autoRestartInProgress
+                autoRestartInProgress = false
+                w
+            }
+            if (!wasAutoRestart) {
+                // 使用者／開機／磁貼的全新啟動成功：自動重連退避歸零。
+                // 看門狗自己的重啟不重置，否則退避永遠停在最小延遲。
+                synchronized(serverEventLock) { serverWatchdog.reset() }
+            }
             publishStatus(getString(R.string.status_tunnel_active, host, port))
             val nm = getSystemService(NotificationManager::class.java)
             nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.notification_running)))
+
+            // 流量統計：每 3 秒更新常駐通知（↑ App→伺服器、↓ 伺服器→App • session 數）
+            statsJob?.cancel()
+            statsJob = serviceScope.launch {
+                while (isRunning) {
+                    try {
+                        val st = NativeEngine.getStats()
+                        getSystemService(NotificationManager::class.java)?.notify(
+                            NOTIFICATION_ID,
+                            createNotification(statsText(st))
+                        )
+                    } catch (e: Exception) {
+                    }
+                    kotlinx.coroutines.delay(STATS_UPDATE_INTERVAL_MS)
+                }
+            }
         } catch (e: Exception) {
+            startPending = false
             Log.e(TAG, "startTunnel failed", e)
             val msg = getString(R.string.err_start, e.message)
             DebugLog.recordError(msg)
@@ -373,6 +458,10 @@ class TunSocksService : VpnService() {
         backgroundRetryCount = 0
         bootContext = false
         flashLaunched = false
+        startPending = false   // 使仍在途中的啟動流程（背景 DNS 解析）失效
+        // 使用者明確停止：自動重連退避一併歸零
+        autoRestartInProgress = false
+        synchronized(serverEventLock) { serverWatchdog.reset() }
         publishStatus(getString(R.string.status_stopping))
         serviceScope.launch {
             stopEngineSync()
@@ -387,6 +476,7 @@ class TunSocksService : VpnService() {
         serviceScope.launch {
             stopEngineSync()
             mainHandler.post {
+                startPending = false   // 使仍在途中的舊啟動流程失效，再以最新設定重啟
                 startTunnel(null)
             }
         }
@@ -394,6 +484,9 @@ class TunSocksService : VpnService() {
 
     // 同步停止原生引擎並釋放 socket（在 IO 執行緒呼叫）
     private fun stopEngineSync() {
+        statsJob?.cancel()
+        statsJob = null
+        resetServerWatchdog()
         try {
             NativeEngine.stopTunnel()
         } catch (e: Exception) {
@@ -410,6 +503,63 @@ class TunSocksService : VpnService() {
         activeSockets.clear()
         isRunning = false
     }
+
+    /**
+     * 來自原生引擎的伺服器連線事件（背景 handshake 線程呼叫）：
+     *  - ok=true ：任一 CONNECT/ASSOCIATE 成功 → 清除失敗紀錄與退避計數
+     *  - ok=false：網路層失敗（socket 建立逾時等）→ 由 ServerWatchdog 滑動窗口累計，
+     *              達門檻即排程自動重啟（遞增延遲，避免對已下線伺服器瘋狂重試）
+     */
+    private fun onServerEvent(ok: Boolean) {
+        if (!isRunning) return
+        val decision = synchronized(serverEventLock) {
+            if (ok) {
+                serverWatchdog.onSuccess()
+                ServerWatchdog.Decision.None
+            } else {
+                serverWatchdog.onNetworkFailure()
+            }
+        }
+        val r = decision as? ServerWatchdog.Decision.Restart ?: return
+        Log.w(TAG, "Server unreachable, auto-restart in ${r.delayMs}ms")
+        publishStatus(getString(R.string.status_auto_reconnect, r.delayMs / 1000))
+        val runnable = Runnable {
+            autoRestartRunnable = null
+            synchronized(serverEventLock) { serverWatchdog.onRestartFired() }
+            if (isRunning && !startPending) {
+                autoRestartInProgress = true
+                restartTunnel()
+            }
+        }
+        autoRestartRunnable = runnable
+        mainHandler.postDelayed(runnable, r.delayMs)
+    }
+
+    private fun resetServerWatchdog() {
+        autoRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+        autoRestartRunnable = null
+        synchronized(serverEventLock) {
+            // 只清失敗與排程，保留退避計數（restartTunnel 內部也會呼叫本函式，
+            // 若連計數一起清，自動重啟會永遠停在最小延遲）
+            serverWatchdog.clearFailures()
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(java.util.Locale.US, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(java.util.Locale.US, "%.1f MB", mb)
+        return String.format(java.util.Locale.US, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun statsText(st: LongArray): String =
+        getString(R.string.notification_running) +
+            " • ↑" + formatBytes(if (st.isNotEmpty()) st[0] else 0L) +
+            " ↓" + formatBytes(if (st.size > 1) st[1] else 0L) +
+            " • TCP:" + (if (st.size > 2) st[2] else 0L) +
+            " UDP:" + (if (st.size > 3) st[3] else 0L)
 
     /**
      * 建立通往 SOCKS5 伺服器的 socket，並以 protect() 繞過 VPN 隧道，
@@ -517,6 +667,9 @@ class TunSocksService : VpnService() {
 
     override fun onDestroy() {
         serviceScope.cancel()
+        statsJob = null
+        resetServerWatchdog()
+        startPending = false
         isRunning = false
         super.onDestroy()
     }

@@ -18,6 +18,7 @@
     <string name="status_stopped">Stopped</string>
     <string name="status_restarting">Restarting…</string>
     <string name="status_start_retrying">Start failed, retrying… (attempt %1$d)</string>
+    <string name="status_auto_reconnect">Server unreachable — auto-reconnect in %1$d s…</string>
 
     <!-- Last crash / error -->
     <string name="last_crash_prefix">⚠️ Last crash:\n%1$s</string>
@@ -40,6 +41,8 @@
     <string name="btn_save_profile">💾 Save Profile</string>
     <string name="btn_delete_profile">🗑️ Delete Profile</string>
     <string name="btn_load_profile">Load Profile</string>
+    <string name="btn_export_profiles">📤 Export</string>
+    <string name="btn_import_profiles">📥 Import</string>
 
     <!-- App list -->
     <string name="applist_title">Apps</string>
@@ -48,6 +51,7 @@
     <string name="applist_hint_exclude">Exclusion mode: checked apps use the phone\'s direct network (bypass the tunnel).</string>
     <string name="applist_search_hint">Search apps…</string>
     <string name="applist_empty">No apps found</string>
+    <string name="applist_show_system">Show system apps</string>
 
     <!-- Section labels -->
     <string name="label_server">SOCKS5 Server</string>
@@ -76,6 +80,10 @@
     <string name="toast_profile_not_found">Profile not found</string>
     <string name="toast_notification_permission">Allow notifications to see the tunnel status</string>
     <string name="toast_tile_vpn_needed">Please allow the VPN connection first</string>
+    <string name="toast_no_profiles">No profiles to export</string>
+    <string name="toast_profiles_exported">Profiles copied to clipboard</string>
+    <string name="toast_profiles_imported">Imported %1$d profile(s)</string>
+    <string name="toast_profiles_invalid">No valid profile data in clipboard</string>
 
     <!-- Errors -->
     <string name="err_bad_params">Invalid parameters: please check the server address and port</string>

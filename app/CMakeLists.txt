@@ -14,6 +14,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size
 set(SOURCE_FILES
     src/main/cpp/jni_bridge.c
     src/main/cpp/tun_socks.c
+    src/main/cpp/checksum.c
 )
 
 add_library(socksclient SHARED

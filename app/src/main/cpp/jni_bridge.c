@@ -15,9 +15,11 @@ jobject g_native_engine_instance = NULL;
 // 快取 MethodID 避免反覆查詢 (效能關鍵)
 static jmethodID g_mid_createSocket = NULL;
 static jmethodID g_mid_notifyClosed = NULL;
+static jmethodID g_mid_notifyServerEvent = NULL;
 
 extern int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass, int udp_in_tcp, int remote_dns);
 extern void tun_socks_stop(void);
+extern void tun_socks_get_stats(unsigned long long *to_server, unsigned long long *from_server, int *tcp_sessions, int *udp_sessions);
 
 static pthread_t g_tunnel_thread;
 static int g_tunnel_running = 0;
@@ -87,6 +89,30 @@ void release_java_socket(int fd) {
     if (should_detach) (*g_jvm)->DetachCurrentThread(g_jvm);
 }
 
+// 伺服器連線事件：ok=1 成功（重置看門狗）、ok=0 網路層失敗（累計觸發自動重啟）
+void notify_server_event(int ok) {
+    int should_detach = 0;
+    JNIEnv *env = get_jni_env(&should_detach);
+    if (!env || !g_native_engine_instance || !g_mid_notifyServerEvent) return;
+
+    (*env)->CallVoidMethod(env, g_native_engine_instance, g_mid_notifyServerEvent, (jint)(ok ? 1 : 0));
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+    if (should_detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+}
+
+// 流量統計 → [tx_bytes, rx_bytes, tcp_sessions, udp_sessions]
+JNIEXPORT jlongArray JNICALL native_get_stats(JNIEnv *env, jobject thiz) {
+    unsigned long long tx = 0, rx = 0;
+    int tn = 0, un = 0;
+    tun_socks_get_stats(&tx, &rx, &tn, &un);
+    jlong v[4] = { (jlong)tx, (jlong)rx, (jlong)tn, (jlong)un };
+    jlongArray arr = (*env)->NewLongArray(env, 4);
+    if (!arr) return NULL;
+    (*env)->SetLongArrayRegion(env, arr, 0, 4, v);
+    return arr;
+}
+
 JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
     (*env)->GetJavaVM(env, &g_jvm);
     if (g_native_engine_instance) (*env)->DeleteGlobalRef(env, g_native_engine_instance);
@@ -96,6 +122,7 @@ JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
     jclass cls = (*env)->GetObjectClass(env, thiz);
     g_mid_createSocket = (*env)->GetMethodID(env, cls, "createSocketFromNative", "(Ljava/lang/String;IZ)I");
     g_mid_notifyClosed = (*env)->GetMethodID(env, cls, "notifySocketClosed", "(I)V");
+    g_mid_notifyServerEvent = (*env)->GetMethodID(env, cls, "notifyServerEvent", "(Z)V");
 }
 
 JNIEXPORT jstring JNICALL native_start_tunnel(JNIEnv *env, jobject thiz, jint fd, jstring host, jint port, jstring user, jstring pass, jboolean udp_in_tcp, jboolean remote_dns) {
@@ -141,6 +168,7 @@ static const JNINativeMethod gMethods[] = {
     {"nativeRegisterInstance", "()V", (void *)native_register_instance},
     {"startTunnel", "(ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;ZZ)Ljava/lang/String;", (void *)native_start_tunnel},
     {"stopTunnel", "()Ljava/lang/String;", (void *)native_stop_tunnel},
+    {"getStats", "()[J", (void *)native_get_stats},
 };
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {

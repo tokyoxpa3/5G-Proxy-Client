@@ -41,6 +41,23 @@ object Config {
 
     fun mode(ctx: Context): Int = prefs(ctx).getInt(KEY_MODE, MODE_GLOBAL)
 
+    // 純 JVM 可測的 IP 驗證（不依賴 android.util.Patterns，讓單元測試可在一般 JVM 跑）
+    private val IPV4_RE = java.util.regex.Pattern.compile(
+        "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$"
+    )
+
+    /**
+     * 數字 IP（IPv4 / IPv6）格式檢查——純本機字串驗證，不觸發 DNS 查詢。
+     * VpnService.Builder.addDnsServer 只接受數字位址；過去用 InetAddress.getByName
+     * 驗證會對 hostname 發出網路查詢（主執行緒 ANR 風險），故改為此檢查。
+     */
+    fun isLiteralIp(s: String): Boolean {
+        if (IPV4_RE.matcher(s).matches()) return true   // IPv4
+        if (!s.contains(':')) return false
+        // IPv6 粗驗：僅允許 hex / 冒號 / 內嵌 IPv4 的點（如 ::ffff:1.2.3.4）
+        return s.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' || it == '.' }
+    }
+
     fun loadProfile(ctx: Context, name: String): Profile? = Profiles.find(ctx, name)
 
     fun startIntent(ctx: Context, restart: Boolean = false): android.content.Intent =

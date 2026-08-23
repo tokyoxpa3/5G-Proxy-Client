@@ -20,10 +20,11 @@ import java.util.TreeSet
 
 class AppListActivity : Activity() {
 
-    private data class AppEntry(val pkg: String, val label: String, val icon: Drawable)
+    private data class AppEntry(val pkg: String, val label: String, val icon: Drawable, val system: Boolean)
 
     private lateinit var selected: MutableSet<String>
     private lateinit var prefs: android.content.SharedPreferences
+    private var showSystem = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,6 +61,14 @@ class AppListActivity : Activity() {
         }
         root.addView(search)
 
+        // 預設隱藏系統 App，勾選後才顯示（清單較乾淨）
+        val showSystemToggle = CheckBox(this).apply {
+            text = getString(R.string.applist_show_system)
+            textSize = 14f
+            setPadding(0, 4, 0, 4)
+        }
+        root.addView(showSystemToggle)
+
         val allApps = loadApps()
         val adapter = AppAdapter(mutableListOf())
         val list = ListView(this)
@@ -83,13 +92,18 @@ class AppListActivity : Activity() {
         root.addView(empty)
 
         fun applyFilter(q: String) {
-            val filtered = if (q.isBlank()) allApps else
-                allApps.filter { it.label.contains(q, ignoreCase = true) || it.pkg.contains(q, ignoreCase = true) }
+            val base = if (showSystem) allApps else allApps.filterNot { it.system }
+            val filtered = if (q.isBlank()) base else
+                base.filter { it.label.contains(q, ignoreCase = true) || it.pkg.contains(q, ignoreCase = true) }
             adapter.replaceAll(filtered)
             empty.visibility = if (filtered.isEmpty()) View.VISIBLE else View.GONE
             list.visibility = if (filtered.isEmpty()) View.GONE else View.VISIBLE
         }
 
+        showSystemToggle.setOnCheckedChangeListener { _, checked ->
+            showSystem = checked
+            applyFilter(search.text?.toString() ?: "")
+        }
         search.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -116,7 +130,8 @@ class AppListActivity : Activity() {
             AppEntry(
                 ai.packageName,
                 pm.getApplicationLabel(ai).toString(),
-                ai.loadIcon(pm)
+                ai.loadIcon(pm),
+                (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0
             )
         }.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
     }
@@ -130,29 +145,60 @@ class AppListActivity : Activity() {
             notifyDataSetChanged()
         }
 
+        // ViewHolder 式回收：列內含 checkbox / icon / 名稱 / 套件名
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val entry = items[position]
-            val row = LinearLayout(this@AppListActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(8, 12, 8, 12)
+            val row: LinearLayout
+            val cb: CheckBox
+            val iv: ImageView
+            val tvLabel: TextView
+            val tvPkg: TextView
+            if (convertView == null) {
+                row = LinearLayout(this@AppListActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(8, 12, 8, 12)
+                }
+                cb = CheckBox(this@AppListActivity).apply {
+                    isClickable = false
+                    isFocusable = false
+                }
+                iv = ImageView(this@AppListActivity).apply {
+                    setPadding(16, 0, 16, 0)
+                }
+                tvLabel = TextView(this@AppListActivity).apply {
+                    textSize = 15f
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                }
+                tvPkg = TextView(this@AppListActivity).apply {
+                    textSize = 11f
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    alpha = 0.6f
+                }
+                val texts = LinearLayout(this@AppListActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                }
+                texts.addView(tvLabel)
+                texts.addView(tvPkg)
+                row.addView(cb)
+                row.addView(iv)
+                row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                row.tag = arrayOf(cb, iv, tvLabel, tvPkg)
+            } else {
+                row = convertView as LinearLayout
+                @Suppress("UNCHECKED_CAST")
+                val t = row.tag as Array<View>
+                cb = t[0] as CheckBox
+                iv = t[1] as ImageView
+                tvLabel = t[2] as TextView
+                tvPkg = t[3] as TextView
             }
-            val cb = CheckBox(this@AppListActivity).apply {
-                isChecked = selected.contains(entry.pkg)
-                isClickable = false
-                isFocusable = false
-            }
-            val iv = ImageView(this@AppListActivity).apply {
-                setImageDrawable(entry.icon)
-                setPadding(16, 0, 16, 0)
-            }
-            val tv = TextView(this@AppListActivity).apply {
-                text = entry.label
-                textSize = 15f
-            }
-            row.addView(cb)
-            row.addView(iv)
-            row.addView(tv)
+            iv.setImageDrawable(entry.icon)
+            tvLabel.text = entry.label
+            tvPkg.text = entry.pkg
+            cb.isChecked = selected.contains(entry.pkg)
             return row
         }
     }

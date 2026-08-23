@@ -9,6 +9,7 @@ object NativeEngine {
 
     var socketProvider: ((String, Int, Boolean) -> Int)? = null
     var onSocketClosed: ((Int) -> Unit)? = null
+    var onServerEvent: ((Boolean) -> Unit)? = null
 
     init {
         try {
@@ -43,6 +44,14 @@ object NativeEngine {
         onSocketClosed?.invoke(fd)
     }
 
+    // 原生引擎回報伺服器連線事件：true=成功、false=網路層失敗
+    fun notifyServerEvent(ok: Boolean) {
+        onServerEvent?.invoke(ok)
+    }
+
     external fun startTunnel(fd: Int, host: String, port: Int, user: String, pass: String, udpInTcp: Boolean, remoteDns: Boolean): String
     external fun stopTunnel(): String
+
+    // [txBytes(→server), rxBytes(←server), tcpSessions, udpSessions]
+    external fun getStats(): LongArray
 }
