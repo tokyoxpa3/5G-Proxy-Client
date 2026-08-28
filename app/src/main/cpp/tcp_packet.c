@@ -61,7 +61,7 @@ ssize_t tcp_build_segment(const unsigned char *saddr, const unsigned char *daddr
 ssize_t tcp_build_synack(const unsigned char *src_ip, const unsigned char *dst_ip, int family,
                          uint16_t src_port_n, uint16_t dst_port_n,
                          uint32_t isn_host, uint32_t ack_host,
-                         uint16_t mss, uint8_t wscale,
+                         uint16_t win, uint16_t mss, uint8_t wscale,
                          unsigned char *out, size_t out_cap) {
     int is6 = (family == AF_INET6);
     size_t ip_hlen = is6 ? 40:20;
@@ -91,8 +91,8 @@ ssize_t tcp_build_synack(const unsigned char *src_ip, const unsigned char *dst_i
     memcpy(out+u+8,&ack_n,4);
     out[u+12]=0x80;
     out[u+13]=0x12;
-    // window: 4MB >>10 = 4096 => 0x1000
-    out[u+14]=0x10; out[u+15]=0x00;
+    // window: 呼叫端傳入（引擎 = TCP_APP_BUF_CAP >> 10）
+    out[u+14]=(uint8_t)(win>>8); out[u+15]=(uint8_t)(win&0xFF);
     out[u+16]=0;out[u+17]=0;
     out[u+18]=0;out[u+19]=0;
     out[u+20]=0x02;out[u+21]=0x04;

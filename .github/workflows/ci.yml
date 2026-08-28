@@ -62,3 +62,17 @@ jobs:
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -pthread -o tun_loopback_test \
             app/src/test/native/tun_loopback_test.c app/src/main/cpp/socks5_codec.c app/src/main/cpp/tcp_packet.c app/src/main/cpp/checksum.c
           ./tun_loopback_test
+
+      - name: Verify engine uses extracted modules (no parallel drift)
+        run: |
+          set -e
+          for sym in socks5_build_connect_request socks5_build_udp_frame \
+                     tcp_build_segment tcp_build_synack udp_build_packet \
+                     dns_build_reply_pure dns_build_fake_ip6; do
+            n=$(grep -c "\\b$sym\\b" app/src/main/cpp/tun_socks.c || true)
+            if [ "$n" -eq 0 ]; then
+              echo "ERROR: $sym 未在 tun_socks.c 中呼叫——抽離模組與引擎實作已分叉"
+              exit 1
+            fi
+          done
+          echo "所有抽離模組均已接回引擎"
