@@ -22,6 +22,9 @@
 
 #include "jni_bridge.h"
 #include "checksum.h"
+#include "socks5_codec.h"
+#include "tcp_packet.h"
+#include "dns_synth.h"
 
 #define LOG_TAG "TunSocks"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -209,16 +212,6 @@ static uint32_t next_tcp_isn(void) {
     return ((uint32_t)time(NULL) ^ 0x5F3759DF) + (++g.isn_counter) * 2654435761u;
 }
 
-// 由 entry 索引產生穩定的 fake IPv6：fd00::5e<idx+1>（16-bit 索引放最後兩 byte，
-// byte13=0x5E 標記避免撞上 TUN 本機位址 fd00::2）
-static void fake_dns_build_ip6(int idx, unsigned char out[16]) {
-    memset(out, 0, 16);
-    out[0] = 0xFD;
-    out[13] = 0x5E;
-    out[14] = (unsigned char)(((idx + 1) >> 8) & 0xFF);
-    out[15] = (unsigned char)((idx + 1) & 0xFF);
-}
-
 static pthread_mutex_t g_fake_dns_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // 取得 fake IP 對應的 32-bit 鍵（非 v4 回傳 0）
@@ -256,7 +249,7 @@ static uint32_t fake_dns_alloc(const char *domain, unsigned char ip6_out[16]) {
             e->last_used = now;
             g.fake_dns_next = (idx + 1) % FAKE_DNS_ENTRIES;
             fake = e->fake_ip;
-            fake_dns_build_ip6((int)idx, e->fake_ip6);
+            dns_build_fake_ip6((int)idx, e->fake_ip6);
             if (ip6_out) memcpy(ip6_out, e->fake_ip6, 16);
             goto out;
         }
@@ -274,7 +267,7 @@ static uint32_t fake_dns_alloc(const char *domain, unsigned char ip6_out[16]) {
         e->last_used = now;
         g.fake_dns_next = (oldest + 1) % FAKE_DNS_ENTRIES;
         fake = e->fake_ip;
-        fake_dns_build_ip6((int)oldest, e->fake_ip6);
+        dns_build_fake_ip6((int)oldest, e->fake_ip6);
         if (ip6_out) memcpy(ip6_out, e->fake_ip6, 16);
     }
 out:
@@ -383,64 +376,24 @@ static int parse_ipv6(const unsigned char *pkt, size_t len, uint8_t *proto, ip_a
 static void write_ipv4_udp_to_tun_ex(const ip_addr_t *app_ip, uint16_t app_port,
                                      const ip_addr_t *remote, uint16_t remote_port,
                                      const unsigned char *payload, size_t plen) {
-    if (plen > TUN_MTU - 28) { LOGE("relay UDP payload 過大 (%zu)，丟棄", plen); return; }
     unsigned char pkt[TUN_MTU];
-    size_t total = 20 + 8 + plen;
-
-    pkt[0] = 0x45;
-    pkt[1] = 0;
-    pkt[2] = (total >> 8) & 0xFF; pkt[3] = total & 0xFF;
-    pkt[4] = 0; pkt[5] = 0;
-    pkt[6] = 0; pkt[7] = 0;
-    pkt[8] = 64;
-    pkt[9] = 17; // UDP
-    memcpy(pkt + 12, remote->ip, 4);
-    memcpy(pkt + 16, app_ip->ip, 4);
-    pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
-    uint16_t csum = checksum16(pkt, 20);
-    pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
-
-    size_t u = 20;
-    memcpy(pkt + u, &remote_port, 2);
-    memcpy(pkt + u + 2, &app_port, 2);
-    uint16_t ulen = (uint16_t)(8 + plen);
-    pkt[u + 4] = ulen >> 8; pkt[u + 5] = ulen & 0xFF;
-    pkt[u + 6] = 0; pkt[u + 7] = 0;
-    memcpy(pkt + u + 8, payload, plen);
-    uint16_t ucsum = tcpudp_checksum4(remote->ip, app_ip->ip, 17, pkt + u, 8 + plen);
-    pkt[u + 6] = ucsum >> 8; pkt[u + 7] = ucsum & 0xFF;
-
-    ssize_t w = write(g.tun_fd, pkt, total);
+    ssize_t total = udp_build_packet(remote->ip, app_ip->ip, AF_INET,
+                                     remote_port, app_port,
+                                     payload, plen, pkt, sizeof pkt);
+    if (total < 0) return;
+    ssize_t w = write(g.tun_fd, pkt, (size_t)total);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun failed: %s", strerror(errno));
 }
 
 static void write_ipv6_udp_to_tun_ex(const ip_addr_t *app_ip, uint16_t app_port,
                                      const ip_addr_t *remote, uint16_t remote_port,
                                      const unsigned char *payload, size_t plen) {
-    if (plen > TUN_MTU - 48) { LOGE("relay UDP payload 過大 (%zu)，丟棄", plen); return; }
     unsigned char pkt[TUN_MTU];
-    size_t total = 40 + 8 + plen;
-
-    pkt[0] = 0x60;                        // version=6
-    pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;   // traffic class / flow label
-    size_t pl = 8 + plen;
-    pkt[4] = (pl >> 8) & 0xFF; pkt[5] = pl & 0xFF;   // payload length
-    pkt[6] = 17;                          // next header = UDP
-    pkt[7] = 64;                          // hop limit
-    memcpy(pkt + 8, remote->ip, 16);
-    memcpy(pkt + 24, app_ip->ip, 16);
-
-    size_t u = 40;
-    memcpy(pkt + u, &remote_port, 2);
-    memcpy(pkt + u + 2, &app_port, 2);
-    uint16_t ulen = (uint16_t)(8 + plen);
-    pkt[u + 4] = ulen >> 8; pkt[u + 5] = ulen & 0xFF;
-    pkt[u + 6] = 0; pkt[u + 7] = 0;
-    memcpy(pkt + u + 8, payload, plen);
-    uint16_t ucsum = tcpudp_checksum6(remote->ip, app_ip->ip, 17, pkt + u, 8 + plen);
-    pkt[u + 6] = ucsum >> 8; pkt[u + 7] = ucsum & 0xFF;
-
-    ssize_t w = write(g.tun_fd, pkt, total);
+    ssize_t total = udp_build_packet(remote->ip, app_ip->ip, AF_INET6,
+                                     remote_port, app_port,
+                                     payload, plen, pkt, sizeof pkt);
+    if (total < 0) return;
+    ssize_t w = write(g.tun_fd, pkt, (size_t)total);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun failed: %s", strerror(errno));
 }
 
@@ -666,47 +619,26 @@ static int udp_tcp_read(udp_sess_t *sess) {
 static void forward_udp_to_server(udp_sess_t *sess, const ip_addr_t *dst, uint16_t dst_port, const unsigned char *payload, size_t plen) {
     unsigned char frame[2 + 262 + MAX_PACKET_SIZE];
     if (plen > MAX_PACKET_SIZE) plen = MAX_PACKET_SIZE;
-    size_t off = 2;
-    memset(frame + 2, 0, 4);
     char dom[256];
-    int use_domain = 0;
+    const char *domain = NULL;
     if (g.remote_dns && dst->family == AF_INET) {
         uint32_t k;
         memcpy(&k, dst->ip, 4);
-        use_domain = fake_dns_lookup(k, dom, sizeof dom);
+        if (fake_dns_lookup(k, dom, sizeof dom)) domain = dom;
     } else if (g.remote_dns && dst->family == AF_INET6) {
         // fake IPv6 → 以網域撥號（Remote DNS 的 AAAA 路徑）
-        use_domain = fake_dns_lookup6(dst->ip, dom, sizeof dom);
+        if (fake_dns_lookup6(dst->ip, dom, sizeof dom)) domain = dom;
     }
-    if (use_domain) {
-        size_t dl = strlen(dom);
-        frame[2 + 3] = 0x03;                // ATYP domain
-        frame[2 + 4] = (unsigned char)dl;   // LEN
-        memcpy(frame + 2 + 5, dom, dl);
-        memcpy(frame + 2 + 5 + dl, &dst_port, 2);
-        off = 2 + 7 + dl;
-    } else if (dst->family == AF_INET6) {
-        frame[2 + 3] = 0x04; // ATYP IPv6
-        memcpy(frame + 2 + 4, dst->ip, 16);
-        memcpy(frame + 2 + 20, &dst_port, 2);
-        off = 2 + 22;
-    } else {
-        frame[2 + 3] = 0x01; // ATYP IPv4
-        memcpy(frame + 2 + 4, dst->ip, 4);
-        memcpy(frame + 2 + 8, &dst_port, 2);
-        off = 2 + 10;
-    }
-    memcpy(frame + off, payload, plen);
+    int flen = socks5_build_udp_frame(dst->ip, dst->family, dst_port, domain,
+                                      payload, plen, frame, sizeof frame);
+    if (flen < 0) { LOGE("udp frame 建構失敗"); return; }
     atomic_fetch_add(&g.bytes_to_server, (unsigned long long)plen);
-    int datalen = (int)(off - 2 + plen);
-    frame[0] = (unsigned char)(datalen >> 8);
-    frame[1] = (unsigned char)(datalen & 0xFF);
 
     if (sess->udp_tcp) {
         // UDP-in-TCP：frame 直接進控制連線的送出佇列
-        udp_tcp_append(sess, frame, 2 + (size_t)datalen);
+        udp_tcp_append(sess, frame, (size_t)flen);
     } else {
-        ssize_t sent = sendto(sess->relay_fd, frame + 2, (size_t)datalen, MSG_NOSIGNAL,
+        ssize_t sent = sendto(sess->relay_fd, frame + 2, (size_t)(flen - 2), MSG_NOSIGNAL,
                               (struct sockaddr *)&sess->relay_addr, sess->relay_len);
         if (sent < 0) LOGE("relay sendto 失敗: %s", strerror(errno));
     }
@@ -756,7 +688,6 @@ static int dns_build_reply(const unsigned char *q, size_t qlen, int always_answe
     int supported = (qtype == 1 || qtype == 28 || qtype == 65);
     if (!supported && !always_answer) return 0;
     name[nlen] = '\0';
-    size_t qend = off + 4;
 
     unsigned char fake6[16];
     uint32_t fake = 0;
@@ -765,41 +696,8 @@ static int dns_build_reply(const unsigned char *q, size_t qlen, int always_answe
         if (!fake) return 0;
     }
 
-    unsigned char r[512];
-    size_t rl = 0;
-    memcpy(r, q, 12);
-    r[2] = (unsigned char)(0x80 | (q[2] & 0x01));  // QR=1，保留 RD
-    r[3] = 0x80;                                   // RA
-    r[6] = 0; r[7] = 0;                            // ANCOUNT（下面視 qtype 設定）
-    r[8] = 0; r[9] = 0;                            // NSCOUNT
-    r[10] = 0; r[11] = 0;                          // ARCOUNT
-    rl = 12;
-    memcpy(r + rl, q + 12, qend - 12);             // 原 question
-    rl += qend - 12;
-    if (qtype == 1) {
-        r[6] = 0; r[7] = 1;                        // ANCOUNT = 1
-        r[rl++] = 0xC0; r[rl++] = 0x0C;            // 名稱指標 → question
-        r[rl++] = 0; r[rl++] = 1;                  // TYPE A
-        r[rl++] = 0; r[rl++] = 1;                  // CLASS IN
-        uint32_t ttl = htonl(FAKE_DNS_REPLY_TTL_SEC);
-        memcpy(r + rl, &ttl, 4); rl += 4;
-        r[rl++] = 0; r[rl++] = 4;                  // RDLENGTH
-        memcpy(r + rl, &fake, 4); rl += 4;
-    } else if (qtype == 28) {
-        // AAAA：回 fake IPv6（fd00::/8 僅在 TUN 內路由），雙棧 App 可直接以 v6 連線
-        r[6] = 0; r[7] = 1;                        // ANCOUNT = 1
-        r[rl++] = 0xC0; r[rl++] = 0x0C;            // 名稱指標 → question
-        r[rl++] = 0; r[rl++] = 28;                 // TYPE AAAA
-        r[rl++] = 0; r[rl++] = 1;                  // CLASS IN
-        uint32_t ttl = htonl(FAKE_DNS_REPLY_TTL_SEC);
-        memcpy(r + rl, &ttl, 4); rl += 4;
-        r[rl++] = 0; r[rl++] = 16;                 // RDLENGTH
-        memcpy(r + rl, fake6, 16); rl += 16;
-    }
-    // HTTPS（qtype=65）或 TCP 下其他型別：NOERROR 空答
-    memcpy(reply, r, rl);
-    *rlen = rl;
-    return 1;
+    // 委派給純函式合成回覆（dns_synth.c，golden 測試覆蓋）
+    return dns_build_reply_pure(q, qlen, fake, fake6, always_answer, reply, rlen);
 }
 
 // UDP 路徑：攔截 DNS 查詢並以 fake IP 回覆；回傳 1=已處理，0=放行走 relay。
@@ -1235,52 +1133,12 @@ static ssize_t write_tcp_to_tun(const ip_addr_t *saddr, const ip_addr_t *daddr,
                                 uint32_t seq, uint32_t ack, uint8_t flags,
                                 const unsigned char *payload, size_t plen,
                                 uint16_t win) {
-    int is6 = (saddr->family == AF_INET6);
-    size_t ip_hlen = is6 ? 40 : 20;
-    if (ip_hlen + 20 + plen > TUN_MTU) { LOGE("tcp 封包過大 (%zu)，丟棄", plen); return -1; }
     unsigned char pkt[TUN_MTU];
-    size_t total = ip_hlen + 20 + plen;
-
-    if (is6) {
-        pkt[0] = 0x60;
-        pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;
-        size_t pl = 20 + plen;
-        pkt[4] = (pl >> 8) & 0xFF; pkt[5] = pl & 0xFF;
-        pkt[6] = 6;
-        pkt[7] = 64;
-        memcpy(pkt + 8, saddr->ip, 16);
-        memcpy(pkt + 24, daddr->ip, 16);
-    } else {
-        pkt[0] = 0x45; pkt[1] = 0;
-        pkt[2] = (total >> 8) & 0xFF; pkt[3] = total & 0xFF;
-        pkt[4] = 0; pkt[5] = 0;
-        pkt[6] = 0; pkt[7] = 0;
-        pkt[8] = 64;
-        pkt[9] = 6;
-        memcpy(pkt + 12, saddr->ip, 4);
-        memcpy(pkt + 16, daddr->ip, 4);
-        pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
-        uint16_t csum = checksum16(pkt, 20);
-        pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
-    }
-
-    size_t u = ip_hlen;
-    memcpy(pkt + u, &sport, 2);
-    memcpy(pkt + u + 2, &dport, 2);
-    uint32_t seq_n = htonl(seq);
-    uint32_t ack_n = htonl(ack);
-    memcpy(pkt + u + 4, &seq_n, 4);
-    memcpy(pkt + u + 8, &ack_n, 4);
-    pkt[u + 12] = 0x50;
-    pkt[u + 13] = flags;
-    pkt[u + 14] = (uint8_t)(win >> 8); pkt[u + 15] = (uint8_t)(win & 0xFF);
-    pkt[u + 16] = 0; pkt[u + 17] = 0;
-    pkt[u + 18] = 0; pkt[u + 19] = 0;
-    if (plen) memcpy(pkt + u + 20, payload, plen);
-    uint16_t tcsum = transport_checksum(saddr->family, saddr->ip, daddr->ip, 6, pkt + u, 20 + plen);
-    pkt[u + 16] = tcsum >> 8; pkt[u + 17] = tcsum & 0xFF;
-
-    ssize_t w = write(g.tun_fd, pkt, total);
+    ssize_t total = tcp_build_segment(saddr->ip, daddr->ip, saddr->family,
+                                      sport, dport, seq, ack, flags,
+                                      payload, plen, win, pkt, sizeof pkt);
+    if (total < 0) return -1;
+    ssize_t w = write(g.tun_fd, pkt, (size_t)total);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun tcp failed: %s", strerror(errno));
     return w;
 }
@@ -1288,59 +1146,18 @@ static ssize_t write_tcp_to_tun(const ip_addr_t *saddr, const ip_addr_t *daddr,
 static void send_tcp_synack(tcp_sess_t *sess) {
     if (g.tun_fd < 0) return;
     int is6 = (sess->src_ip.family == AF_INET6);
-    size_t ip_hlen = is6 ? 40 : 20;
     unsigned char pkt[TUN_MTU];
-    size_t total = ip_hlen + 32;                     // 32-byte TCP（MSS + WS 選項）
-
-    if (is6) {
-        pkt[0] = 0x60;
-        pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;
-        size_t pl = 32;
-        pkt[4] = (pl >> 8) & 0xFF; pkt[5] = pl & 0xFF;
-        pkt[6] = 6;
-        pkt[7] = 64;
-        memcpy(pkt + 8, sess->dst_ip.ip, 16);
-        memcpy(pkt + 24, sess->src_ip.ip, 16);
-    } else {
-        pkt[0] = 0x45; pkt[1] = 0;
-        pkt[2] = (total >> 8) & 0xFF; pkt[3] = total & 0xFF;
-        pkt[4] = 0; pkt[5] = 0;
-        pkt[6] = 0; pkt[7] = 0;
-        pkt[8] = 64;
-        pkt[9] = 6;
-        memcpy(pkt + 12, sess->dst_ip.ip, 4);
-        memcpy(pkt + 16, sess->src_ip.ip, 4);
-        pkt[10] = 0; pkt[11] = 0;   // checksum 欄位先歸零
-        uint16_t csum = checksum16(pkt, 20);
-        pkt[10] = csum >> 8; pkt[11] = csum & 0xFF;
-    }
-
-    size_t u = ip_hlen;
-    memcpy(pkt + u, &sess->dst_port, 2);
-    memcpy(pkt + u + 2, &sess->src_port, 2);
-    uint32_t isn_n = htonl(sess->srv_isn);
-    uint32_t ack_n = htonl(sess->app_next);
-    memcpy(pkt + u + 4, &isn_n, 4);
-    memcpy(pkt + u + 8, &ack_n, 4);
-    pkt[u + 12] = 0x80;            // 32-byte TCP header（含 MSS + WS）
-    pkt[u + 13] = 0x12;            // SYN|ACK
-    pkt[u + 14] = (uint8_t)((TCP_APP_BUF_CAP >> 10) >> 8);
-    pkt[u + 15] = (uint8_t)((TCP_APP_BUF_CAP >> 10) & 0xFF);
-    pkt[u + 16] = 0; pkt[u + 17] = 0;   // checksum 欄位先歸零
-    pkt[u + 18] = 0; pkt[u + 19] = 0;
-    pkt[u + 20] = 0x02; pkt[u + 21] = 0x04;   // kind=2(MSS) len=4
-    uint16_t mss = htons((uint16_t)(TUN_MTU - (is6 ? 60 : 40)));
-    memcpy(pkt + u + 22, &mss, 2);            // MSS 依 family 調整（v6 多 20 bytes header）
-    pkt[u + 24] = 0x01; pkt[u + 25] = 0x01;   // NOP NOP
-    pkt[u + 26] = 0x03; pkt[u + 27] = 0x03;   // kind=3(WS) len=3
-    pkt[u + 28] = 0x0A;                        // shift=10（與 App 提議相同）
-    pkt[u + 29] = 0; pkt[u + 30] = 0; pkt[u + 31] = 0;
-    uint16_t tcsum = transport_checksum(sess->src_ip.family, sess->dst_ip.ip, sess->src_ip.ip, 6, pkt + u, 32);
-    pkt[u + 16] = tcsum >> 8; pkt[u + 17] = tcsum & 0xFF;
-
-    ssize_t w = write(g.tun_fd, pkt, total);
+    uint16_t mss = (uint16_t)(TUN_MTU - (is6 ? 60 : 40));
+    uint16_t win = (uint16_t)(TCP_APP_BUF_CAP >> 10);
+    ssize_t total = tcp_build_synack(sess->dst_ip.ip, sess->src_ip.ip, sess->src_ip.family,
+                                     sess->dst_port, sess->src_port,
+                                     sess->srv_isn, sess->app_next,
+                                     win, mss, 10,
+                                     pkt, sizeof pkt);
+    if (total < 0) { LOGE("synack build failed"); return; }
+    ssize_t w = write(g.tun_fd, pkt, (size_t)total);
     if (w < 0) LOGE("write tun SYN-ACK failed: %s (errno=%d)", strerror(errno), errno);
-    else if (w != (ssize_t)total) LOGI("write tun SYN-ACK partial %zd/%zu", w, total);
+    else if (w != total) LOGI("write tun SYN-ACK partial %zd/%zd", w, total);
 }
 
 // 引擎對 App 通告的接收 window：app_buf 剩餘空間（SYNACK 協商 shift=10，單位 1KB）
@@ -1626,27 +1443,13 @@ static void *tcp_connect_thread(void *arg) {
         goto fail;
     }
 
-    unsigned char req[300] = {0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
-    int req_len;
-    if (sess->dst_domain[0]) {
-        // Remote DNS：ATYP=0x03，由伺服器端解析網域
-        size_t dl = strlen(sess->dst_domain);
-        req[3] = 0x03;
-        req[4] = (unsigned char)dl;
-        memcpy(req + 5, sess->dst_domain, dl);
-        memcpy(req + 5 + dl, &sess->dst_port, 2);
-        req_len = 5 + (int)dl + 2;
-    } else if (sess->dst_ip.family == AF_INET6) {
-        req[3] = 0x04; // ATYP IPv6
-        memcpy(req + 4, sess->dst_ip.ip, 16);
-        memcpy(req + 20, &sess->dst_port, 2);
-        req_len = 22;
-    } else {
-        memcpy(req + 4, sess->dst_ip.ip, 4);
-        memcpy(req + 8, &sess->dst_port, 2);
-        req_len = 10;
-    }
-    if (net_send_all(sfd, req, req_len) < 0) goto fail;
+    unsigned char req[300];
+    int req_len = socks5_build_connect_request(
+        sess->dst_ip.ip, sess->dst_ip.family, sess->dst_port,
+        sess->dst_domain[0] ? sess->dst_domain : NULL,
+        req, sizeof req);
+    if (req_len < 0) { network_fail = 0; goto fail; }
+    if (net_send_all(sfd, req, (size_t)req_len) < 0) goto fail;
     if (net_recv_all(sfd, buf, 4) < 0) goto fail;
     if (buf[0] != 0x05 || buf[1] != 0x00) { network_fail = 0; goto fail; }   // REP≠0：伺服器端結果，非網路斷線
     int atyp = buf[3];

@@ -208,7 +208,7 @@ int main(void){
         CHECK("tun syn build", slen>0);
         // engine 收到後應回 SYN-ACK: src=daddr->saddr, sport=dport->sport, isn=5000 ack=1001
         unsigned char synack[1500];
-        ssize_t alen=tcp_build_synack(daddr,saddr,AF_INET,dport,sport,5000,1001,1460,6,synack,sizeof synack);
+        ssize_t alen=tcp_build_synack(daddr,saddr,AF_INET,dport,sport,5000,1001,4096,1460,6,synack,sizeof synack);
         CHECK("tun synack build", alen>0);
         // 透過 socketpair 傳遞：engine 寫 tun_write, test 從 tun_read 讀
         ssize_t w=write(tun_write,synack,alen);

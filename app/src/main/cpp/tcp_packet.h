@@ -37,7 +37,7 @@ ssize_t tcp_build_segment(const unsigned char *saddr, const unsigned char *daddr
 ssize_t tcp_build_synack(const unsigned char *src_ip, const unsigned char *dst_ip, int family,
                          uint16_t src_port_n, uint16_t dst_port_n,
                          uint32_t isn_host, uint32_t ack_host,
-                         uint16_t mss, uint8_t wscale,
+                         uint16_t win, uint16_t mss, uint8_t wscale,
                          unsigned char *out, size_t out_cap);
 
 // 建構 UDP/IP 封包（for relay to TUN）

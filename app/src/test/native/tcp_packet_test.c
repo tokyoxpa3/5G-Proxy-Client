@@ -73,7 +73,7 @@ int main(void){
         uint16_t sport=htons(80), dport=htons(12345);
         unsigned char out[1500];
         // isn 12345, ack 1001, mss 1460, wscale 10
-        ssize_t n=tcp_build_synack(src,dst,AF_INET,sport,dport,12345,1001,1460,10,out,sizeof out);
+        ssize_t n=tcp_build_synack(src,dst,AF_INET,sport,dport,12345,1001,4096,1460,10,out,sizeof out);
         CHECK("synack len ipv4", n==20+32);
         size_t u=20;
         CHECK("synack flags", out[u+13]==0x12);
@@ -94,7 +94,7 @@ int main(void){
         unsigned char src6[16]={0xfd,0,0,0,0,0,0,0,0,0,0,0,0,0x5e,0,1}, dst6[16]={0x20,0x01,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,1};
         uint16_t sport=htons(80), dport=htons(12345);
         unsigned char out[1500];
-        ssize_t n=tcp_build_synack(src6,dst6,AF_INET6,sport,dport,999,1001, 4096-60, 10,out,sizeof out);
+        ssize_t n=tcp_build_synack(src6,dst6,AF_INET6,sport,dport,999,1001, 4096, 4096-60, 10,out,sizeof out);
         CHECK("synack ipv6 len", n==40+32);
         CHECK("synack ipv6 mss", ((out[40+22]<<8|out[40+23]) == (4096-60)));
     }
