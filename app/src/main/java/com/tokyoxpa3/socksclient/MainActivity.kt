@@ -529,5 +529,19 @@ class MainActivity : Activity() {
         // 啟動/停止共用單一按鈕：執行中顯示「停止隧道」，停止時顯示「啟動隧道」
         val running = TunSocksService.isRunning
         btnToggle.text = getString(if (running) R.string.btn_stop_tunnel else R.string.btn_start_tunnel)
+        setServerFieldsEnabled(!running)
+    }
+
+    // 隧道執行中鎖定伺服器/連線相關欄位：這些值在 VpnService.Builder.establish()
+    // 時就已固定、改動須等下次啟動才生效，禁止編輯可避免「改了卻沒用」的困惑。
+    private fun setServerFieldsEnabled(enabled: Boolean) {
+        etHost.isEnabled = enabled
+        etPort.isEnabled = enabled
+        etUser.isEnabled = enabled
+        etPass.isEnabled = enabled
+        etDns1.isEnabled = enabled
+        etDns2.isEnabled = enabled
+        cbUdpInTcp.isEnabled = enabled
+        cbRemoteDns.isEnabled = enabled
     }
 }
