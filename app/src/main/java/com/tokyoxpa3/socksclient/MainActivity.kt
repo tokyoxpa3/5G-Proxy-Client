@@ -538,9 +538,9 @@ class MainActivity : Activity() {
         setConfigFieldsEnabled(!running)
     }
 
-    // 隧道執行中鎖定隧道組態欄位（伺服器/DNS/驗證/模式/App 選擇/連線選項）：
+    // 隧道執行中鎖定組態欄位（伺服器/DNS/驗證/模式/App 選擇/連線選項/設定檔）：
     // 這些值在 VpnService.Builder.establish() 時就已固定、改動須等下次啟動才生效，
-    // 禁止編輯可避免「改了卻沒用」的困惑。啟動/停止按鈕、開機自啟與設定檔不在此限。
+    // 禁止編輯可避免「改了卻沒用」的困惑。僅保留啟動/停止按鈕與開機自啟可操作。
     private fun setConfigFieldsEnabled(enabled: Boolean) {
         etHost.isEnabled = enabled
         etPort.isEnabled = enabled
@@ -555,5 +555,11 @@ class MainActivity : Activity() {
         for (i in 0 until modeGroup.childCount) {
             modeGroup.getChildAt(i).isEnabled = enabled
         }
+        etProfileName.isEnabled = enabled
+        spinnerProfile.isEnabled = enabled
+        btnSaveProfile.isEnabled = enabled
+        btnDeleteProfile.isEnabled = enabled
+        btnExportProfiles.isEnabled = enabled
+        btnImportProfiles.isEnabled = enabled
     }
 }
