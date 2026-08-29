@@ -66,6 +66,12 @@
     <string name="label_auto_start">開機自動啟動隧道</string>
     <string name="label_other">其他設定</string>
     <string name="label_profiles">設定檔</string>
+    <string name="label_kill_switch_status">斷線保護：%1$s</string>
+    <string name="btn_vpn_settings">前往系統 VPN 設定</string>
+    <string name="ks_status_none">未啟用</string>
+    <string name="ks_status_always_on">永遠連線</string>
+    <string name="ks_status_locked">已封鎖無 VPN</string>
+    <string name="ks_status_unreadable">無法自動偵測</string>
 
     <!-- Toasts -->
     <string name="toast_invalid_input">請輸入有效的伺服器位址與連接埠</string>

@@ -7,7 +7,7 @@
   - 預設 **UDP-in-UDP**（RFC 1928），可切換 **UDP-in-TCP**（自訂擴充指令 0x04，relay 走同一條 TCP，不受 UDP 優先權/壅塞影響）
 - **Remote DNS（fakedns）**：攔截 DNS 查詢並回覆保留網段（198.18.0.0/15）的 fake IP，TCP/UDP 皆以網域（ATYP=0x03）向伺服器撥號、由伺服器端解析——伺服器不需要實作 UDP relay 也能解析網域（需 SOCKS5 伺服器支援 domain 目標）
   - AAAA 查詢回覆 **fake IPv6**（`fd00::5e00:x`，僅 TUN 內路由），雙棧 App 直接以 v6 連線；HTTPS（type 65）查詢回空答強制退回 A/AAAA
-- **自動重連**：60 秒內 ≥3 次網路層連線失敗即判定伺服器斷線，以遞增延遲（10s→上限 5 分鐘）自動重啟隧道；任一連線成功即重置（認證被拒等協定層錯誤不觸發）
+- **自動重連**：60 秒內 ≥3 次網路層連線失敗即判定伺服器斷線，以遞增延遲（10s→上限 5 分鐘）自動重啟隧道；任一連線成功即重置（認證被拒等協定層錯誤不觸發）。自動重連採**軟重連**：不拆 TUN，僅重置引擎連線狀態避免洩漏真實 IP；沿用啟動時解析的伺服器 IP、不重新解析 hostname（伺服器位址變動需手動停止/重啟）
 - **流量統計**：常駐通知即時顯示 ↑/↓ bytes 與 TCP/UDP session 數（每 3 秒更新）
 - **IPv4 + IPv6 雙棧**：TUN 同時配置 `10.8.0.2/32` 與 `fd00::2/128`，UDP/TCP 皆支援 v6
 - **Per-App 模式**：三種模式任選
@@ -120,4 +120,4 @@ export JAVA_HOME=<JDK 17 路徑>
 ### IPv6
 
 - TUN 同時配置 `fd00::2/128`；IPv6 封包解析、checksum（pseudo-header）、SOCKS5 ATYP=0x04（CONNECT 與 UDP 雙向）皆已支援
-- 已知限制：不處理 IPv6 extension header；ICMP 不轉發
+- 已知限制：IPv6 Fragment 僅於「Fragment 為首個 extension header」時重組（巢狀 Fragment 仍丟棄）；ICMP/ICMPv6 僅本機回應 echo 與 NDP，不經 SOCKS5 轉發

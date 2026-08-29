@@ -40,6 +40,7 @@
 #define MAX_UDP_SESSIONS 512
 
 static pthread_t g_engine_thread;
+static atomic_int g_reset_requested = 0;
 
 // ---------- 位址抽象（v4 / v6 共用 session 結構） ----------
 // ip_addr_t 定義移至 ip_parse.h（純解析模組共用）
@@ -1193,12 +1194,6 @@ static int net_recv_all(int fd, unsigned char *buf, size_t len) {
 // 兩階段釋放：若背景 connect 線程尚未結束（thread_done==0），先移入 graveyard，
 // 由 engine_loop 每輪結尾的 tcp_graveyard_collect() 在 thread_done==1 後真正 free。
 static void tcp_session_destroy(tcp_sess_t *sess) {
-    int fd = atomic_load(&sess->srv_fd);
-    if (fd >= 0) {
-        if (g.epoll_fd >= 0) epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-        release_java_socket(fd);
-        atomic_store(&sess->srv_fd, -1);
-    }
     unsigned idx = tcp_hash_idx(&sess->src_ip, sess->src_port);
     tcp_sess_t **pp = &g.tcp_hash[idx];
     while (*pp && *pp != sess) pp = &(*pp)->next;
@@ -1210,6 +1205,8 @@ static void tcp_session_destroy(tcp_sess_t *sess) {
     *pp = sess->next;
     // 一律移入 graveyard，由 tcp_graveyard_collect()（每批 epoll 事件處理完）統一 free。
     // 若 thread_done==1 時立即 free，本批事件中殘留的同 session 事件會讀到已釋放記憶體（UAF）。
+    // srv_fd 不在這裡關閉：背景 connect 線程可能在 session 停放後才 store srv_fd / epoll ADD，
+    // 提前 release 會造成 fd 重用 UAF；改由 tcp_graveyard_collect()（thread_done==1 後）統一關閉。
     sess->next = g.tcp_graveyard;
     g.tcp_graveyard = sess;
 }
@@ -1220,6 +1217,13 @@ static void tcp_graveyard_collect(void) {
         tcp_sess_t *s = *pp;
         if (atomic_load(&s->thread_done)) {
             *pp = s->next;
+            // 背景 connect 線程已結束：此處才安全關閉 srv_fd（可能於停放後才 store）
+            int fd = atomic_load(&s->srv_fd);
+            if (fd >= 0) {
+                if (g.epoll_fd >= 0) epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                release_java_socket(fd);
+                atomic_store(&s->srv_fd, -1);
+            }
             free(s->app_buf);
             free(s->srv_buf);
             free(s->dns_rx_buf);
@@ -2076,12 +2080,61 @@ static void read_tun_packets(void) {
     }
 }
 
+// soft-reconnect：不拆 TUN/VPN 介面，在引擎執行緒內重置所有連線狀態。
+// 所有 TCP/UDP session 標記關閉並停放 graveyard，交由既有的兩階段釋放
+//（thread_done==1 後才 close fds / free）回收；背景 connect/handshake 線程結束時
+// 自行遞減 handshake_inflight，故此處不得清零 session count / handshake_inflight。
+static void engine_soft_reset(void) {
+    // TCP：全部標 closed 並銷毀（unlink → 停放 graveyard，srv_fd 由 collect 關閉）
+    for (int b = 0; b < TCP_HASH_BUCKETS; b++) {
+        while (g.tcp_hash[b]) {
+            tcp_sess_t *s = g.tcp_hash[b];
+            s->closed = 1;
+            tcp_session_destroy(s);
+        }
+    }
+    tcp_graveyard_collect();
+
+    // UDP：全部標 closed、unlink、停放 graveyard（fds 由 collect 在 thread_done==1 後關閉）
+    pthread_mutex_lock(&g_udp_hash_lock);
+    for (int b = 0; b < UDP_HASH_BUCKETS; b++) {
+        udp_sess_t *s = g.udp_hash[b];
+        g.udp_hash[b] = NULL;
+        while (s) {
+            udp_sess_t *n = s->next;
+            s->closed = 1;
+            s->next = g.udp_graveyard;
+            g.udp_graveyard = s;
+            s = n;
+        }
+    }
+    pthread_mutex_unlock(&g_udp_hash_lock);
+    udp_graveyard_collect();
+
+    // 重設統計與快取（沿用 engine_ctx_reset 語意，但「不」清 session count / handshake_inflight）
+    atomic_store(&g.bytes_to_server, 0);
+    atomic_store(&g.bytes_from_server, 0);
+    g.isn_counter = 0;
+    pthread_mutex_lock(&g_fake_dns_lock);
+    for (int i = 0; i < FAKE_DNS_ENTRIES; i++) g.fake_dns[i].in_use = 0;
+    g.fake_dns_next = 0;
+    pthread_mutex_unlock(&g_fake_dns_lock);
+    reasm_table_clear();
+
+    LOGI("soft reconnect: 已重置所有 session（保留 TUN/epoll/執行緒）");
+}
+
 static void *engine_loop(void *arg) {
     jni_attach_thread();
     struct epoll_event events[MAX_EVENTS];
     time_t last_gc = time(NULL);
 
     while (g.running) {
+        // soft-reconnect 要求：重置連線狀態後繼續（TUN/epoll/pipes/執行緒不動）
+        if (atomic_exchange(&g_reset_requested, 0)) {
+            engine_soft_reset();
+        }
+
         int nfds = epoll_wait(g.epoll_fd, events, MAX_EVENTS, 2000);
         time_t now = time(NULL);
 
@@ -2368,4 +2421,16 @@ void tun_socks_stop(void) {
     if (g.kick_pipe[0] != -1) { close(g.kick_pipe[0]); g.kick_pipe[0] = -1; }
     if (g.kick_pipe[1] != -1) { close(g.kick_pipe[1]); g.kick_pipe[1] = -1; }
     LOGI("tunnel stopped");
+}
+
+// soft-reconnect：要求引擎執行緒重置連線狀態（保留 TUN / VPN 介面）。
+// 任何執行緒皆可呼叫：設定旗標 + 寫 kick_pipe 喚醒引擎執行緒，
+// 實際重置由 engine_loop 在引擎執行緒內執行（engine_soft_reset）。
+void tun_socks_reconnect(void) {
+    if (!g.running) return;
+    atomic_store(&g_reset_requested, 1);
+    if (g.kick_pipe[1] != -1) {
+        char c = 1;
+        write(g.kick_pipe[1], &c, 1);
+    }
 }

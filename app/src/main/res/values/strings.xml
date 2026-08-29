@@ -66,6 +66,12 @@
     <string name="label_auto_start">Start tunnel on boot</string>
     <string name="label_other">Other Settings</string>
     <string name="label_profiles">Profiles</string>
+    <string name="label_kill_switch_status">Kill switch: %1$s</string>
+    <string name="btn_vpn_settings">Open system VPN settings</string>
+    <string name="ks_status_none">Not enabled</string>
+    <string name="ks_status_always_on">Always-on VPN</string>
+    <string name="ks_status_locked">Blocked without VPN</string>
+    <string name="ks_status_unreadable">Cannot auto-detect</string>
 
     <!-- Toasts -->
     <string name="toast_invalid_input">Please enter a valid server address and port</string>

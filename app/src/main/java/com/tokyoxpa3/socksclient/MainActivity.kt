@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.ScrollView
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
@@ -52,6 +53,8 @@ class MainActivity : Activity() {
     private lateinit var btnImportProfiles: Button
     private lateinit var spinnerProfile: Spinner
     private lateinit var tvStatus: TextView
+    private lateinit var tvKillSwitch: TextView
+    private lateinit var btnKillSwitch: Button
 
     private var pendingAutoStart = false
     private var autoFinishPending = false
@@ -107,6 +110,7 @@ class MainActivity : Activity() {
             Context.RECEIVER_NOT_EXPORTED
         )
         updateStatus(TunSocksService.lastStatus)
+        refreshKillSwitch()
 
         // 開機「閃一下」：若在背景停留期間隧道已連上，回到前台時立即關閉
         if (autoFinishPending && TunSocksService.isRunning) {
@@ -189,6 +193,16 @@ class MainActivity : Activity() {
             text = getString(R.string.label_auto_start)
             setPadding(0, 8, 0, 0)
         }
+        tvKillSwitch = TextView(this).apply {
+            textSize = 14f
+            setPadding(0, 8, 0, 0)
+        }
+        btnKillSwitch = Button(this).apply {
+            text = getString(R.string.btn_vpn_settings)
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
+            }
+        }
 
         // 隧道模式
         modeGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
@@ -243,6 +257,8 @@ class MainActivity : Activity() {
         root.addView(cbUdpInTcp)
         root.addView(cbRemoteDns)
         root.addView(cbAutoStart)
+        root.addView(tvKillSwitch)
+        root.addView(btnKillSwitch)
         root.addView(label(getString(R.string.label_profiles)))
         root.addView(etProfileName)
         root.addView(spinnerProfile)
@@ -515,6 +531,24 @@ class MainActivity : Activity() {
     private fun isValidIp(s: String): Boolean = Config.isLiteralIp(s)
 
     private fun prefs() = Config.prefs(this)
+
+    // 讀取系統 Always-on VPN / 封鎖無 VPN 設定，顯示斷線保護三態。
+    // Android 12+ 起 always_on_vpn_app / always_on_vpn_lockdown 為 @hide 設定鍵，
+    // 第三方 App 直接讀取會拋 SecurityException，故 catch 後降級顯示「無法自動偵測」。
+    private fun refreshKillSwitch() {
+        val statusRes = try {
+            val pkg = Settings.Secure.getString(contentResolver, "always_on_vpn_app")
+            val locked = Settings.Secure.getString(contentResolver, "always_on_vpn_lockdown") == "1"
+            when (KillSwitch.status(packageName, pkg, locked)) {
+                KillSwitchStatus.NONE -> R.string.ks_status_none
+                KillSwitchStatus.ALWAYS_ON -> R.string.ks_status_always_on
+                KillSwitchStatus.LOCKDOWN -> R.string.ks_status_locked
+            }
+        } catch (e: Exception) {
+            R.string.ks_status_unreadable
+        }
+        tvKillSwitch.text = getString(R.string.label_kill_switch_status, getString(statusRes))
+    }
 
     private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= 33 &&

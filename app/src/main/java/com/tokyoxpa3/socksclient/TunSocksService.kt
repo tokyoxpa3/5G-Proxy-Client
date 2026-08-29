@@ -482,6 +482,20 @@ class TunSocksService : VpnService() {
         }
     }
 
+    // 軟重連：不拆 TUN / VPN 介面，只重置引擎連線狀態。
+    // 原生沿用啟動時已解析的 g.srv_host（IP）重新撥號，伺服器恢復即自動重連。
+    // 不呼叫 stopEngineSync()、不清 activeSockets、isRunning 維持 true——
+    // 被關閉的 session fd 由原生經 notifySocketClosed 回呼逐一從 activeSockets 移除。
+    private fun softRestart() {
+        try {
+            val err = NativeEngine.reconnect()
+            if (err != null) Log.w(TAG, "soft reconnect failed: $err")
+        } catch (e: Exception) {
+            Log.w(TAG, "soft reconnect error", e)
+        }
+        synchronized(serverEventLock) { autoRestartInProgress = false }
+    }
+
     // 同步停止原生引擎並釋放 socket（在 IO 執行緒呼叫）
     private fun stopEngineSync() {
         statsJob?.cancel()
@@ -528,7 +542,7 @@ class TunSocksService : VpnService() {
             synchronized(serverEventLock) { serverWatchdog.onRestartFired() }
             if (isRunning && !startPending) {
                 autoRestartInProgress = true
-                restartTunnel()
+                softRestart()
             }
         }
         autoRestartRunnable = runnable
