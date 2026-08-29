@@ -69,4 +69,20 @@ object Config {
         android.content.Intent(ctx, TunSocksService::class.java).apply {
             action = TunSocksService.ACTION_STOP
         }
+
+    // per-app 設定在執行中被改動 → 要求服務 debounce 後自動重啟套用
+    fun applyPerAppIntent(ctx: Context): android.content.Intent =
+        android.content.Intent(ctx, TunSocksService::class.java).apply {
+            action = TunSocksService.ACTION_APPLY_PER_APP
+        }
+
+    fun applyPerAppIfRunning(ctx: Context) {
+        if (TunSocksService.isRunning) {
+            try {
+                ctx.startService(applyPerAppIntent(ctx))
+            } catch (e: Exception) {
+                // 服務可能正處於關閉中：忽略，下次啟動自然會讀到最新設定
+            }
+        }
+    }
 }

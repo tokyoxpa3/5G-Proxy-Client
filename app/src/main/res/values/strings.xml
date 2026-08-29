@@ -19,6 +19,7 @@
     <string name="status_restarting">Restarting…</string>
     <string name="status_start_retrying">Start failed, retrying… (attempt %1$d)</string>
     <string name="status_auto_reconnect">Server unreachable — auto-reconnect in %1$d s…</string>
+    <string name="status_applying_per_app">Applying per-app settings…</string>
 
     <!-- Last crash / error -->
     <string name="last_crash_prefix">⚠️ Last crash:\n%1$s</string>

@@ -19,6 +19,7 @@
     <string name="status_restarting">正在重啟…</string>
     <string name="status_start_retrying">啟動失敗，重試中…（第 %1$d 次）</string>
     <string name="status_auto_reconnect">伺服器無回應 — %1$d 秒後自動重連…</string>
+    <string name="status_applying_per_app">正在套用 App 設定…</string>
 
     <!-- Last crash / error -->
     <string name="last_crash_prefix">⚠️ 上次發生崩潰：\n%1$s</string>
