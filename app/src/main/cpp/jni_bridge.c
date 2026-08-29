@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #define TAG "JNI_BRIDGE"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
@@ -22,7 +23,7 @@ extern void tun_socks_stop(void);
 extern void tun_socks_get_stats(unsigned long long *to_server, unsigned long long *from_server, int *tcp_sessions, int *udp_sessions);
 
 static pthread_t g_tunnel_thread;
-static int g_tunnel_running = 0;
+static atomic_int g_tunnel_running = 0;
 
 typedef struct { int fd; char host[256]; int port; char user[128]; char pass[128]; int udp_in_tcp; int remote_dns; } TunnelArgs;
 
@@ -121,12 +122,39 @@ JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
     // 初始化 MethodID 快取
     jclass cls = (*env)->GetObjectClass(env, thiz);
     g_mid_createSocket = (*env)->GetMethodID(env, cls, "createSocketFromNative", "(Ljava/lang/String;IZ)I");
+    if (!g_mid_createSocket) {
+        LOGE("native_register_instance: GetMethodID failed for createSocketFromNative");
+        g_mid_createSocket = NULL;
+        g_mid_notifyClosed = NULL;
+        g_mid_notifyServerEvent = NULL;
+        (*env)->DeleteGlobalRef(env, g_native_engine_instance);
+        g_native_engine_instance = NULL;
+        return;
+    }
     g_mid_notifyClosed = (*env)->GetMethodID(env, cls, "notifySocketClosed", "(I)V");
+    if (!g_mid_notifyClosed) {
+        LOGE("native_register_instance: GetMethodID failed for notifySocketClosed");
+        g_mid_createSocket = NULL;
+        g_mid_notifyClosed = NULL;
+        g_mid_notifyServerEvent = NULL;
+        (*env)->DeleteGlobalRef(env, g_native_engine_instance);
+        g_native_engine_instance = NULL;
+        return;
+    }
     g_mid_notifyServerEvent = (*env)->GetMethodID(env, cls, "notifyServerEvent", "(Z)V");
+    if (!g_mid_notifyServerEvent) {
+        LOGE("native_register_instance: GetMethodID failed for notifyServerEvent");
+        g_mid_createSocket = NULL;
+        g_mid_notifyClosed = NULL;
+        g_mid_notifyServerEvent = NULL;
+        (*env)->DeleteGlobalRef(env, g_native_engine_instance);
+        g_native_engine_instance = NULL;
+        return;
+    }
 }
 
 JNIEXPORT jstring JNICALL native_start_tunnel(JNIEnv *env, jobject thiz, jint fd, jstring host, jint port, jstring user, jstring pass, jboolean udp_in_tcp, jboolean remote_dns) {
-    if (g_tunnel_running) return (*env)->NewStringUTF(env, "Already running");
+    if (atomic_load(&g_tunnel_running)) return (*env)->NewStringUTF(env, "Already running");
 
     TunnelArgs *args = calloc(1, sizeof(TunnelArgs));
     if (!args) return (*env)->NewStringUTF(env, "OOM");
@@ -145,7 +173,7 @@ JNIEXPORT jstring JNICALL native_start_tunnel(JNIEnv *env, jobject thiz, jint fd
     if (cuser) (*env)->ReleaseStringUTFChars(env, user, cuser);
     if (cpass) (*env)->ReleaseStringUTFChars(env, pass, cpass);
 
-    g_tunnel_running = 1;
+    atomic_store(&g_tunnel_running, 1);
     pthread_create(&g_tunnel_thread, NULL, tunnel_thread_func, args);
     return (*env)->NewStringUTF(env, "Started");
 }
@@ -155,9 +183,9 @@ JNIEXPORT jstring JNICALL native_stop_tunnel(JNIEnv *env, jobject thiz) {
     // 不能以 g_tunnel_running 判斷，因為啟動線程幾毫秒內就會把它清成 0，
     // 之後按停止會被誤判為「沒在跑」而直接略過 → 引擎永遠停不掉。
     tun_socks_stop();
-    if (g_tunnel_running) {
+    if (atomic_load(&g_tunnel_running)) {
         pthread_join(g_tunnel_thread, NULL);
-        g_tunnel_running = 0;
+        atomic_store(&g_tunnel_running, 0);
     }
     // 第二次：處理「按停止時啟動線程才剛 spawn 引擎」的競態（先 join 再停）
     tun_socks_stop();
