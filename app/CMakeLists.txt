@@ -18,6 +18,7 @@ set(SOURCE_FILES
     src/main/cpp/socks5_codec.c
     src/main/cpp/dns_synth.c
     src/main/cpp/tcp_packet.c
+    src/main/cpp/ip_parse.c
 )
 
 add_library(socksclient SHARED

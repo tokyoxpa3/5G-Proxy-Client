@@ -25,6 +25,7 @@
 #include "socks5_codec.h"
 #include "tcp_packet.h"
 #include "dns_synth.h"
+#include "ip_parse.h"
 
 #define LOG_TAG "TunSocks"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -41,11 +42,7 @@
 static pthread_t g_engine_thread;
 
 // ---------- 位址抽象（v4 / v6 共用 session 結構） ----------
-
-typedef struct {
-    int family;             // AF_INET / AF_INET6
-    unsigned char ip[16];   // 網路序位址（v4 存前 4 bytes）
-} ip_addr_t;
+// ip_addr_t 定義移至 ip_parse.h（純解析模組共用）
 
 static int ip_addr_eq(const ip_addr_t *a, const ip_addr_t *b) {
     return a->family == b->family && memcmp(a->ip, b->ip, 16) == 0;
@@ -335,42 +332,7 @@ static unsigned udp_hash_idx(const ip_addr_t *ip, uint16_t port) {
 }
 
 // ---------- TUN 封包處理 ----------
-
-static int parse_ipv4(const unsigned char *pkt, size_t len, uint8_t *proto, ip_addr_t *saddr, ip_addr_t *daddr, int *ihl) {
-    if (len < 20) return -1;
-    if ((pkt[0] >> 4) != 4) return -1;
-    *ihl = (pkt[0] & 0x0F) * 4;
-    if (*ihl < 20 || (size_t)*ihl > len) return -1;
-    *proto = pkt[9];
-    saddr->family = AF_INET; memcpy(saddr->ip, pkt + 12, 4); memset(saddr->ip + 4, 0, 12);
-    daddr->family = AF_INET; memcpy(daddr->ip, pkt + 16, 4); memset(daddr->ip + 4, 0, 12);
-    return 0;
-}
-
-// 沿 IPv6 extension header 鏈走到真正的 L4 協定，輸出傳輸層偏移 l4off。
-// 支援 Hop-by-Hop(0)/Routing(43)/Destination(60)/AH(51)；Fragment(44) 需重組，直接丟棄。
-static int parse_ipv6(const unsigned char *pkt, size_t len, uint8_t *proto, ip_addr_t *saddr, ip_addr_t *daddr, size_t *l4off) {
-    if (len < 40) return -1;
-    if ((pkt[0] >> 4) != 6) return -1;
-    saddr->family = AF_INET6; memcpy(saddr->ip, pkt + 8, 16);
-    daddr->family = AF_INET6; memcpy(daddr->ip, pkt + 24, 16);
-
-    size_t off = 40;
-    uint8_t nh = pkt[6];
-    for (int hops = 0; hops < 8; hops++) {
-        if (nh == 17 || nh == 6 || nh == 58) { *proto = nh; *l4off = off; return 0; }
-        if (nh == 44) return -1;                   // Fragment：無法重組，直接丟棄
-        if (off + 8 > len) return -1;
-        size_t hlen;
-        if (nh == 51)                              hlen = ((size_t)pkt[off + 1] + 2) * 4;   // AH
-        else if (nh == 0 || nh == 43 || nh == 60)  hlen = ((size_t)pkt[off + 1] + 1) * 8;   // Hop-by-Hop / Routing / Destination
-        else return -1;                                                                      // 不認識的 ext header
-        if (hlen < 8 || off + hlen > len) return -1;
-        nh = pkt[off];
-        off += hlen;
-    }
-    return -1;                                      // 超過層數上限
-}
+// (parse_ipv4 / parse_ipv6 / ipv6_first_frag 已抽離至 ip_parse.c)
 
 // 回覆 App 的 IP 封包（relay 回應 → TUN）；_ex 版本以顯式位址取代 session
 static void write_ipv4_udp_to_tun_ex(const ip_addr_t *app_ip, uint16_t app_port,
@@ -2031,21 +1993,7 @@ static void reasm_dispatch(uint8_t family, const ip_addr_t *src, const ip_addr_t
     reasm_clear_entry(idx);
 }
 
-// IPv6：檢查首個 extension header 是否為 Fragment（最常見情況）；
-// 更深層（ext header 在 Fragment 之前）的分片由 parse_ipv6 直接丟棄。
-static int ipv6_first_frag(const unsigned char *pkt, size_t len,
-                           uint8_t *next_hdr, size_t *frag_off, int *mf, uint32_t *id) {
-    if (len < 48) return 0;
-    if (pkt[6] != 44) return 0;
-    uint16_t ff = (uint16_t)((pkt[42] << 8) | pkt[43]);
-    *next_hdr = pkt[40];
-    *frag_off = (size_t)(ff & 0x1FFF) * 8;
-    *mf = (ff & 0x0001) != 0;
-    uint32_t idn;
-    memcpy(&idn, pkt + 44, 4);
-    *id = ntohl(idn);
-    return 1;
-}
+// ipv6_first_frag 已抽離至 ip_parse.c
 
 static void reasm_gc(time_t now) {
     for (int i = 0; i < REASM_MAX_ENTRIES; i++)
