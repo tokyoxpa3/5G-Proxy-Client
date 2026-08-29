@@ -79,8 +79,6 @@ class AppListActivity : Activity() {
             else selected.add(entry.pkg)
             prefs.edit().putStringSet(KEY_APPS, selected).apply()
             adapter.notifyDataSetChanged()
-            // 執行中改動 App 清單 → debounce 後自動重啟套用
-            Config.applyPerAppIfRunning(this@AppListActivity)
         }
         root.addView(list)
 

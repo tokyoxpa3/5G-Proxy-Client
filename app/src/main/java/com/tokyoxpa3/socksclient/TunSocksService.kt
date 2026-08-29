@@ -35,7 +35,6 @@ class TunSocksService : VpnService() {
         const val ACTION_STOP = "com.tokyoxpa3.socksclient.STOP"
         const val ACTION_RESTART = "com.tokyoxpa3.socksclient.RESTART"
         const val ACTION_STATUS = "com.tokyoxpa3.socksclient.STATUS"
-        const val ACTION_APPLY_PER_APP = "com.tokyoxpa3.socksclient.APPLY_PER_APP"
 
         // 5G 高頻寬×高延遲（BDP 常 >1MB），relay socket buffer 太小會卡住吞吐量。
         // 在 connect 前設定，讓 kernel 直接以較大 window 協商。
@@ -64,9 +63,6 @@ class TunSocksService : VpnService() {
         // Samsung 開機後 establish() 需要該 App 至少一次在前台成功建立 VPN 才會放行背景呼叫；
         // 背景重試失敗幾次後，自動開啟 MainActivity（前台建立）再自動關閉
         private const val BOOT_FLASH_AFTER_RETRIES = 3
-
-        // per-app 改動後自動重啟的 debounce：連點多個 App / 快速切模式時只重啟最後一次
-        private const val APPLY_DEBOUNCE_MS = 1_500L
 
         @Volatile
         var isRunning = false
@@ -106,9 +102,6 @@ class TunSocksService : VpnService() {
     private val serverEventLock = Any()
     private var autoRestartRunnable: Runnable? = null
 
-    // per-app 設定改動後、執行中自動重啟套用的延遲執行單位（debounce）
-    private var applyRestartRunnable: Runnable? = null
-
     // 自動重啟進行中標記：讓「看門狗觸發的重啟」不重置退避計數（僅使用者/開機的全新啟動才重置）
     @Volatile
     private var autoRestartInProgress = false
@@ -142,7 +135,6 @@ class TunSocksService : VpnService() {
         when (intent?.action) {
             ACTION_STOP -> stopTunnel()
             ACTION_RESTART -> restartTunnel()
-            ACTION_APPLY_PER_APP -> scheduleApplyPerApp()
             // ACTION_START、null（START_STICKY 被系統重建）→ 啟動（無 extras 時讀取已儲存設定）
             else -> startTunnel(intent)
         }
@@ -462,7 +454,6 @@ class TunSocksService : VpnService() {
     }
 
     private fun stopTunnel() {
-        removeApplyRestartPending()
         mainHandler.removeCallbacks(backgroundStartRetry)
         backgroundRetryCount = 0
         bootContext = false
@@ -480,8 +471,8 @@ class TunSocksService : VpnService() {
         }
     }
 
-    private fun restartTunnel(statusOverride: String? = null) {
-        publishStatus(statusOverride ?: getString(R.string.status_restarting))
+    private fun restartTunnel() {
+        publishStatus(getString(R.string.status_restarting))
         serviceScope.launch {
             stopEngineSync()
             mainHandler.post {
@@ -489,26 +480,6 @@ class TunSocksService : VpnService() {
                 startTunnel(null)
             }
         }
-    }
-
-    // per-app 模式 / App 清單在執行中被改動 → debounce 後自動重啟套用，
-    // 避免連點多個 App 或快速切換模式造成多次重啟與連線震盪。
-    private fun scheduleApplyPerApp() {
-        if (!isRunning) return   // 未執行時，下次啟動自然會讀到最新設定
-        applyRestartRunnable?.let { mainHandler.removeCallbacks(it) }
-        val runnable = Runnable {
-            applyRestartRunnable = null
-            if (isRunning && !startPending) {
-                restartTunnel(getString(R.string.status_applying_per_app))
-            }
-        }
-        applyRestartRunnable = runnable
-        mainHandler.postDelayed(runnable, APPLY_DEBOUNCE_MS)
-    }
-
-    private fun removeApplyRestartPending() {
-        applyRestartRunnable?.let { mainHandler.removeCallbacks(it) }
-        applyRestartRunnable = null
     }
 
     // 同步停止原生引擎並釋放 socket（在 IO 執行緒呼叫）
@@ -682,7 +653,6 @@ class TunSocksService : VpnService() {
     }
 
     override fun onDestroy() {
-        removeApplyRestartPending()
         serviceScope.cancel()
         statsJob = null
         resetServerWatchdog()

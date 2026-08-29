@@ -278,12 +278,6 @@ class MainActivity : Activity() {
             prefs.edit().putBoolean(Config.KEY_AUTO_START, checked).apply()
         }
         modeGroup.check(prefs.getInt(Config.KEY_MODE, Config.MODE_GLOBAL))
-        // 切換模式立即存檔；若隧道執行中則 debounce 後自動重啟套用新模式
-        modeGroup.setOnCheckedChangeListener { _, checkedId ->
-            if (checkedId == -1) return@setOnCheckedChangeListener
-            prefs.edit().putInt(Config.KEY_MODE, checkedId).apply()
-            Config.applyPerAppIfRunning(this@MainActivity)
-        }
 
         setupProfileUi()
 
