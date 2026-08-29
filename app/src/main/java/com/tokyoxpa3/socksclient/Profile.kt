@@ -13,7 +13,8 @@ data class Profile(
     val remoteDns: Boolean,
     val dns1: String,
     val dns2: String,
-    val mode: Int
+    val mode: Int,
+    val apps: Set<String> = emptySet()
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("name", name)
@@ -26,6 +27,11 @@ data class Profile(
         put("dns1", dns1)
         put("dns2", dns2)
         put("mode", mode)
+        if (apps.isNotEmpty()) {
+            val arr = JSONArray()
+            apps.forEach { arr.put(it) }
+            put("apps", arr)
+        }
     }
 
     companion object {
@@ -39,7 +45,12 @@ data class Profile(
             remoteDns = o.optBoolean("remote_dns", false),
             dns1 = o.optString("dns1", "8.8.8.8"),
             dns2 = o.optString("dns2", "1.1.1.1"),
-            mode = o.optInt("mode", Config.MODE_GLOBAL)
+            mode = o.optInt("mode", Config.MODE_GLOBAL),
+            apps = o.optJSONArray("apps")?.let { arr ->
+                (0 until arr.length()).mapNotNull {
+                    try { arr.optString(it).takeIf { s -> s.isNotBlank() } } catch (e: Exception) { null }
+                }.toSet()
+            } ?: emptySet()
         )
     }
 }

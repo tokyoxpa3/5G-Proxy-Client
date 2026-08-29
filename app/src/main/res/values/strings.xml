@@ -84,6 +84,7 @@
     <string name="toast_profiles_exported">Profiles copied to clipboard</string>
     <string name="toast_profiles_imported">Imported %1$d profile(s)</string>
     <string name="toast_profiles_invalid">No valid profile data in clipboard</string>
+    <string name="toast_allowlist_empty">Allowlist mode has no apps selected — please select apps first</string>
 
     <!-- Errors -->
     <string name="err_bad_params">Invalid parameters: please check the server address and port</string>

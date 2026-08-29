@@ -263,21 +263,21 @@ class MainActivity : Activity() {
             insets
         }
 
-        val prefs = getSharedPreferences("tunnel_config", MODE_PRIVATE)
-        etHost.setText(prefs.getString("host", ""))
-        etPort.setText(prefs.getString("port", "1080"))
-        etUser.setText(prefs.getString("user", ""))
-        etPass.setText(prefs.getString("pass", ""))
-        etDns1.setText(prefs.getString("dns1", "8.8.8.8"))
-        etDns2.setText(prefs.getString("dns2", "1.1.1.1"))
-        cbUdpInTcp.isChecked = prefs.getBoolean("udp_in_tcp", false)
-        cbRemoteDns.isChecked = prefs.getBoolean("remote_dns", false)
-        cbAutoStart.isChecked = prefs.getBoolean("auto_start", false)
+        val prefs = Config.prefs(this)
+        etHost.setText(prefs.getString(Config.KEY_HOST, ""))
+        etPort.setText(prefs.getString(Config.KEY_PORT, "1080"))
+        etUser.setText(prefs.getString(Config.KEY_USER, ""))
+        etPass.setText(prefs.getString(Config.KEY_PASS, ""))
+        etDns1.setText(prefs.getString(Config.KEY_DNS1, "8.8.8.8"))
+        etDns2.setText(prefs.getString(Config.KEY_DNS2, "1.1.1.1"))
+        cbUdpInTcp.isChecked = prefs.getBoolean(Config.KEY_UDP_IN_TCP, false)
+        cbRemoteDns.isChecked = prefs.getBoolean(Config.KEY_REMOTE_DNS, false)
+        cbAutoStart.isChecked = prefs.getBoolean(Config.KEY_AUTO_START, false)
         // 勾選/取消當下立即存檔，確保重開機使用最新設定（不必等到按下「啟動」）
         cbAutoStart.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(Config.KEY_AUTO_START, checked).apply()
         }
-        modeGroup.check(prefs.getInt("tunnel_mode", Config.MODE_GLOBAL))
+        modeGroup.check(prefs.getInt(Config.KEY_MODE, Config.MODE_GLOBAL))
 
         setupProfileUi()
 
@@ -315,6 +315,14 @@ class MainActivity : Activity() {
                 .putBoolean(Config.KEY_AUTO_START, cbAutoStart.isChecked)
                 .putInt(Config.KEY_MODE, modeGroup.checkedRadioButtonId)
                 .apply()
+
+            // 僅允許模式尚未勾選任何 App 時直接擋下，避免啟動後隧道不涵蓋任何 App
+            val selectedApps =
+                Config.prefs(this).getStringSet(AppListActivity.KEY_APPS, emptySet()) ?: emptySet()
+            if (PerAppMode.isEmptyAllowlist(Config.mode(this), selectedApps)) {
+                Toast.makeText(this, R.string.toast_allowlist_empty, Toast.LENGTH_LONG).show()
+                return
+            }
 
             Toast.makeText(this, getString(R.string.toast_starting), Toast.LENGTH_SHORT).show()
             android.util.Log.i("MainActivity", "Start button pressed, preparing VPN")
@@ -394,6 +402,11 @@ class MainActivity : Activity() {
                     cbRemoteDns.isChecked = p.remoteDns
                     modeGroup.check(p.mode)
                     etProfileName.setText(p.name)
+                    // 把此設定檔的 per-app 選擇與模式寫回 prefs，使下次啟動反映完整設定
+                    Config.prefs(this@MainActivity).edit()
+                        .putStringSet(AppListActivity.KEY_APPS, p.apps)
+                        .putInt(Config.KEY_MODE, p.mode)
+                        .apply()
                 }
             }
 
@@ -482,7 +495,8 @@ class MainActivity : Activity() {
         remoteDns = cbRemoteDns.isChecked,
         dns1 = etDns1.text.toString().trim(),
         dns2 = etDns2.text.toString().trim(),
-        mode = modeGroup.checkedRadioButtonId
+        mode = modeGroup.checkedRadioButtonId,
+        apps = Config.prefs(this).getStringSet(AppListActivity.KEY_APPS, emptySet()) ?: emptySet()
     )
 
     private fun refreshProfileSpinner() {
@@ -500,7 +514,7 @@ class MainActivity : Activity() {
     // 僅接受數字 IP：InetAddress.getByName 會對 hostname 發 DNS 查詢（主執行緒網路操作）
     private fun isValidIp(s: String): Boolean = Config.isLiteralIp(s)
 
-    private fun prefs() = getSharedPreferences("tunnel_config", MODE_PRIVATE)
+    private fun prefs() = Config.prefs(this)
 
     private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= 33 &&

@@ -29,7 +29,7 @@ class AppListActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        prefs = getSharedPreferences("tunnel_config", MODE_PRIVATE)
+        prefs = Config.prefs(this)
         // 相容舊版：讀取舊的 excluded_apps 鍵當作初始值
         selected = TreeSet(
             (prefs.getStringSet(KEY_APPS, null) ?: prefs.getStringSet(KEY_LEGACY_EXCLUDED, null)

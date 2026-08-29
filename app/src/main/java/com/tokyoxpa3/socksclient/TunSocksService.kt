@@ -109,6 +109,10 @@ class TunSocksService : VpnService() {
     // 常駐通知流量統計更新協程
     private var statsJob: kotlinx.coroutines.Job? = null
 
+    // 上次已顯示的流量摘要：數值未變時略過 notify，避免常駐通知每 3 秒無謂重建
+    @Volatile
+    private var lastStatsText: String? = null
+
     override fun onCreate() {
         super.onCreate()
         isRunning = false
@@ -317,14 +321,19 @@ class TunSocksService : VpnService() {
 
             // 流量統計：每 3 秒更新常駐通知（↑ App→伺服器、↓ 伺服器→App • session 數）
             statsJob?.cancel()
+            lastStatsText = null
             statsJob = serviceScope.launch {
                 while (isRunning) {
                     try {
                         val st = NativeEngine.getStats()
-                        getSystemService(NotificationManager::class.java)?.notify(
-                            NOTIFICATION_ID,
-                            createNotification(statsText(st))
-                        )
+                        val text = statsText(st)
+                        if (text != lastStatsText) {
+                            lastStatsText = text
+                            getSystemService(NotificationManager::class.java)?.notify(
+                                NOTIFICATION_ID,
+                                createNotification(text)
+                            )
+                        }
                     } catch (e: Exception) {
                     }
                     kotlinx.coroutines.delay(STATS_UPDATE_INTERVAL_MS)
@@ -348,42 +357,33 @@ class TunSocksService : VpnService() {
     private fun applyPerAppMode(builder: Builder, prefs: android.content.SharedPreferences) {
         val mode = prefs.getInt(Config.KEY_MODE, Config.MODE_GLOBAL)
         val selected = (prefs.getStringSet(AppListActivity.KEY_APPS, emptySet())
-            ?: emptySet()).filter { it.isNotBlank() }
-        when (mode) {
-            Config.MODE_EXCLUDE -> {
-                selected.forEach { pkg ->
-                    try {
-                        builder.addDisallowedApplication(pkg)
-                        Log.d(TAG, "Excluding app from tunnel: $pkg")
-                    } catch (e: Exception) {
-                        Log.w(TAG, "addDisallowedApplication($pkg) failed: ${e.message}")
-                    }
-                }
+            ?: emptySet()).filter { it.isNotBlank() }.toSet()
+
+        // 僅 ALLOWLIST + API<30 需要完整已安裝清單（把未勾選者全部設為繞過隧道）
+        val installed: Collection<String> =
+            if (mode == Config.MODE_ALLOWLIST && Build.VERSION.SDK_INT < PerAppMode.API_ADD_ALLOWED) {
+                packageManager.getInstalledApplications(0).map { it.packageName }
+            } else {
+                emptyList()
             }
-            Config.MODE_ALLOWLIST -> {
-                if (Build.VERSION.SDK_INT >= 30) {
-                    // addAllowedApplication：只有列出的 App 走隧道（API 30+）
-                    selected.forEach { pkg ->
-                        try {
-                            builder.addAllowedApplication(pkg)
-                            Log.d(TAG, "Allowlisted app: $pkg")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "addAllowedApplication($pkg) failed: ${e.message}")
-                        }
-                    }
-                } else {
-                    // API 26-29 無 addAllowedApplication：將「未勾選」的 App 全部設為繞過隧道
-                    packageManager.getInstalledApplications(0).forEach { ai ->
-                        if (ai.packageName !in selected) {
-                            try {
-                                builder.addDisallowedApplication(ai.packageName)
-                            } catch (e: Exception) {
-                            }
-                        }
-                    }
-                }
+
+        val plan = PerAppMode.compute(mode, selected, installed, Build.VERSION.SDK_INT)
+
+        plan.disallowed.forEach { pkg ->
+            try {
+                builder.addDisallowedApplication(pkg)
+                Log.d(TAG, "Excluding app from tunnel: $pkg")
+            } catch (e: Exception) {
+                Log.w(TAG, "addDisallowedApplication($pkg) failed: ${e.message}")
             }
-            else -> { /* global：不加任何限制 */ }
+        }
+        plan.allowed.forEach { pkg ->
+            try {
+                builder.addAllowedApplication(pkg)
+                Log.d(TAG, "Allowlisted app: $pkg")
+            } catch (e: Exception) {
+                Log.w(TAG, "addAllowedApplication($pkg) failed: ${e.message}")
+            }
         }
     }
 
@@ -545,21 +545,8 @@ class TunSocksService : VpnService() {
         }
     }
 
-    private fun formatBytes(bytes: Long): String {
-        if (bytes < 1024) return "$bytes B"
-        val kb = bytes / 1024.0
-        if (kb < 1024) return String.format(java.util.Locale.US, "%.1f KB", kb)
-        val mb = kb / 1024.0
-        if (mb < 1024) return String.format(java.util.Locale.US, "%.1f MB", mb)
-        return String.format(java.util.Locale.US, "%.2f GB", mb / 1024.0)
-    }
-
     private fun statsText(st: LongArray): String =
-        getString(R.string.notification_running) +
-            " • ↑" + formatBytes(if (st.isNotEmpty()) st[0] else 0L) +
-            " ↓" + formatBytes(if (st.size > 1) st[1] else 0L) +
-            " • TCP:" + (if (st.size > 2) st[2] else 0L) +
-            " UDP:" + (if (st.size > 3) st[3] else 0L)
+        getString(R.string.notification_running) + " • " + TrafficStats.summary(st)
 
     /**
      * 建立通往 SOCKS5 伺服器的 socket，並以 protect() 繞過 VPN 隧道，

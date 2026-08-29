@@ -84,6 +84,7 @@
     <string name="toast_profiles_exported">設定檔已複製到剪貼簿</string>
     <string name="toast_profiles_imported">已匯入 %1$d 個設定檔</string>
     <string name="toast_profiles_invalid">剪貼簿中沒有有效的設定檔資料</string>
+    <string name="toast_allowlist_empty">僅允許模式尚未選擇任何 App，請先前往選擇 App</string>
 
     <!-- Errors -->
     <string name="err_bad_params">參數錯誤：請檢查伺服器位址與連接埠</string>

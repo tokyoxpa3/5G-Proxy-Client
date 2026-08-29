@@ -53,6 +53,31 @@ class ProfileTest {
     }
 
     @Test
+    fun roundTrip_appsEmpty_default() {
+        val p = sample() // apps 預設 emptySet
+        assertTrue(p.apps.isEmpty())
+        assertEquals(p, Profile.fromJson(p.toJson()))
+        // 空 apps 不寫 "apps" 鍵
+        assertTrue(!p.toJson().has("apps"))
+    }
+
+    @Test
+    fun roundTrip_appsNonEmpty() {
+        val p = sample().copy(apps = setOf("com.a", "com.b"))
+        val restored = Profile.fromJson(p.toJson())
+        assertEquals(setOf("com.a", "com.b"), restored.apps)
+        assertEquals(p, restored)
+    }
+
+    @Test
+    fun fromJson_missingAppsKey_returnsEmptySet() {
+        val o = sample().toJson()
+        o.remove("apps")
+        val p = Profile.fromJson(o)
+        assertTrue(p.apps.isEmpty())
+    }
+
+    @Test
     fun profilesJson_arrayRoundTrip() {
         val list = listOf(sample(), sample().copy(name = "Office", port = "1090"))
         val arr = JSONArray()
