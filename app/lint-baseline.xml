@@ -1,0 +1,253 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<issues format="6" by="lint 8.5.2" type="baseline" client="gradle" dependencies="false" name="AGP (8.5.2)" variant="all" version="8.5.2">
+
+    <issue
+        id="ApplySharedPref"
+        message="Consider using `apply()` instead; `commit` writes its data to persistent storage immediately, whereas `apply` will handle it in the background"
+        errorLine1="                        .edit().putString(KEY_CRASH, detail).commit()"
+        errorLine2="                                                             ~~~~~~~~">
+        <location
+            file="src/main/java/com/tokyoxpa3/socksclient/DebugLog.kt"
+            line="45"
+            column="62"/>
+    </issue>
+
+    <issue
+        id="InlinedApi"
+        message="Field requires API level 33 (current min is 26): `android.content.Context#RECEIVER_NOT_EXPORTED`"
+        errorLine1="            Context.RECEIVER_NOT_EXPORTED"
+        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/java/com/tokyoxpa3/socksclient/MainActivity.kt"
+            line="114"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="NewApi"
+        message="Call requires API level 29 (current min is 26): `android.service.quicksettings.Tile#setSubtitle`"
+        errorLine1="        tile.subtitle = getString(if (active) R.string.tile_state_active else R.string.tile_state_inactive)"
+        errorLine2="             ~~~~~~~~">
+        <location
+            file="src/main/java/com/tokyoxpa3/socksclient/TunnelTileService.kt"
+            line="76"
+            column="14"/>
+    </issue>
+
+    <issue
+        id="StartActivityAndCollapseDeprecated"
+        message="TileService#startActivityAndCollapse(Intent) is deprecated. Use TileService#startActivityAndCollapse(PendingIntent) instead."
+        errorLine1="                startActivityAndCollapse(i)"
+        errorLine2="                                         ~">
+        <location
+            file="src/main/java/com/tokyoxpa3/socksclient/TunnelTileService.kt"
+            line="62"
+            column="42"/>
+    </issue>
+
+    <issue
+        id="ProtectedPermissions"
+        message="Permission is only granted to system apps"
+        errorLine1="    &lt;uses-permission android:name=&quot;android.permission.BIND_QUICK_SETTINGS_TILE&quot; />"
+        errorLine2="                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/AndroidManifest.xml"
+            line="12"
+            column="22"/>
+    </issue>
+
+    <issue
+        id="UnspecifiedRegisterReceiverFlag"
+        message="`statusReceiver` is missing `RECEIVER_EXPORTED` or `RECEIVER_NOT_EXPORTED` flag for unprotected broadcasts registered for com.tokyoxpa3.socksclient.STATUS"
+        errorLine1="                registerReceiver(statusReceiver, IntentFilter(TunSocksService.ACTION_STATUS))"
+        errorLine2="                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/java/com/tokyoxpa3/socksclient/TunnelTileService.kt"
+            line="33"
+            column="17"/>
+    </issue>
+
+    <issue
+        id="GradleDependency"
+        message="A newer version of androidx.core:core-ktx than 1.13.1 is available: 1.19.0"
+        errorLine1="    implementation &apos;androidx.core:core-ktx:1.13.1&apos;"
+        errorLine2="                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="build.gradle"
+            line="75"
+            column="20"/>
+    </issue>
+
+    <issue
+        id="PluralsCandidate"
+        message="Formatting %d followed by words (&quot;profile&quot;): This should probably be a plural rather than a string"
+        errorLine1="    &lt;string name=&quot;toast_profiles_imported&quot;>Imported %1$d profile(s)&lt;/string>"
+        errorLine2="    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/res/values/strings.xml"
+            line="94"
+            column="5"/>
+    </issue>
+
+    <issue
+        id="SystemPermissionTypo"
+        message="Did you mean `android.permission.FOREGROUND_SERVICE`?"
+        errorLine1="    &lt;uses-permission android:name=&quot;android.permission.FOREGROUND_SERVICE_VPN&quot; />"
+        errorLine2="                                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/AndroidManifest.xml"
+            line="5"
+            column="36"/>
+    </issue>
+
+    <issue
+        id="DataExtractionRules"
+        message="The attribute `android:allowBackup` is deprecated from Android 12 and higher and may be removed in future versions. Consider adding the attribute `android:dataExtractionRules` specifying an `@xml` resource which configures cloud backups and device transfers on Android 12 and higher."
+        errorLine1="        android:allowBackup=&quot;false&quot;"
+        errorLine2="                             ~~~~~">
+        <location
+            file="src/main/AndroidManifest.xml"
+            line="15"
+            column="30"/>
+    </issue>
+
+    <issue
+        id="QueryAllPackagesPermission"
+        message="A `&lt;queries>` declaration should generally be used instead of QUERY_ALL_PACKAGES; see https://g.co/dev/packagevisibility for details"
+        errorLine1="    &lt;uses-permission android:name=&quot;android.permission.QUERY_ALL_PACKAGES&quot; />"
+        errorLine2="                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/AndroidManifest.xml"
+            line="8"
+            column="22"/>
+    </issue>
+
+    <issue
+        id="ObsoleteSdkInt"
+        message="Unnecessary; SDK_INT is always >= 26"
+        errorLine1="            if (Build.VERSION.SDK_INT >= 26) {"
+        errorLine2="                ~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/java/com/tokyoxpa3/socksclient/BootReceiver.kt"
+            line="29"
+            column="17"/>
+    </issue>
+
+    <issue
+        id="ObsoleteSdkInt"
+        message="Unnecessary; SDK_INT is always >= 26"
+        errorLine1="            if (android.os.Build.VERSION.SDK_INT >= 26) {"
+        errorLine2="                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/java/com/tokyoxpa3/socksclient/MainActivity.kt"
+            line="402"
+            column="17"/>
+    </issue>
+
+    <issue
+        id="ObsoleteSdkInt"
+        message="This folder configuration (`v26`) is unnecessary; `minSdkVersion` is 26. Merge all the resources in this folder into `mipmap-anydpi`.">
+        <location
+            file="src/main/res/mipmap-anydpi-v26"/>
+    </issue>
+
+    <issue
+        id="StaticFieldLeak"
+        message="Do not place Android context classes in static fields (static reference to `DebugLog` which has field `ctx` pointing to `Context`); this is a memory leak"
+        errorLine1="/**"
+        errorLine2="^">
+        <location
+            file="src/main/java/com/tokyoxpa3/socksclient/DebugLog.kt"
+            line="10"
+            column="1"/>
+    </issue>
+
+    <issue
+        id="StaticFieldLeak"
+        message="Do not place Android context classes in static fields; this is a memory leak"
+        errorLine1="    private var ctx: Context? = null"
+        errorLine2="    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/java/com/tokyoxpa3/socksclient/DebugLog.kt"
+            line="20"
+            column="5"/>
+    </issue>
+
+    <issue
+        id="UnusedResources"
+        message="The resource `R.mipmap.ic_launcher_round` appears to be unused"
+        errorLine1="&lt;adaptive-icon xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;>"
+        errorLine2="^">
+        <location
+            file="src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml"
+            line="2"
+            column="1"/>
+    </issue>
+
+    <issue
+        id="UnusedResources"
+        message="The resource `R.string.notification_stopped` appears to be unused"
+        errorLine1="    &lt;string name=&quot;notification_stopped&quot;>Stopped&lt;/string>"
+        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/res/values/strings.xml"
+            line="9"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="UnusedResources"
+        message="The resource `R.string.btn_restart_tunnel` appears to be unused"
+        errorLine1="    &lt;string name=&quot;btn_restart_tunnel&quot;>🔄 Restart Tunnel&lt;/string>"
+        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/res/values/strings.xml"
+            line="39"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="UnusedResources"
+        message="The resource `R.string.toast_profile_not_found` appears to be unused"
+        errorLine1="    &lt;string name=&quot;toast_profile_not_found&quot;>Profile not found&lt;/string>"
+        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/res/values/strings.xml"
+            line="89"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="UnusedResources"
+        message="The resource `R.string.toast_tile_vpn_needed` appears to be unused"
+        errorLine1="    &lt;string name=&quot;toast_tile_vpn_needed&quot;>Please allow the VPN connection first&lt;/string>"
+        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/res/values/strings.xml"
+            line="91"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="UnusedResources"
+        message="The resource `R.string.boot_autostart_disabled` appears to be unused"
+        errorLine1="    &lt;string name=&quot;boot_autostart_disabled&quot;>Auto-start is disabled — open 5G Proxy Client to enable it&lt;/string>"
+        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/res/values/strings.xml"
+            line="113"
+            column="13"/>
+    </issue>
+
+    <issue
+        id="MonochromeLauncherIcon"
+        message="The application adaptive icon is missing a monochrome tag"
+        errorLine1="&lt;adaptive-icon xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;>"
+        errorLine2="^">
+        <location
+            file="src/main/res/mipmap-anydpi-v26/ic_launcher.xml"
+            line="2"
+            column="1"/>
+    </issue>
+
+</issues>

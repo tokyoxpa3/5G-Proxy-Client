@@ -38,13 +38,13 @@ data class Profile(
         fun fromJson(o: JSONObject): Profile = Profile(
             name = o.optString("name", ""),
             host = o.optString("host", ""),
-            port = o.optString("port", "1080"),
+            port = o.optString("port", Config.DEFAULT_PORT.toString()),
             user = o.optString("user", ""),
             pass = o.optString("pass", ""),
             udpInTcp = o.optBoolean("udp_in_tcp", false),
-            remoteDns = o.optBoolean("remote_dns", false),
-            dns1 = o.optString("dns1", "8.8.8.8"),
-            dns2 = o.optString("dns2", "1.1.1.1"),
+            remoteDns = o.optBoolean("remote_dns", Config.DEFAULT_REMOTE_DNS),
+            dns1 = o.optString("dns1", Config.DEFAULT_DNS1),
+            dns2 = o.optString("dns2", Config.DEFAULT_DNS2),
             mode = o.optInt("mode", Config.MODE_GLOBAL),
             apps = o.optJSONArray("apps")?.let { arr ->
                 (0 until arr.length()).mapNotNull {

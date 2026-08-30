@@ -33,6 +33,7 @@
 
 #define MAX_PACKET_SIZE 4160
 #define MAX_EVENTS 256
+// 須與 Java Config.TUN_MTU 保持一致（VpnService.Builder.setMtu），改動需同步兩側
 #define TUN_MTU 4096
 #define UDP_IDLE_TIMEOUT_SEC 330
 #define HANDSHAKE_TIMEOUT_SEC 10
@@ -805,12 +806,12 @@ static void *udp_session_thread(void *arg) {
     int cfd = -1, rfd = -1;
     struct sockaddr_storage relay = {0};
     socklen_t relay_len = 0;
-    int network_fail = 1;   // 網路層失敗旗標（同 tcp_connect_thread）
+    int fail_code = SE_EVENT_NETWORK_FAIL;   // 事件分類碼（同 tcp_connect_thread）
 
     // 1. TCP 控制連線（Java 已 connect + protect）
     cfd = request_java_socket(g.srv_host, g.srv_port, 0);
     if (cfd < 0) goto fail;
-    if (!g.running) { network_fail = 0; goto fail; }
+    if (!g.running) { fail_code = SE_EVENT_NONE; goto fail; }
     struct timeval tv = {HANDSHAKE_TIMEOUT_SEC, 0};
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
@@ -819,7 +820,7 @@ static void *udp_session_thread(void *arg) {
     buf[0] = 0x05; buf[1] = 0x01; buf[2] = g.auth_enabled ? 0x02 : 0x00;
     if (send_all(cfd, buf, 3) < 0) goto fail;
     if (recv_all(cfd, buf, 2) < 0) goto fail;
-    if (buf[0] != 0x05) { network_fail = 0; goto fail; }   // 對方不是 SOCKS5
+    if (buf[0] != 0x05) { fail_code = SE_EVENT_PROTOCOL_FAIL; goto fail; }   // 對方不是 SOCKS5
     if (buf[1] == 0x02) {
         // RFC 1929
         size_t ul = strlen(g.auth_user), pl = strlen(g.auth_pass);
@@ -829,9 +830,9 @@ static void *udp_session_thread(void *arg) {
         memcpy(buf + 3 + ul, g.auth_pass, pl);
         if (send_all(cfd, buf, 3 + ul + pl) < 0) goto fail;
         if (recv_all(cfd, buf, 2) < 0) goto fail;
-        if (buf[0] != 0x01 || buf[1] != 0x00) { network_fail = 0; goto fail; }   // 認證被拒
+        if (buf[0] != 0x01 || buf[1] != 0x00) { fail_code = SE_EVENT_AUTH_FAIL; goto fail; }   // 認證被拒
     } else if (buf[1] != 0x00) {
-        network_fail = 0;   // 伺服器拒絕認證方式
+        fail_code = SE_EVENT_AUTH_FAIL;   // 伺服器拒絕認證方式
         goto fail;
     }
 
@@ -843,7 +844,7 @@ static void *udp_session_thread(void *arg) {
         req[1] = 0x04;
         if (send_all(cfd, req, 10) < 0) goto fail;
         if (recv_all(cfd, buf, 4) < 0) goto fail;
-        if (buf[0] != 0x05) { network_fail = 0; goto fail; }
+        if (buf[0] != 0x05) { fail_code = SE_EVENT_PROTOCOL_FAIL; goto fail; }
         if (buf[1] == 0x00) {
             // 伺服器支援：relay 就是這條 TCP 連線，吃掉 BND.ADDR/PORT 即可
             int atyp_r = buf[3];
@@ -852,7 +853,7 @@ static void *udp_session_thread(void *arg) {
             } else if (atyp_r == 0x04) {
                 if (recv_all(cfd, buf, 18) < 0) goto fail;
             } else {
-                network_fail = 0;
+                fail_code = SE_EVENT_PROTOCOL_FAIL;
                 goto fail;
             }
             udp_tcp = 1;
@@ -862,12 +863,12 @@ static void *udp_session_thread(void *arg) {
             req[1] = 0x03;
             if (send_all(cfd, req, 10) < 0) goto fail;
             if (recv_all(cfd, buf, 4) < 0) goto fail;
-            if (buf[0] != 0x05 || buf[1] != 0x00) { network_fail = 0; goto fail; }
+            if (buf[0] != 0x05 || buf[1] != 0x00) { fail_code = SE_EVENT_PROTOCOL_FAIL; goto fail; }
         }
     } else {
         if (send_all(cfd, req, 10) < 0) goto fail;
         if (recv_all(cfd, buf, 4) < 0) goto fail;
-        if (buf[0] != 0x05 || buf[1] != 0x00) { network_fail = 0; goto fail; }
+        if (buf[0] != 0x05 || buf[1] != 0x00) { fail_code = SE_EVENT_PROTOCOL_FAIL; goto fail; }
     }
 
     if (!udp_tcp) {
@@ -889,14 +890,14 @@ static void *udp_session_thread(void *arg) {
         } else {
             // 不支援其他 ATYP（0x03 網域 relay 位址極少見，且此處無法解析）
             LOGE("UDP ASSOCIATE 回覆 ATYP=%d 不支援", atyp);
-            network_fail = 0;
+            fail_code = SE_EVENT_PROTOCOL_FAIL;
             goto fail;
         }
 
         // 4. UDP relay socket（Java protect，未 connect，由 sendto 指定目標）
         rfd = request_java_socket(g.srv_host, g.srv_port, 1);
         if (rfd < 0) goto fail;
-        if (!g.running) { network_fail = 0; goto fail; }
+        if (!g.running) { fail_code = SE_EVENT_NONE; goto fail; }
         set_nonblocking(rfd);
     } else {
         // UDP-in-TCP：初始化 frame 串流的收發緩衝
@@ -968,7 +969,7 @@ static void *udp_session_thread(void *arg) {
         }
         LOGI("udp handshake 完成: relay=%s:%d", rbuf, rport);
     }
-    notify_server_event(1);
+    notify_server_event(SE_EVENT_OK);
     return NULL;
 
 fail:
@@ -977,7 +978,7 @@ fail:
         ip_to_str(&sess->src_ip, b1, sizeof b1);
         LOGI("udp handshake 失敗 (src=%s:%d)", b1, ntohs(sess->src_port));
     }
-    if (network_fail) notify_server_event(0);
+    if (fail_code != SE_EVENT_NONE) notify_server_event(fail_code);
     if (cfd >= 0) { release_java_socket(cfd); sess->control_fd = -1; }
     if (rfd >= 0) { release_java_socket(rfd); sess->relay_fd = -1; }
     // 從 hash 移除；記憶體保留至線程結束（thread_done=1）後由 graveyard collect 釋放，
@@ -1384,17 +1385,17 @@ static void *tcp_connect_thread(void *arg) {
     unsigned char buf[320];
     int sfd = -1;
     int fd_stored = 0;   // srv_fd 是否已交由 engine 管理（之後線程不再 close）
-    int network_fail = 1;   // 網路層失敗旗標：伺服器明確拒絕（auth/REP≠0/非 SOCKS5）時清除，不觸發自動重連
+    int fail_code = SE_EVENT_NETWORK_FAIL;   // 事件分類碼：明確拒絕（auth/REP≠0/非 SOCKS5）時改為對應碼，不觸發看門狗
 
     sfd = request_java_socket(g.srv_host, g.srv_port, 0);
     if (sfd < 0) goto fail;
-    if (!g.running) { network_fail = 0; goto fail; }
+    if (!g.running) { fail_code = SE_EVENT_NONE; goto fail; }
     set_nonblocking(sfd);
 
     buf[0] = 0x05; buf[1] = 0x01; buf[2] = g.auth_enabled ? 0x02 : 0x00;
     if (net_send_all(sfd, buf, 3) < 0) goto fail;
     if (net_recv_all(sfd, buf, 2) < 0) goto fail;
-    if (buf[0] != 0x05) { network_fail = 0; goto fail; }   // 對方不是 SOCKS5：重連無益
+    if (buf[0] != 0x05) { fail_code = SE_EVENT_PROTOCOL_FAIL; goto fail; }   // 對方不是 SOCKS5：重連無益
     if (buf[1] == 0x02) {
         size_t ul = strlen(g.auth_user), pl = strlen(g.auth_pass);
         buf[0] = 0x01; buf[1] = (unsigned char)ul;
@@ -1403,9 +1404,9 @@ static void *tcp_connect_thread(void *arg) {
         memcpy(buf + 3 + ul, g.auth_pass, pl);
         if (net_send_all(sfd, buf, 3 + ul + pl) < 0) goto fail;
         if (net_recv_all(sfd, buf, 2) < 0) goto fail;
-        if (buf[0] != 0x01 || buf[1] != 0x00) { network_fail = 0; goto fail; }   // 認證被拒
+        if (buf[0] != 0x01 || buf[1] != 0x00) { fail_code = SE_EVENT_AUTH_FAIL; goto fail; }   // 認證被拒
     } else if (buf[1] != 0x00) {
-        network_fail = 0;   // 伺服器拒絕認證方式
+        fail_code = SE_EVENT_AUTH_FAIL;   // 伺服器拒絕認證方式
         goto fail;
     }
 
@@ -1414,10 +1415,10 @@ static void *tcp_connect_thread(void *arg) {
         sess->dst_ip.ip, sess->dst_ip.family, sess->dst_port,
         sess->dst_domain[0] ? sess->dst_domain : NULL,
         req, sizeof req);
-    if (req_len < 0) { network_fail = 0; goto fail; }
+    if (req_len < 0) { fail_code = SE_EVENT_PROTOCOL_FAIL; goto fail; }
     if (net_send_all(sfd, req, (size_t)req_len) < 0) goto fail;
     if (net_recv_all(sfd, buf, 4) < 0) goto fail;
-    if (buf[0] != 0x05 || buf[1] != 0x00) { network_fail = 0; goto fail; }   // REP≠0：伺服器端結果，非網路斷線
+    if (buf[0] != 0x05 || buf[1] != 0x00) { fail_code = SE_EVENT_PROTOCOL_FAIL; goto fail; }   // REP≠0：伺服器端結果，非網路斷線
     int atyp = buf[3];
     if (atyp == 0x01) {
         if (net_recv_all(sfd, buf, 6) < 0) goto fail;
@@ -1429,7 +1430,7 @@ static void *tcp_connect_thread(void *arg) {
     } else if (atyp == 0x04) {
         if (net_recv_all(sfd, buf, 18) < 0) goto fail;
     } else {
-        network_fail = 0;
+        fail_code = SE_EVENT_PROTOCOL_FAIL;
         goto fail;
     }
 
@@ -1449,13 +1450,13 @@ static void *tcp_connect_thread(void *arg) {
     char b1[64];
     ip_to_str(&sess->dst_ip, b1, sizeof b1);
     LOGI("tcp connect 完成 -> %s:%d", b1, ntohs(sess->dst_port));
-    notify_server_event(1);
+    notify_server_event(SE_EVENT_OK);
     goto done;
 
 fail:
     ip_to_str(&sess->dst_ip, b1, sizeof b1);
     LOGI("tcp connect 失敗 -> %s:%d", b1, ntohs(sess->dst_port));
-    if (network_fail) notify_server_event(0);
+    if (fail_code != SE_EVENT_NONE) notify_server_event(fail_code);
     // 只有 store 前（fd_stored==0）的失敗才由線程 close；store 後 fd 屬 engine 所有
     if (sfd >= 0 && !fd_stored) { release_java_socket(sfd); }
     if (g.tun_fd >= 0) send_session_rst(sess);
@@ -2128,6 +2129,7 @@ static void *engine_loop(void *arg) {
     jni_attach_thread();
     struct epoll_event events[MAX_EVENTS];
     time_t last_gc = time(NULL);
+    int unexpected_exit = 0;   // 非停止路徑（epoll 錯誤）退出時設 1，shutdown 完成後通知 Java
 
     while (g.running) {
         // soft-reconnect 要求：重置連線狀態後繼續（TUN/epoll/pipes/執行緒不動）
@@ -2140,6 +2142,7 @@ static void *engine_loop(void *arg) {
 
         if (nfds < 0) {
             if (errno == EINTR) continue;
+            unexpected_exit = 1;
             break;
         }
 
@@ -2263,6 +2266,10 @@ static void *engine_loop(void *arg) {
     }
 
 shutdown:
+    // 意外退出（epoll 錯誤等非停止路徑）：清 running，否則 g.running / g_tunnel_running
+    // 卡住會讓 Java isRunning 永不歸零、之後無法重啟。正常停止路徑 g.running 已由
+    // tun_socks_stop 清為 0，此處只處理意外路徑。
+    if (unexpected_exit) g.running = 0;
     // 先關 TUN：VPN 立刻拆除，網路馬上還原（fd 由 native 全權關閉）
     if (g.tun_fd >= 0) { close(g.tun_fd); g.tun_fd = -1; }
 
@@ -2314,6 +2321,8 @@ shutdown:
     tcp_graveyard_collect();
 
     if (g.epoll_fd >= 0) { close(g.epoll_fd); g.epoll_fd = -1; }
+    // 清理完成後才通知：此時所有 session fd 已 release_java_socket（Java activeSockets 已清空）
+    if (unexpected_exit) notify_engine_stopped(1);
     jni_detach_thread();
     return NULL;
 }
@@ -2421,6 +2430,12 @@ void tun_socks_stop(void) {
     if (g.kick_pipe[0] != -1) { close(g.kick_pipe[0]); g.kick_pipe[0] = -1; }
     if (g.kick_pipe[1] != -1) { close(g.kick_pipe[1]); g.kick_pipe[1] = -1; }
     LOGI("tunnel stopped");
+}
+
+// 供 JNI 層確認引擎是否「實際」仍在執行：g_tunnel_running 在引擎意外退出後
+// 可能殘留為 1，但 g.running 已於 shutdown 清為 0，故以此為準判斷存活。
+int tun_socks_is_running(void) {
+    return g.running;
 }
 
 // soft-reconnect：要求引擎執行緒重置連線狀態（保留 TUN / VPN 介面）。

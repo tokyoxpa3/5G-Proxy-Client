@@ -19,6 +19,8 @@
     <string name="status_restarting">Restarting…</string>
     <string name="status_start_retrying">Start failed, retrying… (attempt %1$d)</string>
     <string name="status_auto_reconnect">Server unreachable — auto-reconnect in %1$d s…</string>
+    <string name="status_auth_failed">⚠️ SOCKS5 authentication failed — check username/password</string>
+    <string name="status_protocol_failed">⚠️ SOCKS5 protocol error — check server address/port or target reachability</string>
 
     <!-- Last crash / error -->
     <string name="last_crash_prefix">⚠️ Last crash:\n%1$s</string>
@@ -71,7 +73,10 @@
     <string name="ks_status_none">Not enabled</string>
     <string name="ks_status_always_on">Always-on VPN</string>
     <string name="ks_status_locked">Blocked without VPN</string>
-    <string name="ks_status_unreadable">Cannot auto-detect</string>
+    <string name="ks_status_unreadable">Unknown — check system VPN settings</string>
+    <string name="btn_battery_optimization">🔋 Battery optimization</string>
+    <string name="toast_battery_already">Already exempt from battery optimization</string>
+    <string name="toast_battery_failed">Unable to open battery settings: %1$s</string>
 
     <!-- Toasts -->
     <string name="toast_invalid_input">Please enter a valid server address and port</string>

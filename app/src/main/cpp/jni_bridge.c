@@ -17,11 +17,13 @@ jobject g_native_engine_instance = NULL;
 static jmethodID g_mid_createSocket = NULL;
 static jmethodID g_mid_notifyClosed = NULL;
 static jmethodID g_mid_notifyServerEvent = NULL;
+static jmethodID g_mid_notifyEngineStopped = NULL;
 
 extern int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass, int udp_in_tcp, int remote_dns);
 extern void tun_socks_stop(void);
 extern void tun_socks_get_stats(unsigned long long *to_server, unsigned long long *from_server, int *tcp_sessions, int *udp_sessions);
 extern void tun_socks_reconnect(void);
+extern int tun_socks_is_running(void);
 
 static pthread_t g_tunnel_thread;
 static atomic_int g_tunnel_running = 0;
@@ -91,13 +93,25 @@ void release_java_socket(int fd) {
     if (should_detach) (*g_jvm)->DetachCurrentThread(g_jvm);
 }
 
-// 伺服器連線事件：ok=1 成功（重置看門狗）、ok=0 網路層失敗（累計觸發自動重啟）
-void notify_server_event(int ok) {
+// 伺服器連線事件（事件碼見 jni_bridge.h 的 enum server_event）
+void notify_server_event(int code) {
     int should_detach = 0;
     JNIEnv *env = get_jni_env(&should_detach);
     if (!env || !g_native_engine_instance || !g_mid_notifyServerEvent) return;
 
-    (*env)->CallVoidMethod(env, g_native_engine_instance, g_mid_notifyServerEvent, (jint)(ok ? 1 : 0));
+    (*env)->CallVoidMethod(env, g_native_engine_instance, g_mid_notifyServerEvent, (jint)code);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+    if (should_detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+}
+
+// 引擎意外退出（非正常停止）→ 通知 Java 清除 isRunning 等狀態
+void notify_engine_stopped(int unexpected) {
+    int should_detach = 0;
+    JNIEnv *env = get_jni_env(&should_detach);
+    if (!env || !g_native_engine_instance || !g_mid_notifyEngineStopped) return;
+
+    (*env)->CallVoidMethod(env, g_native_engine_instance, g_mid_notifyEngineStopped, (jboolean)(unexpected ? 1 : 0));
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 
     if (should_detach) (*g_jvm)->DetachCurrentThread(g_jvm);
@@ -142,12 +156,24 @@ JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
         g_native_engine_instance = NULL;
         return;
     }
-    g_mid_notifyServerEvent = (*env)->GetMethodID(env, cls, "notifyServerEvent", "(Z)V");
+    g_mid_notifyServerEvent = (*env)->GetMethodID(env, cls, "notifyServerEvent", "(I)V");
     if (!g_mid_notifyServerEvent) {
         LOGE("native_register_instance: GetMethodID failed for notifyServerEvent");
         g_mid_createSocket = NULL;
         g_mid_notifyClosed = NULL;
         g_mid_notifyServerEvent = NULL;
+        g_mid_notifyEngineStopped = NULL;
+        (*env)->DeleteGlobalRef(env, g_native_engine_instance);
+        g_native_engine_instance = NULL;
+        return;
+    }
+    g_mid_notifyEngineStopped = (*env)->GetMethodID(env, cls, "notifyEngineStopped", "(Z)V");
+    if (!g_mid_notifyEngineStopped) {
+        LOGE("native_register_instance: GetMethodID failed for notifyEngineStopped");
+        g_mid_createSocket = NULL;
+        g_mid_notifyClosed = NULL;
+        g_mid_notifyServerEvent = NULL;
+        g_mid_notifyEngineStopped = NULL;
         (*env)->DeleteGlobalRef(env, g_native_engine_instance);
         g_native_engine_instance = NULL;
         return;
@@ -155,7 +181,11 @@ JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
 }
 
 JNIEXPORT jstring JNICALL native_start_tunnel(JNIEnv *env, jobject thiz, jint fd, jstring host, jint port, jstring user, jstring pass, jboolean udp_in_tcp, jboolean remote_dns) {
-    if (atomic_load(&g_tunnel_running)) return (*env)->NewStringUTF(env, "Already running");
+    // g_tunnel_running 在引擎意外退出（epoll 錯誤）後可能殘留為 1；只有「引擎實際仍執行」
+    // 時才拒絕，否則歸零照常啟動，避免隧道卡在假運行狀態永遠無法重啟。
+    if (atomic_load(&g_tunnel_running) && tun_socks_is_running())
+        return (*env)->NewStringUTF(env, "Already running");
+    atomic_store(&g_tunnel_running, 0);
 
     TunnelArgs *args = calloc(1, sizeof(TunnelArgs));
     if (!args) return (*env)->NewStringUTF(env, "OOM");

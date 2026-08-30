@@ -11,8 +11,8 @@ android {
         applicationId "com.tokyoxpa3.socksclient"
         minSdk 26
         targetSdk 35
-        versionCode 10
-        versionName "1.4.2"
+        versionCode 11
+        versionName "1.5.0"
 
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
@@ -34,7 +34,7 @@ android {
             debuggable true
         }
         release {
-            minifyEnabled false
+            minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             // 若根目錄存在 keystore.properties 則以正式金鑰簽名（自行發布用），
             // 否則不簽名，供 F-Droid 等第三方使用自己的金鑰簽署。
@@ -62,9 +62,12 @@ android {
 
     ndkVersion "26.3.11579264"
 
-    lintOptions {
-        abortOnError false
-        checkReleaseBuilds false
+    lint {
+        // 開啟 lint 門禁：既有歷史問題收進 lint-baseline.xml 逐步消化，
+        // 新程式碼仍會即時被 lint 擋下。
+        abortOnError true
+        checkReleaseBuilds true
+        baseline file('lint-baseline.xml')
     }
 }
 

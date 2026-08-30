@@ -28,14 +28,27 @@ object Config {
     const val MODE_ALLOWLIST = 1
     const val MODE_EXCLUDE = 2
 
+    // 預設值集中管理，避免同一數值散落多檔（改動只需改此處）。
+    const val DEFAULT_PORT = 1080
+    const val DEFAULT_DNS1 = "8.8.8.8"
+    const val DEFAULT_DNS2 = "1.1.1.1"
+    // Remote DNS（fakedns）：預設開啟，讓 DNS 在代理出口側解析，
+    // CDN／地理路由更貼近出口網路（5G 代理等場景尤為重要）。
+    const val DEFAULT_REMOTE_DNS = true
+    // TUN 位址 / MTU：與 C 層 tun_socks.c 的 TUN_MTU、對 fd00::/8 的 ICMP6 NS 處理
+    // 互相耦合，改動時需同步 Java 與 C 兩側。
+    const val TUN_ADDR_V4 = "10.8.0.2"
+    const val TUN_ADDR_V6 = "fd00::2"
+    const val TUN_MTU = 4096
+
     fun prefs(ctx: Context): SharedPreferences =
         ctx.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun dnsServers(ctx: Context): List<String> {
         val p = prefs(ctx)
         val list = mutableListOf<String>()
-        p.getString(KEY_DNS1, "8.8.8.8")?.takeIf { it.isNotBlank() }?.let { list.add(it) }
-        p.getString(KEY_DNS2, "1.1.1.1")?.takeIf { it.isNotBlank() }?.let { list.add(it) }
+        p.getString(KEY_DNS1, DEFAULT_DNS1)?.takeIf { it.isNotBlank() }?.let { list.add(it) }
+        p.getString(KEY_DNS2, DEFAULT_DNS2)?.takeIf { it.isNotBlank() }?.let { list.add(it) }
         return list
     }
 

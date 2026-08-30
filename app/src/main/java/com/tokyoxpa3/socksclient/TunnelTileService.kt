@@ -42,6 +42,7 @@ class TunnelTileService : TileService() {
         try {
             unregisterReceiver(statusReceiver)
         } catch (e: Exception) {
+            Log.w(TAG, "unregisterReceiver failed: ${e.message}")
         }
     }
 

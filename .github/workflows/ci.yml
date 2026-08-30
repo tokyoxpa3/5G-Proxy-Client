@@ -28,6 +28,9 @@ jobs:
       - name: Run Kotlin unit tests
         run: ./gradlew testDebugUnitTest --stacktrace
 
+      - name: Run lint
+        run: ./gradlew lint
+
       - name: Assemble debug APK
         run: ./gradlew assembleDebug
 

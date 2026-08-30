@@ -23,6 +23,9 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import android.widget.AdapterView
+import android.os.PowerManager
+import android.net.Uri
+import android.annotation.SuppressLint
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 
@@ -55,6 +58,7 @@ class MainActivity : Activity() {
     private lateinit var tvStatus: TextView
     private lateinit var tvKillSwitch: TextView
     private lateinit var btnKillSwitch: Button
+    private lateinit var btnBattery: Button
 
     private var pendingAutoStart = false
     private var autoFinishPending = false
@@ -203,6 +207,10 @@ class MainActivity : Activity() {
                 startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
             }
         }
+        btnBattery = Button(this).apply {
+            text = getString(R.string.btn_battery_optimization)
+            setOnClickListener { onBatteryClick() }
+        }
 
         // 隧道模式
         modeGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
@@ -259,6 +267,7 @@ class MainActivity : Activity() {
         root.addView(cbAutoStart)
         root.addView(tvKillSwitch)
         root.addView(btnKillSwitch)
+        root.addView(btnBattery)
         root.addView(label(getString(R.string.label_profiles)))
         root.addView(etProfileName)
         root.addView(spinnerProfile)
@@ -281,13 +290,13 @@ class MainActivity : Activity() {
 
         val prefs = Config.prefs(this)
         etHost.setText(prefs.getString(Config.KEY_HOST, ""))
-        etPort.setText(prefs.getString(Config.KEY_PORT, "1080"))
+        etPort.setText(prefs.getString(Config.KEY_PORT, Config.DEFAULT_PORT.toString()))
         etUser.setText(prefs.getString(Config.KEY_USER, ""))
         etPass.setText(prefs.getString(Config.KEY_PASS, ""))
-        etDns1.setText(prefs.getString(Config.KEY_DNS1, "8.8.8.8"))
-        etDns2.setText(prefs.getString(Config.KEY_DNS2, "1.1.1.1"))
+        etDns1.setText(prefs.getString(Config.KEY_DNS1, Config.DEFAULT_DNS1))
+        etDns2.setText(prefs.getString(Config.KEY_DNS2, Config.DEFAULT_DNS2))
         cbUdpInTcp.isChecked = prefs.getBoolean(Config.KEY_UDP_IN_TCP, false)
-        cbRemoteDns.isChecked = prefs.getBoolean(Config.KEY_REMOTE_DNS, false)
+        cbRemoteDns.isChecked = prefs.getBoolean(Config.KEY_REMOTE_DNS, Config.DEFAULT_REMOTE_DNS)
         cbAutoStart.isChecked = prefs.getBoolean(Config.KEY_AUTO_START, false)
         // 勾選/取消當下立即存檔，確保重開機使用最新設定（不必等到按下「啟動」）
         cbAutoStart.setOnCheckedChangeListener { _, checked ->
@@ -361,7 +370,7 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_VPN_PERMISSION) {
             if (resultCode == RESULT_OK) {
-                val port = etPort.text.toString().trim().toIntOrNull() ?: 1080
+                val port = etPort.text.toString().trim().toIntOrNull() ?: Config.DEFAULT_PORT
                 startTunnel(etHost.text.toString().trim(), port)
             } else {
                 Toast.makeText(this, getString(R.string.toast_vpn_denied), Toast.LENGTH_SHORT).show()
@@ -484,6 +493,7 @@ class MainActivity : Activity() {
                             Profiles.save(this, Profile.fromJson(arr.getJSONObject(i)))
                             imported++
                         } catch (e: Exception) {
+                            android.util.Log.w("MainActivity", "import profile[$i] failed: ${e.message}")
                         }
                     }
                 } else if (text.startsWith("{")) {
@@ -491,6 +501,7 @@ class MainActivity : Activity() {
                     imported++
                 }
             } catch (e: Exception) {
+                android.util.Log.w("MainActivity", "import profiles parse failed: ${e.message}")
             }
             if (imported > 0) {
                 refreshProfileSpinner()
@@ -534,20 +545,50 @@ class MainActivity : Activity() {
 
     // 讀取系統 Always-on VPN / 封鎖無 VPN 設定，顯示斷線保護三態。
     // Android 12+ 起 always_on_vpn_app / always_on_vpn_lockdown 為 @hide 設定鍵，
-    // 第三方 App 直接讀取會拋 SecurityException，故 catch 後降級顯示「無法自動偵測」。
+    // 第三方 App 直接讀取會拋 SecurityException；隧道執行中改用服務端以 VpnService
+    // 公開 API（isAlwaysOn / isLockdownEnabled）快取的值，未執行時才退回讀系統設定。
     private fun refreshKillSwitch() {
-        val statusRes = try {
-            val pkg = Settings.Secure.getString(contentResolver, "always_on_vpn_app")
-            val locked = Settings.Secure.getString(contentResolver, "always_on_vpn_lockdown") == "1"
-            when (KillSwitch.status(packageName, pkg, locked)) {
-                KillSwitchStatus.NONE -> R.string.ks_status_none
-                KillSwitchStatus.ALWAYS_ON -> R.string.ks_status_always_on
-                KillSwitchStatus.LOCKDOWN -> R.string.ks_status_locked
+        val statusRes = if (TunSocksService.isRunning) {
+            when {
+                TunSocksService.lastLockdown -> R.string.ks_status_locked
+                TunSocksService.lastAlwaysOn -> R.string.ks_status_always_on
+                else -> R.string.ks_status_none
             }
-        } catch (e: Exception) {
-            R.string.ks_status_unreadable
+        } else {
+            try {
+                val pkg = Settings.Secure.getString(contentResolver, "always_on_vpn_app")
+                val locked = Settings.Secure.getString(contentResolver, "always_on_vpn_lockdown") == "1"
+                when (KillSwitch.status(packageName, pkg, locked)) {
+                    KillSwitchStatus.NONE -> R.string.ks_status_none
+                    KillSwitchStatus.ALWAYS_ON -> R.string.ks_status_always_on
+                    KillSwitchStatus.LOCKDOWN -> R.string.ks_status_locked
+                }
+            } catch (e: Exception) {
+                R.string.ks_status_unreadable
+            }
         }
         tvKillSwitch.text = getString(R.string.label_kill_switch_status, getString(statusRes))
+    }
+
+    // 引導使用者將本 App 加入電池最佳化白名單，降低常駐 VPN 前台服務被 OEM 省電機制
+    // 在背景悄悄終止的風險。此 App 以 F-Droid 發布，不受 Google Play 電池權限審核限制，
+    // 故刻意使用 REQUEST_IGNORE_BATTERY_OPTIMIZATIONS（lint 的 BatteryLife 警告在此情境適用）。
+    @SuppressLint("BatteryLife")
+    private fun onBatteryClick() {
+        val pm = getSystemService(PowerManager::class.java)
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            Toast.makeText(this, R.string.toast_battery_already, Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                    .setData(Uri.parse("package:$packageName"))
+            )
+        } catch (e: Exception) {
+            android.util.Log.e("MainActivity", "request ignore battery optimizations failed", e)
+            Toast.makeText(this, getString(R.string.toast_battery_failed, e.message), Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun requestNotificationPermissionIfNeeded() {

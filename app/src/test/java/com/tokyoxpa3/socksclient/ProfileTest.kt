@@ -37,7 +37,7 @@ class ProfileTest {
         assertEquals("1.1.1.1", p.dns2)
         assertEquals(Config.MODE_GLOBAL, p.mode)
         assertEquals(false, p.udpInTcp)
-        assertEquals(false, p.remoteDns)
+        assertEquals(true, p.remoteDns)
         assertEquals("", p.host)
         assertEquals("", p.pass)
     }
