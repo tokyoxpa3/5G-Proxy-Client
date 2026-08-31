@@ -9,7 +9,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -latomic -O3 -fno-semantic-interposition")
 
 # 16KB page 對齊（Android 15+ 新裝置，如小米 Pad Mini）：
 # 未對齊的 .so 在 16KB page 裝置上會 dlopen 失敗（UnsatisfiedLinkError → 閃退）
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
 
 set(SOURCE_FILES
     src/main/cpp/jni_bridge.c
