@@ -1,0 +1,17 @@
+Android SOCKS5 TUN tunnel client — routes the device's entire network traffic through a remote SOCKS5 server using a TUN virtual interface. No root required.
+
+Features:
+- User-space TCP state machine forwarded via SOCKS5 CONNECT
+- UDP / DNS / QUIC relay via SOCKS5 UDP ASSOCIATE (UDP-in-UDP or UDP-in-TCP 0x04)
+- Remote DNS (fakedns) with fake IPv4 (198.18.0.0/15) and fake IPv6
+- IPv4 + IPv6 dual-stack support
+- Per-App routing modes: Global, Allowlist, or Exclusion
+- Auto-reconnect with exponential backoff on connection drop
+- Live traffic statistics (up/down bytes & session count) in persistent notification
+- Custom primary & secondary DNS servers
+- Start tunnel on boot
+- Quick Settings tile for one-tap tunnel toggle
+- Multiple profile management with JSON export/import via clipboard
+- Native C (epoll) engine + JNI + Kotlin UI
+
+Open source (MIT), reproducible builds.

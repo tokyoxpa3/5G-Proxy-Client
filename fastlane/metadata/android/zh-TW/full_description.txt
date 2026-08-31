@@ -1,0 +1,17 @@
+Android SOCKS5 TUN 隧道客戶端 — 透過 TUN 虛擬網卡將整台裝置的網路流量導向遠端 SOCKS5 伺服器，完全無需 Root 權限。
+
+特色功能：
+- 使用者空間 TCP 狀態機，透過 SOCKS5 CONNECT 轉發
+- 支援 UDP / DNS / QUIC 轉發（RFC 1928 標準 UDP-in-UDP 或自訂擴充 0x04 UDP-in-TCP）
+- Remote DNS（fakedns）攔截，支援 fake IPv4（198.18.0.0/15）與 fake IPv6，由伺服器端解析網域
+- IPv4 + IPv6 雙棧支援
+- Per-App 應用程式分流模式：全局、白名單、排除名單
+- 斷線自動軟重連（指數退避，不拆 TUN 避免洩漏真實 IP）
+- 常駐通知即時顯示上傳/下載流量與連線數統計
+- 自訂主要/次要 DNS 伺服器
+- 開機自動啟動隧道
+- Quick Settings 快速設定面板磁貼開關
+- 多組設定檔儲存與剪貼簿 JSON 匯入/匯出
+- 原生 C（epoll）引擎 + JNI + Kotlin UI
+
+開源專案（MIT 授權）。
