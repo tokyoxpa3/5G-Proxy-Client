@@ -26,6 +26,7 @@
 #include "tcp_packet.h"
 #include "dns_synth.h"
 #include "ip_parse.h"
+#include "reasm.h"
 
 #define LOG_TAG "TunSocks"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1126,10 +1127,7 @@ static void send_tcp_synack(tcp_sess_t *sess) {
 
 // 引擎對 App 通告的接收 window：app_buf 剩餘空間（SYNACK 協商 shift=10，單位 1KB）
 static uint16_t tcp_win_field(const tcp_sess_t *sess) {
-    size_t occ = sess->app_off + sess->app_len;
-    size_t free = (occ >= TCP_APP_BUF_CAP) ? 0 : (TCP_APP_BUF_CAP - occ);
-    uint16_t w = (uint16_t)(free >> 10);
-    return (w > 0) ? w : 1;
+    return tcp_win_field_pure(sess->app_off + sess->app_len, TCP_APP_BUF_CAP);
 }
 
 static void send_tcp_ack(tcp_sess_t *sess) {
@@ -1580,14 +1578,8 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
         sess->srv_next = sess->srv_isn + 1;
         sess->app_acked = sess->srv_isn + 1;
         sess->app_win = 0x3FFFFFFF;          // 未知前不限制
-        for (int o = 20; o + 2 <= tcp_hlen; ) {   // 解析 App SYN 的 window scale
-            uint8_t k = pkt[t + o];
-            if (k == 0) break;
-            if (k == 1) { o += 1; continue; }
-            if (k == 3 && o + 3 <= tcp_hlen) sess->app_ws = pkt[t + o + 2];
-            if (o + 1 < tcp_hlen) o += pkt[t + o + 1];
-            else break;
-        }
+        // 解析 App SYN 的 window scale（選項區 = 固定 20B 表頭之後，長度 = tcp_hlen-20）
+        sess->app_ws = tcp_parse_window_scale(pkt + t + 20, (size_t)tcp_hlen - 20);
         sess->last_active = time(NULL);
         sess->next = g.tcp_hash[idx];
         g.tcp_hash[idx] = sess;
@@ -1627,7 +1619,7 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
     sess->app_win = ((uint32_t)ntohs(win_field)) << sess->app_ws;
     // 迴繞安全比較（RFC1323 式）：單一連線傳輸超過 4GB 後序號迴繞，
     // 普通大小比較會拒絕更新 ack → app_acked 凍結 → 流控誤判窗口耗盡而卡死
-    if ((int32_t)(ack_host - sess->app_acked) > 0) sess->app_acked = ack_host;
+    if (tcp_seq_gt(ack_host, sess->app_acked)) sess->app_acked = ack_host;
 
     if ((flags & 0x02) && !(flags & 0x10)) {               // SYN 重傳
         if (atomic_load(&sess->state) == 0) send_tcp_synack(sess);
@@ -1848,8 +1840,6 @@ static void handle_icmp6_ns(const unsigned char *pkt, size_t len, const ip_addr_
 // 但大型 UDP datagram 仍可能被 kernel 分片。此處做有界、保守的重組：
 // 僅處理「Fragment 為首個 ext header」的一般情況，重疊/超大/逾時一律丟棄。
 #define REASM_MAX_ENTRIES 16
-#define REASM_MAX_FRAGS 16
-#define REASM_MAX_SIZE 65535
 #define REASM_TIMEOUT_SEC 5
 
 typedef struct {
@@ -1918,44 +1908,16 @@ static int reasm_alloc(uint8_t family, const ip_addr_t *src, const ip_addr_t *ds
 }
 
 // 回傳 1 = 重組完成；0 = 尚未完成；-1 = 需丟棄（重疊/不一致）
+// 純演算法已抽離至 reasm.c（reasm_insert_seg），此處僅在失敗時清空整個 entry。
 static int reasm_insert(int idx, size_t offset, const unsigned char *data, size_t len,
                         int mf, time_t now) {
     reasm_entry_t *e = &g_reasm[idx];
-    if (offset + len > REASM_MAX_SIZE) { reasm_clear_entry(idx); return -1; }
     e->last_active = now;
-    if (!mf) {
-        size_t t = offset + len;
-        if (e->have_last && e->total_len != t) { reasm_clear_entry(idx); return -1; }
-        e->total_len = t;
-        e->have_last = 1;
-    }
-    if (len > 0) {
-        if (e->nseg >= REASM_MAX_FRAGS) { reasm_clear_entry(idx); return -1; }
-        // 重疊檢查（RFC 5722：重疊的分片一律丟棄）
-        for (int i = 0; i < e->nseg; i++) {
-            size_t a = e->soff[i], b = a + e->slen[i];
-            if (offset < b && a < offset + len) { reasm_clear_entry(idx); return -1; }
-        }
-        e->soff[e->nseg] = offset;
-        e->slen[e->nseg] = len;
-        e->nseg++;
-        memcpy(e->buf + offset, data, len);
-    }
-    if (!e->have_last) return 0;
-    // 依 offset 排序 segment，確認 [0, total_len) 無間隙全覆蓋
-    for (int i = 0; i < e->nseg - 1; i++)
-        for (int j = i + 1; j < e->nseg; j++)
-            if (e->soff[j] < e->soff[i]) {
-                size_t t1 = e->soff[i], t2 = e->slen[i];
-                e->soff[i] = e->soff[j]; e->slen[i] = e->slen[j];
-                e->soff[j] = t1; e->slen[j] = t2;
-            }
-    size_t expected = 0;
-    for (int i = 0; i < e->nseg; i++) {
-        if (e->soff[i] != expected) return 0;
-        expected += e->slen[i];
-    }
-    return (expected == e->total_len) ? 1 : 0;
+    int r = reasm_insert_seg(e->soff, e->slen, &e->nseg, e->buf,
+                             offset, data, len, mf,
+                             &e->total_len, &e->have_last);
+    if (r < 0) { reasm_clear_entry(idx); return -1; }
+    return r;
 }
 
 static void reasm_dispatch(uint8_t family, const ip_addr_t *src, const ip_addr_t *dst,

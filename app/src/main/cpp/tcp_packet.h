@@ -46,6 +46,17 @@ ssize_t udp_build_packet(const unsigned char *src_ip, const unsigned char *dst_i
                          const unsigned char *payload, size_t plen,
                          unsigned char *out, size_t out_cap);
 
+// 序號迴繞安全比較（RFC 1323 式）：回傳 a 是否「在 b 之後」（考慮 32-bit 迴繞）
+int tcp_seq_gt(uint32_t a, uint32_t b);
+
+// 引擎對 App 通告的接收窗口欄位：occ 為緩衝已佔用位元組、cap 為總容量，
+// 以 shift=10（1KB 單位）換算剩餘空間，下限 1（避免通告 0 使對端暫停）
+uint16_t tcp_win_field_pure(size_t occ, size_t cap);
+
+// 解析 TCP SYN 選項中的 Window Scale（kind=3），回傳縮放值（預設 0）。
+// opts 指向 TCP 選項區（20 位元組固定表頭之後），optlen 為選項區長度。
+uint8_t tcp_parse_window_scale(const unsigned char *opts, size_t optlen);
+
 #ifdef __cplusplus
 }
 #endif

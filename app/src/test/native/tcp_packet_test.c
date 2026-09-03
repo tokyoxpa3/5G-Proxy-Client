@@ -114,25 +114,47 @@ int main(void){
         printf("  udp checksum=0x%04x\n",ucsum);
         CHECK("udp checksum non-zero", ucsum!=0);
     }
-    // 6. Sequence wrap-around comparison (RFC1323 style): (int32_t)(a-b)>0
+    // 6. Sequence wrap-around comparison (RFC1323 style): tcp_seq_gt
     {
         uint32_t a=0x00000002, b=0xFFFFFFFE; // a is 4 ahead in wrap space (a = b+4 mod 2^32)
-        int r = (int32_t)(a - b) > 0;
-        CHECK("seq wraparound a>b", r==1);
+        CHECK("seq wraparound a>b", tcp_seq_gt(a, b) == 1);
         uint32_t c=0xFFFFFFFE, d=0x00000002;
-        int r2 = (int32_t)(c - d) > 0;
-        CHECK("seq wraparound c<d", r2==0);
+        CHECK("seq wraparound c<d", tcp_seq_gt(c, d) == 0);
+        CHECK("seq equal not gt", tcp_seq_gt(0x00001000, 0x00001000) == 0);
     }
-    // 7. TCP window field helper (app_buf free >>10) golden: 4MB free => 4096
+    // 7. TCP window field helper: tcp_win_field_pure
     {
         size_t cap=4*1024*1024;
-        size_t occ=0;
-        uint16_t w=(cap-occ)>>10;
-        CHECK("window full free", w==4096);
-        occ=cap-1024; w=(cap-occ)>>10;
-        CHECK("window almost full", w==1);
-        occ=cap; w=(cap-occ)>>10; if(w==0) w=1;
-        CHECK("window zero -> 1", w==1);
+        CHECK("window full free", tcp_win_field_pure(0, cap) == 4096);
+        CHECK("window almost full", tcp_win_field_pure(cap-1024, cap) == 1);
+        CHECK("window zero -> 1", tcp_win_field_pure(cap, cap) == 1);
+        CHECK("window over cap -> 1", tcp_win_field_pure(cap+1024, cap) == 1);
+    }
+    // 8. TCP SYN window scale option parse: tcp_parse_window_scale
+    {
+        // 空選項
+        CHECK("ws empty -> 0", tcp_parse_window_scale(NULL, 0) == 0);
+        // 僅 EOL
+        unsigned char eol[] = {0x00};
+        CHECK("ws eol -> 0", tcp_parse_window_scale(eol, 1) == 0);
+        // NOP + EOL
+        unsigned char nop_eol[] = {0x01, 0x01, 0x00};
+        CHECK("ws nop+eol -> 0", tcp_parse_window_scale(nop_eol, 3) == 0);
+        // WS(kind=3,len=3,val=10)
+        unsigned char ws10[] = {0x03, 0x03, 0x0A};
+        CHECK("ws value 10", tcp_parse_window_scale(ws10, 3) == 10);
+        // MSS + NOP + WS：驗證依長度跳過前面的選項
+        unsigned char mss_ws[] = {0x02,0x04,0x05,0xB4, 0x01, 0x03,0x03,0x09};
+        CHECK("ws after mss+nop", tcp_parse_window_scale(mss_ws, sizeof mss_ws) == 9);
+        // 截斷的 WS（宣告 len=3 但只剩 2 位元組）→ 不採計
+        unsigned char truncated[] = {0x03, 0x02};
+        CHECK("ws truncated -> 0", tcp_parse_window_scale(truncated, 2) == 0);
+        // 畸形選項長度位元組 = 0（原本會無限迴圈）→ 直接終止
+        unsigned char mal_len0[] = {0x02, 0x00, 0x03, 0x03, 0x0A};
+        CHECK("ws malformed len0 -> 0", tcp_parse_window_scale(mal_len0, sizeof mal_len0) == 0);
+        // 畸形選項長度位元組 = 1（RFC 793 要求 >= 2）→ 直接終止
+        unsigned char mal_len1[] = {0x08, 0x01, 0x03, 0x03, 0x0A};
+        CHECK("ws malformed len1 -> 0", tcp_parse_window_scale(mal_len1, sizeof mal_len1) == 0);
     }
 
     printf(g_fail?"\nRESULT: FAIL\n":"\nRESULT: PASS\n");

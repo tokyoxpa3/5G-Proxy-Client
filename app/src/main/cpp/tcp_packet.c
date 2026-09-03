@@ -140,6 +140,33 @@ ssize_t udp_build_packet(const unsigned char *src_ip, const unsigned char *dst_i
     out[u+6]=0;out[u+7]=0;
     if (plen) memcpy(out+u+8,payload,plen);
     uint16_t ucsum = (family==AF_INET6)? tcpudp_checksum6(src_ip,dst_ip,17,out+u,8+plen) : tcpudp_checksum4(src_ip,dst_ip,17,out+u,8+plen);
-    out[u+6]=ucsum>>8;out[u+7]=ucsum&0xFF;
+    out[u+6]=ucsum>>8; out[u+7]=ucsum&0xFF;
     return (ssize_t)total;
+}
+
+int tcp_seq_gt(uint32_t a, uint32_t b) {
+    return (int32_t)(a - b) > 0;
+}
+
+uint16_t tcp_win_field_pure(size_t occ, size_t cap) {
+    size_t free = (occ >= cap) ? 0 : (cap - occ);
+    uint16_t w = (uint16_t)(free >> 10);
+    return (w > 0) ? w : 1;
+}
+
+uint8_t tcp_parse_window_scale(const unsigned char *opts, size_t optlen) {
+    uint8_t ws = 0;
+    size_t o = 0;
+    while (o + 2 <= optlen) {
+        uint8_t k = opts[o];
+        if (k == 0) break;                              // EOL
+        if (k == 1) { o += 1; continue; }               // NOP
+        if (k == 3 && o + 3 <= optlen) ws = opts[o + 2];  // Window Scale
+        // RFC 793：非 EOL/NOP 的選項長度須 >= 2；畸形長度（0/1）直接終止，
+        // 否則 o 不前進會在惡意 SYN 上無限迴圈（引擎執行緒 DoS）。
+        uint8_t alen = opts[o + 1];
+        if (alen < 2) break;
+        o += alen;
+    }
+    return ws;
 }
