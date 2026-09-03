@@ -81,6 +81,18 @@ int main(void) {
         CHECK("flow window 隨機對照舊公式 200k", ok);
     }
 
+    // 半關傳播判定：tcp_srv_should_send_fin（真值表）
+    CHECK("srv_fin eof+drained+unsent -> 1", tcp_srv_should_send_fin(1, 0, 0) == 1);
+    CHECK("srv_fin not eof -> 0", tcp_srv_should_send_fin(0, 0, 0) == 0);
+    CHECK("srv_fin data pending -> 0", tcp_srv_should_send_fin(1, 100, 0) == 0);
+    CHECK("srv_fin already sent -> 0", tcp_srv_should_send_fin(1, 0, 1) == 0);
+
+    // 半關傳播判定：tcp_app_can_shutdown_write（真值表）
+    CHECK("app_shutdown fin+drained -> 1", tcp_app_can_shutdown_write(1, 0) == 1);
+    CHECK("app_shutdown no fin -> 0", tcp_app_can_shutdown_write(0, 0) == 0);
+    CHECK("app_shutdown data pending -> 0", tcp_app_can_shutdown_write(1, 100) == 0);
+    CHECK("app_shutdown neither -> 0", tcp_app_can_shutdown_write(0, 100) == 0);
+
     printf(g_fail ? "\nRESULT: FAIL\n" : "\nRESULT: PASS\n");
     return g_fail;
 }

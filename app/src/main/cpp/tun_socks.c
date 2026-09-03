@@ -1296,7 +1296,7 @@ static void flush_tcp_srv_buf(tcp_sess_t *sess) {
         sess->srv_off = 0;
     }
     if (sess->srv_in_off && sess->srv_len < TCP_SRV_BUF_CAP / 2) set_srv_in(sess, 1);
-    if (sess->srv_eof && sess->srv_len == 0 && !sess->srv_fin_sent) {
+    if (tcp_srv_should_send_fin(sess->srv_eof, sess->srv_len, sess->srv_fin_sent)) {
         sess->srv_fin_sent = 1;
         send_tcp_fin(sess);
     }
@@ -1323,7 +1323,7 @@ static void flush_tcp_app_buf(tcp_sess_t *sess) {
     }
     if (sess->app_len == 0) {
         set_srv_out(sess, 0);
-        if (sess->app_fin) shutdown(fd, SHUT_WR);
+        if (tcp_app_can_shutdown_write(sess->app_fin, sess->app_len)) shutdown(fd, SHUT_WR);
     }
     // 排空後重開 window：主動送 window-update ACK，避免 App 停在縮小的窗上死鎖
     if (sess->app_len < before && !sess->closed && atomic_load(&sess->state) == 1) {
@@ -1644,7 +1644,7 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
         return;
     }
 
-    if (payload_len == 0 && (flags & 0x10)) {              // 純 ACK：確認 app 收到資料
+    if (payload_len == 0 && (flags & 0x10) && !(flags & 0x01)) {   // 純 ACK（FIN 需先送進 FIN 分支處理）
         if (sess->srv_len > 0) flush_tcp_srv_buf(sess);    // ACK 開窗 → 續送
         return;
     }
@@ -1692,11 +1692,11 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
         sess->app_fin = 1;
         send_tcp_ack(sess);
         if (sess->srv_fin_sent) { close_tcp_session(sess, 0); return; }
-        if (sess->app_len == 0) {
+        if (tcp_app_can_shutdown_write(sess->app_fin, sess->app_len)) {
             int sfd = atomic_load(&sess->srv_fd);
             if (sfd >= 0) shutdown(sfd, SHUT_WR);
         }
-        if (sess->srv_eof) close_tcp_session(sess, 0);
+        if (sess->srv_eof && sess->srv_len == 0) close_tcp_session(sess, 0);
     }
 
     if (sess->srv_len > 0) {                               // App ACK/開窗 → 續送
