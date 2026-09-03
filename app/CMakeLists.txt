@@ -19,7 +19,9 @@ set(SOURCE_FILES
     src/main/cpp/dns_synth.c
     src/main/cpp/tcp_packet.c
     src/main/cpp/ip_parse.c
+    src/main/cpp/ip_hash.c
     src/main/cpp/reasm.c
+    src/main/cpp/tcp_state.c
 )
 
 add_library(socksclient SHARED

@@ -68,6 +68,12 @@ jobs:
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o reasm_test \
             app/src/test/native/reasm_test.c app/src/main/cpp/reasm.c
           ./reasm_test
+          gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o ip_hash_test \
+            app/src/test/native/ip_hash_test.c app/src/main/cpp/ip_hash.c
+          ./ip_hash_test
+          gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o tcp_state_test \
+            app/src/test/native/tcp_state_test.c app/src/main/cpp/tcp_state.c
+          ./tcp_state_test
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -pthread -o tun_loopback_test \
             app/src/test/native/tun_loopback_test.c app/src/main/cpp/socks5_codec.c app/src/main/cpp/tcp_packet.c app/src/main/cpp/checksum.c
           ./tun_loopback_test
@@ -78,7 +84,8 @@ jobs:
           for sym in socks5_build_connect_request socks5_build_udp_frame \
                      tcp_build_segment tcp_build_synack udp_build_packet \
                      dns_build_reply_pure dns_build_fake_ip6 \
-                     reasm_insert_seg tcp_seq_gt tcp_win_field_pure tcp_parse_window_scale; do
+                     reasm_insert_seg tcp_seq_gt tcp_win_field_pure tcp_parse_window_scale \
+                     ip_hash32 tcp_isn_generate tcp_win_scaled tcp_flow_window_full; do
             n=$(grep -c "\\b$sym\\b" app/src/main/cpp/tun_socks.c || true)
             if [ "$n" -eq 0 ]; then
               echo "ERROR: $sym 未在 tun_socks.c 中呼叫——抽離模組與引擎實作已分叉"

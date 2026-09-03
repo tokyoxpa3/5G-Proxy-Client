@@ -26,6 +26,8 @@
 #include "tcp_packet.h"
 #include "dns_synth.h"
 #include "ip_parse.h"
+#include "ip_hash.h"
+#include "tcp_state.h"
 #include "reasm.h"
 
 #define LOG_TAG "TunSocks"
@@ -40,6 +42,8 @@
 #define HANDSHAKE_TIMEOUT_SEC 10
 #define UDP_HASH_BUCKETS 256
 #define MAX_UDP_SESSIONS 512
+// 首包緩衝門檻：涵蓋 QUIC Initial（~1200B），超過此值不緩衝、避免等 App 重傳
+#define UDP_FIRST_PKT_BUFFER_MAX 1400
 
 static pthread_t g_engine_thread;
 static atomic_int g_reset_requested = 0;
@@ -49,12 +53,6 @@ static atomic_int g_reset_requested = 0;
 
 static int ip_addr_eq(const ip_addr_t *a, const ip_addr_t *b) {
     return a->family == b->family && memcmp(a->ip, b->ip, 16) == 0;
-}
-
-static uint32_t ip_hash32(const ip_addr_t *a) {
-    uint32_t h = 2166136261u;
-    for (int i = 0; i < 16; i++) { h ^= a->ip[i]; h *= 16777619u; }
-    return h ^ (uint32_t)a->family;
 }
 
 static void ip_to_str(const ip_addr_t *a, char *out, size_t n) {
@@ -209,7 +207,7 @@ typedef struct {
 static engine_ctx_t g;
 
 static uint32_t next_tcp_isn(void) {
-    return ((uint32_t)time(NULL) ^ 0x5F3759DF) + (++g.isn_counter) * 2654435761u;
+    return tcp_isn_generate((uint32_t)time(NULL), &g.isn_counter);
 }
 
 static pthread_mutex_t g_fake_dns_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -726,8 +724,7 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
         LOGI("udp session 建立 src=%s:%d dst=%s:%d",
              b1, ntohs(sport), b2, ntohs(dport));
         // 首次封包：啟動 handshake 線程；同時緩衝此封包，完成後立即轉發（不用等 App 重傳）
-        // 上限 1400：涵蓋 QUIC Initial（~1200B）避免被丟棄等重傳
-        if (payload_len <= 1400) {
+        if (payload_len <= UDP_FIRST_PKT_BUFFER_MAX) {
             sess->pend_data = malloc(payload_len);
             if (sess->pend_data) {
                 memcpy(sess->pend_data, pkt + u + 8, payload_len);
@@ -758,7 +755,7 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
     if (sess->state == 0) {
         // handshake 進行中：若尚未緩衝首包則緩衝，完成後由線程轉發
         pthread_mutex_lock(&g_udp_hash_lock);
-        if (sess->state == 0 && !sess->pend_data && payload_len <= 1400) {
+        if (sess->state == 0 && !sess->pend_data && payload_len <= UDP_FIRST_PKT_BUFFER_MAX) {
             sess->pend_data = malloc(payload_len);
             if (sess->pend_data) {
                 memcpy(sess->pend_data, pkt + u + 8, payload_len);
@@ -1283,7 +1280,7 @@ static void flush_tcp_srv_buf(tcp_sess_t *sess) {
         size_t chunk = sess->srv_len;
         if (chunk > seg_max) chunk = seg_max;
         // 流量控制：App 通告 window 已滿 → 暫停送出，等 App ACK 開窗
-        if (sess->srv_next - sess->app_acked >= sess->app_win) break;
+        if (tcp_flow_window_full(sess->srv_next, sess->app_acked, sess->app_win)) break;
         ssize_t w = write_tcp_to_tun(&sess->dst_ip, &sess->src_ip, sess->dst_port, sess->src_port,
                                      sess->srv_next, sess->app_next, 0x18,
                                      sess->srv_buf + sess->srv_off, chunk, tcp_win_field(sess));
@@ -1616,7 +1613,7 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
     // 更新 App 通告的 window（乘 WS）與 ack，供 srv→App 流量控制
     uint16_t win_field;
     memcpy(&win_field, pkt + t + 14, 2);
-    sess->app_win = ((uint32_t)ntohs(win_field)) << sess->app_ws;
+    sess->app_win = tcp_win_scaled(ntohs(win_field), sess->app_ws);
     // 迴繞安全比較（RFC1323 式）：單一連線傳輸超過 4GB 後序號迴繞，
     // 普通大小比較會拒絕更新 ack → app_acked 凍結 → 流控誤判窗口耗盡而卡死
     if (tcp_seq_gt(ack_host, sess->app_acked)) sess->app_acked = ack_host;
