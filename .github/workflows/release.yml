@@ -62,8 +62,9 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           cp "$(ls app/build/outputs/apk/release/*.apk | head -1)" "5G-Proxy-Client-${TAG}.apk"
-          gh release create "$TAG" --title "$TAG" --target "$GITHUB_SHA" 2>/dev/null || \
-            gh release edit "$TAG"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --target "$GITHUB_SHA"
+          fi
           gh release upload "$TAG" "5G-Proxy-Client-${TAG}.apk" --clobber
         env:
           GH_TOKEN: ${{ github.token }}
