@@ -29,12 +29,10 @@ jobs:
           java-version: '17'
 
       - uses: android-actions/setup-android@v3
-        with:
-          ndk-version: '26.3.11579264'
 
-      - name: Install build-tools and platforms
+      - name: Install NDK, build-tools and platforms
         run: |
-          sdkmanager "build-tools;35.0.0" "platforms;android-35"
+          sdkmanager "ndk;26.3.11579264" "build-tools;35.0.0" "platforms;android-35"
           yes | sdkmanager --licenses
 
       - name: Restore keystore
