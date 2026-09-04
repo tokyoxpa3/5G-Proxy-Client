@@ -11,16 +11,19 @@ jobs:
     name: Android unit tests & build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
-        with:
-          ndk-version: '26.3.11579264'
+      - uses: android-actions/setup-android@v4
+
+      - name: Install NDK
+        run: |
+          sdkmanager "ndk;26.3.11579264"
+          yes | sdkmanager --licenses
 
       - name: Grant gradle permission
         run: chmod +x gradlew
@@ -45,7 +48,7 @@ jobs:
     name: Native checksum unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Compile & run native unit tests
         run: |
@@ -88,7 +91,7 @@ jobs:
                      tcp_build_segment tcp_build_synack udp_build_packet \
                      dns_build_reply_pure dns_build_fake_ip6 \
                      reasm_insert_seg tcp_seq_gt tcp_win_field_pure tcp_parse_window_scale \
-                     ip_hash32 tcp_isn_generate tcp_win_scaled tcp_flow_window_full \
+                     ip_hash_bucket tcp_isn_generate tcp_win_scaled tcp_flow_window_full \
                      tcp_srv_should_send_fin tcp_app_can_shutdown_write \
                      udp_should_buffer_first_pkt udp_is_idle; do
             n=$(grep -c "\\b$sym\\b" app/src/main/cpp/tun_socks.c || true)
