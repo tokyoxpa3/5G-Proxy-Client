@@ -2,10 +2,14 @@
 #define TCP_STATE_H
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// 閒置逾時：超過此秒數未活動即回收 TCP 會話（僅在 state==1「就緒」時套用）。
+#define TCP_IDLE_TIMEOUT_SEC 300
 
 // 產生下一個 TCP ISN（host 序）。
 // now_sec 為秒級時間（引擎注入 time(NULL)）；counter 為會話計數（引擎注入 &g.isn_counter），
@@ -38,6 +42,10 @@ int tcp_srv_should_send_fin(int srv_eof, size_t srv_len, int srv_fin_sent);
 
 // App→server 半關傳播：App 已 FIN 且待送資料排空 → 可 shutdown(SHUT_WR)。
 int tcp_app_can_shutdown_write(int app_fin, size_t app_len);
+
+// 閒置逾時判定：會話就緒（state==1）且 now-last_active 超過 TCP_IDLE_TIMEOUT_SEC。
+// state 由引擎以 atomic_load 載入後傳入；closed 判斷留給引擎。
+int tcp_is_idle(int state, time_t now, time_t last_active);
 
 #ifdef __cplusplus
 }

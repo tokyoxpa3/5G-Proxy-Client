@@ -20,3 +20,7 @@ int tcp_srv_should_send_fin(int srv_eof, size_t srv_len, int srv_fin_sent) {
 int tcp_app_can_shutdown_write(int app_fin, size_t app_len) {
     return app_fin && app_len == 0;
 }
+
+int tcp_is_idle(int state, time_t now, time_t last_active) {
+    return state == 1 && now - last_active > TCP_IDLE_TIMEOUT_SEC;
+}

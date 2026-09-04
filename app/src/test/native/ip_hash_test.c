@@ -66,6 +66,41 @@ int main(void) {
         CHECK("deterministic", ip_hash32(&a) == ip_hash32(&a));
     }
 
+    // 5. ip_hash_bucket：golden（(ip_hash32 ^ port) % 256，獨立 Python 算得）
+    {
+        ip_addr_t a = mk4(1, 2, 3, 4);
+        CHECK("bucket v4 p0",   ip_hash_bucket(&a, 0, 256) == 239);
+        CHECK("bucket v4 p443", ip_hash_bucket(&a, 443, 256) == 84);
+        CHECK("bucket v4 p12345", ip_hash_bucket(&a, 12345, 256) == 214);
+    }
+    {
+        ip_addr_t a;
+        memset(&a, 0, sizeof a);
+        a.family = AF_INET6;
+        unsigned char raw[16] = {0x20,0x01,0x0d,0xb8, 0,0,0,0,0,0,0,0,0,0,0,0x01};
+        memcpy(a.ip, raw, 16);
+        CHECK("bucket v6 p0", ip_hash_bucket(&a, 0, 256) == 254);
+        CHECK("bucket v6 p53", ip_hash_bucket(&a, 53, 256) == 203);
+    }
+
+    // 6. ip_hash_bucket 差分：隨機對照舊公式 (ip_hash32 ^ port) % nbuckets
+    {
+        int ok = 1;
+        uint32_t xs = 0x9E3779B9u;
+        for (int i = 0; i < 200000 && ok; i++) {
+            xs = xs * 1664525u + 1013904223u;
+            ip_addr_t a;
+            memset(&a, 0, sizeof a);
+            a.family = (xs & 1) ? AF_INET6 : AF_INET;
+            for (int j = 0; j < 16; j++) a.ip[j] = (unsigned char)(xs >> (j & 3));
+            uint16_t port = (uint16_t)(xs >> 16);
+            uint32_t nb = 1u + (xs % 512);   // 避免 nb==0 除零
+            uint32_t expect = (ip_hash32(&a) ^ (uint32_t)port) % nb;
+            if (ip_hash_bucket(&a, port, nb) != expect) { ok = 0; break; }
+        }
+        CHECK("bucket 隨機對照舊公式 200k", ok);
+    }
+
     printf(g_fail ? "\nRESULT: FAIL\n" : "\nRESULT: PASS\n");
     return g_fail;
 }

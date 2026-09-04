@@ -28,6 +28,7 @@
 #include "ip_parse.h"
 #include "ip_hash.h"
 #include "tcp_state.h"
+#include "udp_session.h"
 #include "reasm.h"
 
 #define LOG_TAG "TunSocks"
@@ -38,12 +39,9 @@
 #define MAX_EVENTS 256
 // 須與 Java Config.TUN_MTU 保持一致（VpnService.Builder.setMtu），改動需同步兩側
 #define TUN_MTU 4096
-#define UDP_IDLE_TIMEOUT_SEC 330
 #define HANDSHAKE_TIMEOUT_SEC 10
 #define UDP_HASH_BUCKETS 256
 #define MAX_UDP_SESSIONS 512
-// 首包緩衝門檻：涵蓋 QUIC Initial（~1200B），超過此值不緩衝、避免等 App 重傳
-#define UDP_FIRST_PKT_BUFFER_MAX 1400
 
 static pthread_t g_engine_thread;
 static atomic_int g_reset_requested = 0;
@@ -66,7 +64,6 @@ static void ip_to_str(const ip_addr_t *a, char *out, size_t n) {
 #define MAX_TCP_SESSIONS 512
 #define TCP_APP_BUF_CAP (4 * 1024 * 1024)
 #define TCP_SRV_BUF_CAP (1024 * 1024)
-#define TCP_IDLE_TIMEOUT_SEC 300
 #define TCP_READ_CHUNK (64 * 1024)
 
 typedef struct tcp_sess {
@@ -102,7 +99,7 @@ typedef struct tcp_sess {
 
 
 static unsigned tcp_hash_idx(const ip_addr_t *ip, uint16_t port) {
-    return (ip_hash32(ip) ^ (uint32_t)port) % TCP_HASH_BUCKETS;
+    return ip_hash_bucket(ip, port, TCP_HASH_BUCKETS);
 }
 
 
@@ -211,6 +208,19 @@ static uint32_t next_tcp_isn(void) {
 }
 
 static pthread_mutex_t g_fake_dns_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// 保護 g.srv_host / g.srv_port 的並行讀寫：soft-reconnect 會更新 srv_host，
+// 而各 handshake 執行緒在建立 socket 時會讀它；加鎖快照避免讀到撕裂字串。
+static pthread_mutex_t g_srv_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// 加鎖快照伺服器位址／埠，供 handshake 執行緒安全讀取。
+static void srv_snapshot(char *host_out, size_t host_len, int *port_out) {
+    pthread_mutex_lock(&g_srv_cfg_lock);
+    strncpy(host_out, g.srv_host, host_len - 1);
+    host_out[host_len - 1] = '\0';
+    *port_out = g.srv_port;
+    pthread_mutex_unlock(&g_srv_cfg_lock);
+}
 
 // 取得 fake IP 對應的 32-bit 鍵（非 v4 回傳 0）
 static uint32_t fake_dns_key(const ip_addr_t *ip) {
@@ -329,7 +339,7 @@ static void set_nonblocking(int fd) {
 }
 
 static unsigned udp_hash_idx(const ip_addr_t *ip, uint16_t port) {
-    return (ip_hash32(ip) ^ (uint32_t)port) % UDP_HASH_BUCKETS;
+    return ip_hash_bucket(ip, port, UDP_HASH_BUCKETS);
 }
 
 // ---------- TUN 封包處理 ----------
@@ -724,7 +734,7 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
         LOGI("udp session 建立 src=%s:%d dst=%s:%d",
              b1, ntohs(sport), b2, ntohs(dport));
         // 首次封包：啟動 handshake 線程；同時緩衝此封包，完成後立即轉發（不用等 App 重傳）
-        if (payload_len <= UDP_FIRST_PKT_BUFFER_MAX) {
+        if (udp_should_buffer_first_pkt(payload_len)) {
             sess->pend_data = malloc(payload_len);
             if (sess->pend_data) {
                 memcpy(sess->pend_data, pkt + u + 8, payload_len);
@@ -755,7 +765,7 @@ static void handle_tun_udp(const unsigned char *pkt, size_t len, size_t t, const
     if (sess->state == 0) {
         // handshake 進行中：若尚未緩衝首包則緩衝，完成後由線程轉發
         pthread_mutex_lock(&g_udp_hash_lock);
-        if (sess->state == 0 && !sess->pend_data && payload_len <= UDP_FIRST_PKT_BUFFER_MAX) {
+        if (sess->state == 0 && !sess->pend_data && udp_should_buffer_first_pkt(payload_len)) {
             sess->pend_data = malloc(payload_len);
             if (sess->pend_data) {
                 memcpy(sess->pend_data, pkt + u + 8, payload_len);
@@ -805,9 +815,11 @@ static void *udp_session_thread(void *arg) {
     struct sockaddr_storage relay = {0};
     socklen_t relay_len = 0;
     int fail_code = SE_EVENT_NETWORK_FAIL;   // 事件分類碼（同 tcp_connect_thread）
+    char srv_host[256]; int srv_port;
+    srv_snapshot(srv_host, sizeof srv_host, &srv_port);
 
     // 1. TCP 控制連線（Java 已 connect + protect）
-    cfd = request_java_socket(g.srv_host, g.srv_port, 0);
+    cfd = request_java_socket(srv_host, srv_port, 0);
     if (cfd < 0) goto fail;
     if (!g.running) { fail_code = SE_EVENT_NONE; goto fail; }
     struct timeval tv = {HANDSHAKE_TIMEOUT_SEC, 0};
@@ -893,7 +905,7 @@ static void *udp_session_thread(void *arg) {
         }
 
         // 4. UDP relay socket（Java protect，未 connect，由 sendto 指定目標）
-        rfd = request_java_socket(g.srv_host, g.srv_port, 1);
+        rfd = request_java_socket(srv_host, srv_port, 1);
         if (rfd < 0) goto fail;
         if (!g.running) { fail_code = SE_EVENT_NONE; goto fail; }
         set_nonblocking(rfd);
@@ -2185,7 +2197,7 @@ static void *engine_loop(void *arg) {
                 while (*pp) {
                     udp_sess_t *s = *pp;
                     // 垃圾桶滿了就跳過該 session，下一輪再收
-                    if (now - s->last_active > UDP_IDLE_TIMEOUT_SEC && gc < MAX_EVENTS) {
+                    if (udp_is_idle(now, s->last_active) && gc < MAX_EVENTS) {
                         s->closed = 1;
                         *pp = s->next;
                         garbage[gc++] = s;
@@ -2205,8 +2217,7 @@ static void *engine_loop(void *arg) {
             int tgc = 0;
             for (int b = 0; b < TCP_HASH_BUCKETS && tgc < MAX_EVENTS; b++) {
                 for (tcp_sess_t *s = g.tcp_hash[b]; s && tgc < MAX_EVENTS; s = s->next) {
-                    int idle = !s->closed && atomic_load(&s->state) == 1 &&
-                               now - s->last_active > TCP_IDLE_TIMEOUT_SEC;
+                    int idle = !s->closed && tcp_is_idle(atomic_load(&s->state), now, s->last_active);
                     if (s->closed || atomic_load(&s->handshake_failed) || idle) {
                         s->closed = 1;
                         tcp_garbage[tgc++] = s;

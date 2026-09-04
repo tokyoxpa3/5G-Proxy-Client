@@ -22,6 +22,7 @@ set(SOURCE_FILES
     src/main/cpp/ip_hash.c
     src/main/cpp/reasm.c
     src/main/cpp/tcp_state.c
+    src/main/cpp/udp_session.c
 )
 
 add_library(socksclient SHARED

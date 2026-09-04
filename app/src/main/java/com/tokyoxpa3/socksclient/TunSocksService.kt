@@ -285,8 +285,10 @@ class TunSocksService : VpnService() {
             builder.setMtu(Config.TUN_MTU)
             builder.addAddress(Config.TUN_ADDR_V4, 32)
             builder.addAddress(Config.TUN_ADDR_V6, 128)
-            builder.addRoute("0.0.0.0", 0)
-            builder.addRoute("::", 0)
+            // 只把公網單播導進隧道；私網／link-local／loopback／multicast 走本機直連，
+            // 讓區網裝置（NAS、印表機、其他電腦）與 adb over WiFi 可正常連線。
+            LanRoutes.v4().forEach { (addr, prefix) -> builder.addRoute(addr, prefix) }
+            LanRoutes.v6().forEach { (addr, prefix) -> builder.addRoute(addr, prefix) }
 
             // DNS 伺服器（使用者可自訂；先驗數字 IP 格式，避免對 hostname 觸發 DNS 查詢）
             val dnsList = Config.dnsServers(this)
