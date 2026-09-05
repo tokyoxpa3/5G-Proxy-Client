@@ -331,8 +331,6 @@ class MainActivity : Activity() {
             prefs().edit()
                 .putString(Config.KEY_HOST, host)
                 .putString(Config.KEY_PORT, etPort.text.toString().trim())
-                .putString(Config.KEY_USER, SecretCipher.encrypt(etUser.text.toString().trim()))
-                .putString(Config.KEY_PASS, SecretCipher.encrypt(etPass.text.toString().trim()))
                 .putString(Config.KEY_DNS1, dns1)
                 .putString(Config.KEY_DNS2, dns2)
                 .putBoolean(Config.KEY_UDP_IN_TCP, cbUdpInTcp.isChecked)
@@ -340,6 +338,8 @@ class MainActivity : Activity() {
                 .putBoolean(Config.KEY_AUTO_START, cbAutoStart.isChecked)
                 .putInt(Config.KEY_MODE, modeGroup.checkedRadioButtonId)
                 .apply()
+            Config.putSecret(this, Config.KEY_USER, etUser.text.toString().trim())
+            Config.putSecret(this, Config.KEY_PASS, etPass.text.toString().trim())
 
             // 僅允許模式尚未勾選任何 App 時直接擋下，避免啟動後隧道不涵蓋任何 App
             val selectedApps =

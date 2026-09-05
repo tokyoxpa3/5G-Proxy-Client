@@ -214,11 +214,11 @@ class TunSocksService : VpnService() {
         prefs.edit()
             .putString(Config.KEY_HOST, host)
             .putString(Config.KEY_PORT, port.toString())
-            .putString(Config.KEY_USER, SecretCipher.encrypt(user))
-            .putString(Config.KEY_PASS, SecretCipher.encrypt(pass))
             .putBoolean(Config.KEY_UDP_IN_TCP, udpInTcp)
             .putBoolean(Config.KEY_REMOTE_DNS, remoteDns)
             .apply()
+        Config.putSecret(this, Config.KEY_USER, user)
+        Config.putSecret(this, Config.KEY_PASS, pass)
 
         Log.i(TAG, "startTunnel: host=$host port=$port user=$user udpInTcp=$udpInTcp remoteDns=$remoteDns")
 
