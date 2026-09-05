@@ -22,7 +22,7 @@ static jmethodID g_mid_notifyEngineStopped = NULL;
 extern int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass, int udp_in_tcp, int remote_dns);
 extern void tun_socks_stop(void);
 extern void tun_socks_get_stats(unsigned long long *to_server, unsigned long long *from_server, int *tcp_sessions, int *udp_sessions);
-extern void tun_socks_reconnect(void);
+extern void tun_socks_reconnect(const char *new_host);
 extern int tun_socks_is_running(void);
 
 static pthread_t g_tunnel_thread;
@@ -223,10 +223,13 @@ JNIEXPORT jstring JNICALL native_stop_tunnel(JNIEnv *env, jobject thiz) {
     return (*env)->NewStringUTF(env, "Stopped");
 }
 
-// soft-reconnect：保留 TUN / VPN 介面，僅重置引擎連線狀態（供自動重連走軟重連路徑）
-JNIEXPORT jstring JNICALL native_reconnect(JNIEnv *env, jobject thiz) {
+// soft-reconnect：保留 TUN / VPN 介面，僅重置引擎連線狀態（供自動重連走軟重連路徑）。
+// jhost 非空時傳入重新解析後的伺服器 IP，引擎據此更新 g.srv_host；null 沿用舊位址。
+JNIEXPORT jstring JNICALL native_reconnect(JNIEnv *env, jobject thiz, jstring jhost) {
     if (!atomic_load(&g_tunnel_running)) return (*env)->NewStringUTF(env, "Not running");
-    tun_socks_reconnect();
+    const char *chost = jhost ? (*env)->GetStringUTFChars(env, jhost, NULL) : NULL;
+    tun_socks_reconnect(chost);
+    if (chost) (*env)->ReleaseStringUTFChars(env, jhost, chost);
     return NULL;
 }
 
@@ -235,7 +238,7 @@ static const JNINativeMethod gMethods[] = {
     {"startTunnel", "(ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;ZZ)Ljava/lang/String;", (void *)native_start_tunnel},
     {"stopTunnel", "()Ljava/lang/String;", (void *)native_stop_tunnel},
     {"getStats", "()[J", (void *)native_get_stats},
-    {"reconnect", "()Ljava/lang/String;", (void *)native_reconnect},
+    {"reconnect", "(Ljava/lang/String;)Ljava/lang/String;", (void *)native_reconnect},
 };
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {

@@ -66,8 +66,10 @@ object NativeEngine {
     external fun startTunnel(fd: Int, host: String, port: Int, user: String, pass: String, udpInTcp: Boolean, remoteDns: Boolean): String
     external fun stopTunnel(): String
 
-    // soft-reconnect：不拆 TUN/VPN，重置引擎連線狀態（回傳 null=成功，字串=失敗原因）
-    external fun reconnect(): String?
+    // soft-reconnect：不拆 TUN/VPN，重置引擎連線狀態。
+    // host 非空時先更新伺服器位址（DDNS/IP 變動場景重新解析後的 IP），null 沿用舊位址。
+    // 回傳 null=成功，字串=失敗原因
+    external fun reconnect(host: String?): String?
 
     // [txBytes(→server), rxBytes(←server), tcpSessions, udpSessions]
     external fun getStats(): LongArray

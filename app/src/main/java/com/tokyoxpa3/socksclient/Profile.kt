@@ -57,7 +57,8 @@ data class Profile(
 
 object Profiles {
     fun load(ctx: android.content.Context): List<Profile> {
-        val raw = Config.prefs(ctx).getString(Config.KEY_PROFILES, null) ?: return emptyList()
+        // 設定檔整份 JSON 以 Keystore 加密入庫（無 "enc:" 前綴／解密失敗回退舊明文）
+        val raw = SecretCipher.decrypt(Config.prefs(ctx).getString(Config.KEY_PROFILES, null)) ?: return emptyList()
         return try {
             val arr = JSONArray(raw)
             (0 until arr.length()).mapNotNull {
@@ -87,6 +88,7 @@ object Profiles {
     private fun persist(ctx: android.content.Context, list: List<Profile>) {
         val arr = JSONArray()
         list.forEach { arr.put(it.toJson()) }
-        Config.prefs(ctx).edit().putString(Config.KEY_PROFILES, arr.toString()).apply()
+        // 整份 JSON（含 pass 欄位）加密後入庫，避免明文密碼落在 SharedPreferences
+        Config.prefs(ctx).edit().putString(Config.KEY_PROFILES, SecretCipher.encrypt(arr.toString())).apply()
     }
 }

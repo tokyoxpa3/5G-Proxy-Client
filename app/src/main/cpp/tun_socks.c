@@ -1394,7 +1394,9 @@ static void *tcp_connect_thread(void *arg) {
     int fd_stored = 0;   // srv_fd 是否已交由 engine 管理（之後線程不再 close）
     int fail_code = SE_EVENT_NETWORK_FAIL;   // 事件分類碼：明確拒絕（auth/REP≠0/非 SOCKS5）時改為對應碼，不觸發看門狗
 
-    sfd = request_java_socket(g.srv_host, g.srv_port, 0);
+    char srv_host[256]; int srv_port;
+    srv_snapshot(srv_host, sizeof srv_host, &srv_port);
+    sfd = request_java_socket(srv_host, srv_port, 0);
     if (sfd < 0) goto fail;
     if (!g.running) { fail_code = SE_EVENT_NONE; goto fail; }
     set_nonblocking(sfd);
@@ -2409,10 +2411,17 @@ int tun_socks_is_running(void) {
 }
 
 // soft-reconnect：要求引擎執行緒重置連線狀態（保留 TUN / VPN 介面）。
-// 任何執行緒皆可呼叫：設定旗標 + 寫 kick_pipe 喚醒引擎執行緒，
+// new_host 非空時，先更新 g.srv_host（DDNS／IP 變動場景重新解析後的位址）；
+// new_host == NULL 時沿用舊 host。更新與重置皆為任何執行緒可安全呼叫的旗標／鎖操作，
 // 實際重置由 engine_loop 在引擎執行緒內執行（engine_soft_reset）。
-void tun_socks_reconnect(void) {
+void tun_socks_reconnect(const char *new_host) {
     if (!g.running) return;
+    if (new_host && new_host[0]) {
+        pthread_mutex_lock(&g_srv_cfg_lock);
+        strncpy(g.srv_host, new_host, sizeof(g.srv_host) - 1);
+        g.srv_host[sizeof(g.srv_host) - 1] = '\0';
+        pthread_mutex_unlock(&g_srv_cfg_lock);
+    }
     atomic_store(&g_reset_requested, 1);
     if (g.kick_pipe[1] != -1) {
         char c = 1;

@@ -15,6 +15,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -198,8 +199,8 @@ class TunSocksService : VpnService() {
         if (host.isEmpty()) {
             host = prefs.getString(Config.KEY_HOST, "") ?: ""
             port = prefs.getString(Config.KEY_PORT, Config.DEFAULT_PORT.toString())?.toIntOrNull() ?: Config.DEFAULT_PORT
-            user = prefs.getString(Config.KEY_USER, "") ?: ""
-            pass = prefs.getString(Config.KEY_PASS, "") ?: ""
+            user = Config.getSecret(this, Config.KEY_USER)
+            pass = Config.getSecret(this, Config.KEY_PASS)
             udpInTcp = prefs.getBoolean(Config.KEY_UDP_IN_TCP, false)
             remoteDns = prefs.getBoolean(Config.KEY_REMOTE_DNS, Config.DEFAULT_REMOTE_DNS)
             Log.i(TAG, "Using saved config: host=$host port=$port")
@@ -213,8 +214,8 @@ class TunSocksService : VpnService() {
         prefs.edit()
             .putString(Config.KEY_HOST, host)
             .putString(Config.KEY_PORT, port.toString())
-            .putString(Config.KEY_USER, user)
-            .putString(Config.KEY_PASS, pass)
+            .putString(Config.KEY_USER, SecretCipher.encrypt(user))
+            .putString(Config.KEY_PASS, SecretCipher.encrypt(pass))
             .putBoolean(Config.KEY_UDP_IN_TCP, udpInTcp)
             .putBoolean(Config.KEY_REMOTE_DNS, remoteDns)
             .apply()
@@ -267,8 +268,8 @@ class TunSocksService : VpnService() {
         val prefs = Config.prefs(this)
         val host = prefs.getString(Config.KEY_HOST, "") ?: ""
         val port = prefs.getString(Config.KEY_PORT, Config.DEFAULT_PORT.toString())?.toIntOrNull() ?: Config.DEFAULT_PORT
-        val user = prefs.getString(Config.KEY_USER, "") ?: ""
-        val pass = prefs.getString(Config.KEY_PASS, "") ?: ""
+        val user = Config.getSecret(this, Config.KEY_USER)
+        val pass = Config.getSecret(this, Config.KEY_PASS)
         val udpInTcp = prefs.getBoolean(Config.KEY_UDP_IN_TCP, false)
         val remoteDns = prefs.getBoolean(Config.KEY_REMOTE_DNS, Config.DEFAULT_REMOTE_DNS)
         try {
@@ -526,18 +527,61 @@ class TunSocksService : VpnService() {
         }
     }
 
+    // 在 VPN 隧道開啟期間，以 protect() 過的 UDP socket 直接向 DNS 伺服器查詢，
+    // 繞過隧道取伺服器 hostname 的真實 IP（避免被 Remote DNS 攔截成 fake IP）。
+    // 供軟重連在 DDNS／IP 變動後重新解析伺服器位址；失敗回傳 null（沿用舊 IP）。
+    private fun resolveHostOutsideTunnel(host: String): String? {
+        if (Config.isLiteralIp(host)) return host
+        for (server in Config.dnsServers(this)) {
+            val ip = queryDns(server, host)
+            if (ip != null) return ip
+        }
+        return null
+    }
+
+    // 對單一 DNS 伺服器發 A/AAAA 查詢並解析第一個位址；逾時／失敗回傳 null。
+    private fun queryDns(server: String, hostname: String): String? {
+        if (!Config.isLiteralIp(server)) return null   // 只允許數字 IP，避免遞迴 DNS 查詢
+        val ds = DatagramSocket()
+        return try {
+            ds.soTimeout = 3000
+            val ok = protect(ds)
+            if (!ok) return null
+            val id = java.util.Random().nextInt(0x10000)
+            val query = DnsClient.buildQuery(hostname, id)
+            ds.send(DatagramPacket(query, query.size, InetAddress.getByName(server), 53))
+            val buf = ByteArray(512)
+            val pkt = DatagramPacket(buf, buf.size)
+            ds.receive(pkt)
+            // 比對回應 id，丟棄遲到的上一個查詢封包（DnsClient.parseFirstAddress 不校驗 id）
+            val respId = ((buf[0].toInt() and 0xFF) shl 8) or (buf[1].toInt() and 0xFF)
+            if (respId != id) return null
+            DnsClient.parseFirstAddress(buf.copyOf(pkt.length))
+        } catch (e: Exception) {
+            Log.w(TAG, "queryDns($server, $hostname) failed: ${e.message}")
+            null
+        } finally {
+            try { ds.close() } catch (e: Exception) { }
+        }
+    }
+
     // 軟重連：不拆 TUN / VPN 介面，只重置引擎連線狀態。
-    // 原生沿用啟動時已解析的 g.srv_host（IP）重新撥號，伺服器恢復即自動重連。
+    // 在 IO 執行緒重新解析 hostname（DDNS／IP 變動後取最新位址），解析成功則把新 IP
+    // 傳給原生更新 g.srv_host 再重置；失敗傳 null（沿用舊 IP）。
     // 不呼叫 stopEngineSync()、不清 activeSockets、isRunning 維持 true——
     // 被關閉的 session fd 由原生經 notifySocketClosed 回呼逐一從 activeSockets 移除。
     private fun softRestart() {
-        try {
-            val err = NativeEngine.reconnect()
-            if (err != null) Log.w(TAG, "soft reconnect failed: $err")
-        } catch (e: Exception) {
-            Log.w(TAG, "soft reconnect error", e)
+        val host = Config.prefs(this).getString(Config.KEY_HOST, "") ?: ""
+        serviceScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val newIp = if (host.isBlank()) null else resolveHostOutsideTunnel(host)
+            try {
+                val err = NativeEngine.reconnect(newIp)
+                if (err != null) Log.w(TAG, "soft reconnect failed: $err")
+            } catch (e: Exception) {
+                Log.w(TAG, "soft reconnect error", e)
+            }
+            synchronized(serverEventLock) { autoRestartInProgress = false }
         }
-        synchronized(serverEventLock) { autoRestartInProgress = false }
     }
 
     // 引擎意外退出（非正常停止）：原生已自行清理 session fd，此處只需清除 Java 側的

@@ -44,6 +44,15 @@ object Config {
     fun prefs(ctx: Context): SharedPreferences =
         ctx.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
+    // 機密欄位（帳號／密碼）讀寫：底層以 Keystore AES-GCM 加密後存進 SharedPreferences。
+    // 舊版明文值（無 "enc:" 前綴）會被 decrypt 直接回傳，升級無縫相容。
+    fun getSecret(ctx: Context, key: String, def: String = ""): String =
+        SecretCipher.decrypt(prefs(ctx).getString(key, null)) ?: def
+
+    fun putSecret(ctx: Context, key: String, value: String) {
+        prefs(ctx).edit().putString(key, SecretCipher.encrypt(value)).apply()
+    }
+
     fun dnsServers(ctx: Context): List<String> {
         val p = prefs(ctx)
         val list = mutableListOf<String>()
