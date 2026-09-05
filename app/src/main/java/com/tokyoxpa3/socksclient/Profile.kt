@@ -1,5 +1,6 @@
 package com.tokyoxpa3.socksclient
 
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -88,7 +89,12 @@ object Profiles {
     private fun persist(ctx: android.content.Context, list: List<Profile>) {
         val arr = JSONArray()
         list.forEach { arr.put(it.toJson()) }
-        // 整份 JSON（含 pass 欄位）加密後入庫，避免明文密碼落在 SharedPreferences
-        Config.prefs(ctx).edit().putString(Config.KEY_PROFILES, SecretCipher.encrypt(arr.toString())).apply()
+        // 整份 JSON（含 pass 欄位）加密後入庫，避免明文密碼落在 SharedPreferences；
+        // 加密失敗保留舊值、不寫入明文。
+        val enc = SecretCipher.encrypt(arr.toString()) ?: run {
+            Log.e("Profiles", "persist: encrypt failed, profiles not saved")
+            return
+        }
+        Config.prefs(ctx).edit().putString(Config.KEY_PROFILES, enc).apply()
     }
 }

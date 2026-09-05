@@ -42,8 +42,9 @@ object SecretCipher {
         return kg.generateKey()
     }
 
-    /** 加密；空字串回傳空字串（不加密空值，保持既有語意）。 */
-    fun encrypt(plain: String): String {
+    /** 加密；空字串回傳空字串（不加密空值，保持既有語意）。
+     *  加密失敗回傳 null（而非明文）——絕不把未加密的機密寫回儲存，由呼叫端決定後續。 */
+    fun encrypt(plain: String): String? {
         if (plain.isEmpty()) return ""
         return try {
             val cipher = Cipher.getInstance(TRANSFORMATION)
@@ -53,10 +54,10 @@ object SecretCipher {
             val ct = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
             SecretCodec.pack(cipher.iv, ct)
         } catch (e: Exception) {
-            // Keystore 硬體故障等極端情況：降級回傳明文以維持可用性，但務必留下
-            // 可診斷的錯誤紀錄，避免加密靜默失效而不自知。
-            Log.e(TAG, "encrypt failed, falling back to plaintext", e)
-            plain
+            // Keystore 硬體故障等極端情況：拒絕回傳明文，避免加密靜默失效而讓
+            // 機密以明文落地。回傳 null 讓呼叫端保留舊值或提示使用者。
+            Log.e(TAG, "encrypt failed, refusing to return plaintext", e)
+            null
         }
     }
 

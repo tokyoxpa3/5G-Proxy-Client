@@ -2,11 +2,13 @@ package com.tokyoxpa3.socksclient
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 
 /**
  * 集中管理所有設定鍵，供 MainActivity / Service / BootReceiver / TileService 共用。
  */
 object Config {
+    private const val TAG = "Config"
     const val PREFS = "tunnel_config"
 
     // 目前（最後一次）連線設定
@@ -50,7 +52,12 @@ object Config {
         SecretCipher.decrypt(prefs(ctx).getString(key, null)) ?: def
 
     fun putSecret(ctx: Context, key: String, value: String) {
-        prefs(ctx).edit().putString(key, SecretCipher.encrypt(value)).apply()
+        val enc = SecretCipher.encrypt(value) ?: run {
+            // 加密失敗：保留舊值、不寫入明文，避免機密以明文落地。
+            Log.e(TAG, "putSecret: encrypt failed, keeping previous value for key=$key")
+            return
+        }
+        prefs(ctx).edit().putString(key, enc).apply()
     }
 
     fun dnsServers(ctx: Context): List<String> {
