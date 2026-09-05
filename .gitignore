@@ -32,3 +32,10 @@ captures/
 # APK outputs
 *.apk
 *.aab
+
+# ZCode workspace (session scratch: plans, stress-test scripts, screenshots)
+.zcode/
+
+# Scratch / test artifacts
+screen.png
+tunnel_config_test.xml
