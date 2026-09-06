@@ -92,4 +92,25 @@ class ProfileTest {
         assertEquals(list, restored)
         assertTrue(restored.map { it.name }.containsAll(listOf("Home", "Office")))
     }
+
+    @Test
+    fun exportJson_omitsSecrets() {
+        val o = sample().toExportJson()
+        // user/pass 不得出現在匯出 JSON（避免機密以明文進入剪貼簿）
+        assertTrue(!o.has("user"))
+        assertTrue(!o.has("pass"))
+        // 其餘欄位保留，匯入端可還原非機密設定
+        assertEquals("Home", o.optString("name"))
+        assertEquals("192.168.1.178", o.optString("host"))
+        assertEquals(true, o.optBoolean("udp_in_tcp"))
+    }
+
+    @Test
+    fun exportJson_roundTrip_credentialsBlank() {
+        val restored = Profile.fromJson(sample().toExportJson())
+        assertEquals("", restored.user)
+        assertEquals("", restored.pass)
+        assertEquals(sample().host, restored.host)
+        assertEquals(sample().name, restored.name)
+    }
 }

@@ -467,10 +467,10 @@ class MainActivity : Activity() {
                 return@setOnClickListener
             }
             val arr = org.json.JSONArray()
-            list.forEach { arr.put(it.toJson()) }
+            list.forEach { arr.put(it.toExportJson()) }
             val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
             cm.setPrimaryClip(android.content.ClipData.newPlainText("profiles", arr.toString()))
-            Toast.makeText(this, R.string.toast_profiles_exported, Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, R.string.toast_profiles_exported_no_secrets, Toast.LENGTH_SHORT).show()
         }
 
         btnImportProfiles.setOnClickListener {

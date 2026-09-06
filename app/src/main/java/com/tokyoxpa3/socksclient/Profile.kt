@@ -35,6 +35,24 @@ data class Profile(
         }
     }
 
+    // 匯出（剪貼簿／跨裝置）用：刻意省略 user/pass，避免機密以明文離開本裝置。
+    // 匯入端以空值接住（fromJson 的 optString 預設 ""），密碼需在目標裝置重填。
+    fun toExportJson(): JSONObject = JSONObject().apply {
+        put("name", name)
+        put("host", host)
+        put("port", port)
+        put("udp_in_tcp", udpInTcp)
+        put("remote_dns", remoteDns)
+        put("dns1", dns1)
+        put("dns2", dns2)
+        put("mode", mode)
+        if (apps.isNotEmpty()) {
+            val arr = JSONArray()
+            apps.forEach { arr.put(it) }
+            put("apps", arr)
+        }
+    }
+
     companion object {
         fun fromJson(o: JSONObject): Profile = Profile(
             name = o.optString("name", ""),

@@ -43,9 +43,9 @@ jobs:
           name: app-debug
           path: app/build/outputs/apk/debug/app-debug.apk
 
-  # 原生 C checksum 單元測試（host 端 gcc，不需 Android）
+  # 原生 C 單元測試（host 端 gcc，不需 Android）
   native-unit-test:
-    name: Native checksum unit tests
+    name: Native unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -101,3 +101,58 @@ jobs:
             fi
           done
           echo "所有抽離模組均已接回引擎"
+
+  # 封包解析器模糊測試（ASan/UBSan 下以 random mutation 抓越界與未定義行為）。
+  # 純解析函式吃不可信網路輸入，是記憶體安全最敏感處，故獨立 job 常駐 sanitizer。
+  native-fuzz:
+    name: Native parser fuzz (ASan+UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fuzz parsers under sanitizers
+        run: |
+          set -e
+          export ASAN_OPTIONS=detect_leaks=0:halt_on_error=1
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I app/src/main/cpp -o fuzz_parsers \
+            app/src/test/native/fuzz_parsers.c \
+            app/src/main/cpp/ip_parse.c \
+            app/src/main/cpp/reasm.c \
+            app/src/main/cpp/dns_synth.c \
+            app/src/main/cpp/socks5_codec.c \
+            app/src/main/cpp/tcp_packet.c \
+            app/src/main/cpp/checksum.c
+          ./fuzz_parsers 200000
+
+      - name: Offset-sensitive golden tests under sanitizers
+        run: |
+          set -e
+          export ASAN_OPTIONS=detect_leaks=0:halt_on_error=1
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I app/src/main/cpp -o ip_parse_test \
+            app/src/test/native/ip_parse_test.c \
+            app/src/main/cpp/ip_parse.c \
+            app/src/main/cpp/reasm.c
+          ./ip_parse_test
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I app/src/main/cpp -o reasm_test \
+            app/src/test/native/reasm_test.c \
+            app/src/main/cpp/reasm.c
+          ./reasm_test
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I app/src/main/cpp -o dns_synth_test \
+            app/src/test/native/dns_synth_test.c \
+            app/src/main/cpp/dns_synth.c
+          ./dns_synth_test
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I app/src/main/cpp -o socks5_test \
+            app/src/test/native/socks5_test.c \
+            app/src/main/cpp/socks5_codec.c
+          ./socks5_test
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I app/src/main/cpp -o tcp_packet_test \
+            app/src/test/native/tcp_packet_test.c \
+            app/src/main/cpp/tcp_packet.c \
+            app/src/main/cpp/checksum.c
+          ./tcp_packet_test
