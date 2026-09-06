@@ -1,9 +1,10 @@
 // ip_parse_test.c — IPv4/IPv6 頭與 fragment 表頭解析 golden test
-// 建置：gcc -std=c11 -Wall -Wextra -I app/src/main/cpp ip_parse_test.c ip_parse.c -o ip_parse_test
+// 建置：gcc -std=c11 -Wall -Wextra -I app/src/main/cpp ip_parse_test.c ip_parse.c reasm.c -o ip_parse_test
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include "ip_parse.h"
+#include "reasm.h"
 
 static int g_fail = 0;
 
@@ -95,50 +96,182 @@ int main(void) {
         CHECK("parse_ipv6 fragment drop", parse_ipv6(pkt, 48, &proto, &saddr, &daddr, &l4off) == -1);
     }
 
-    // 8. ipv6_first_frag：首片（offset=0、M=1）
+    // 12. ipv6_find_fragment：Fragment 為首個 ext header
     {
         unsigned char pkt[48] = {0};
         pkt[0] = 0x60;
-        pkt[6] = 44;          // Fragment
-        pkt[40] = 17;         // fragment 之後的 next header = UDP
-        pkt[42] = 0x00; pkt[43] = 0x01;   // ff = 0x0001 → offset=0, M=1
-        pkt[44] = 0x12; pkt[45] = 0x34; pkt[46] = 0x56; pkt[47] = 0x78; // id
-        uint8_t next_hdr; size_t frag_off; int mf; uint32_t id;
-        int r = ipv6_first_frag(pkt, 48, &next_hdr, &frag_off, &mf, &id);
-        CHECK("ipv6_first_frag returns 1", r == 1);
-        CHECK("ipv6_first_frag next_hdr", next_hdr == 17);
-        CHECK("ipv6_first_frag frag_off first=0", frag_off == 0);
-        CHECK("ipv6_first_frag mf", mf == 1);
-        CHECK("ipv6_first_frag id", id == 0x12345678);
+        pkt[6] = 44;          // Fragment（首個 ext header）
+        pkt[40] = 17;         // Fragment 的 next header = UDP
+        pkt[42] = 0x00; pkt[43] = 0x01;   // offset=0, M=1
+        pkt[44] = 0x12; pkt[45] = 0x34; pkt[46] = 0x56; pkt[47] = 0x78;
+        uint8_t nh; size_t fo; int m; uint32_t id;
+        size_t fdo, pre, po;
+        int r = ipv6_find_fragment(pkt, 48, &nh, &fo, &m, &id, &fdo, &pre, &po);
+        CHECK("find_frag first returns 1", r == 1);
+        CHECK("find_frag first nh=UDP", nh == 17);
+        CHECK("find_frag first frag_data_off=48", fdo == 48);
+        CHECK("find_frag first pre_frag_len=40", pre == 40);
+        CHECK("find_frag first patch_off=6", po == 6);
+        CHECK("find_frag first id", id == 0x12345678);
+        CHECK("find_frag first mf/off", m == 1 && fo == 0);
     }
 
-    // 9. ipv6_first_frag：offset=1（ff=0x0008 → 高 13 位 = 1 → frag_off=8）
+    // 13. ipv6_find_fragment：Fragment 巢狀於 Hop-by-Hop 之後
     {
-        unsigned char pkt[48] = {0};
+        unsigned char pkt[64] = {0};
         pkt[0] = 0x60;
-        pkt[6] = 44;
-        pkt[42] = 0x00; pkt[43] = 0x08;   // offset=1, M=0
-        uint8_t next_hdr; size_t frag_off; int mf; uint32_t id;
-        CHECK("ipv6_first_frag offset=1", (ipv6_first_frag(pkt, 48, &next_hdr, &frag_off, &mf, &id) == 1 && frag_off == 8 && mf == 0));
+        pkt[6] = 0;            // Hop-by-Hop
+        pkt[40] = 44;          // Hop-by-Hop 的 next header = Fragment
+        pkt[41] = 0;           // hdr ext len = (0+1)*8 = 8
+        pkt[48] = 17;          // Fragment 的 next header = UDP
+        pkt[50] = 0x00; pkt[51] = 0x08;   // offset=1, M=0
+        pkt[52] = 0xAA; pkt[53] = 0xBB; pkt[54] = 0xCC; pkt[55] = 0xDD;
+        uint8_t nh; size_t fo; int m; uint32_t id;
+        size_t fdo, pre, po;
+        int r = ipv6_find_fragment(pkt, 64, &nh, &fo, &m, &id, &fdo, &pre, &po);
+        CHECK("find_frag nested returns 1", r == 1);
+        CHECK("find_frag nested nh=UDP", nh == 17);
+        CHECK("find_frag nested frag_off=8", fo == 8);
+        CHECK("find_frag nested mf=0", m == 0);
+        CHECK("find_frag nested id", id == 0xAABBCCDD);
+        CHECK("find_frag nested frag_data_off=56", fdo == 56);
+        CHECK("find_frag nested pre_frag_len=48", pre == 48);
+        CHECK("find_frag nested patch_off=40", po == 40);
     }
 
-    // 9b. ipv6_first_frag：高位 offset（ff=0x8000 → offset=0x1000 → frag_off=0x8000）
+    // 14. ipv6_find_fragment：無 fragment（L4 直達）
     {
-        unsigned char pkt[48] = {0};
+        unsigned char pkt[40] = {0};
         pkt[0] = 0x60;
-        pkt[6] = 44;
-        pkt[42] = 0x80; pkt[43] = 0x00;   // offset=0x1000, M=0
-        uint8_t next_hdr; size_t frag_off; int mf; uint32_t id;
-        CHECK("ipv6_first_frag high offset", (ipv6_first_frag(pkt, 48, &next_hdr, &frag_off, &mf, &id) == 1 && frag_off == 0x1000u * 8 && mf == 0));
+        pkt[6] = 17;           // UDP
+        uint8_t nh; size_t fo; int m; uint32_t id;
+        size_t fdo, pre, po;
+        CHECK("find_frag none returns 0", ipv6_find_fragment(pkt, 40, &nh, &fo, &m, &id, &fdo, &pre, &po) == 0);
     }
 
-    // 10. ipv6_first_frag：非 fragment（pkt[6] != 44）
+    // 15. ip6_reasm_rebuild：首片（Fragment 為首個 ext header）
     {
-        unsigned char pkt[48] = {0};
-        pkt[0] = 0x60;
-        pkt[6] = 17;   // UDP
-        uint8_t next_hdr; size_t frag_off; int mf; uint32_t id;
-        CHECK("ipv6_first_frag not fragment", ipv6_first_frag(pkt, 48, &next_hdr, &frag_off, &mf, &id) == 0);
+        unsigned char hdr[40] = {0};
+        hdr[0] = 0x60;
+        hdr[6] = 44;           // base next header = Fragment（待移除）
+        unsigned char payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
+        unsigned char out[64];
+        int n = ip6_reasm_rebuild(hdr, 40, 6, 17, payload, 4, out, sizeof out);
+        CHECK("rebuild first len=44", n == 44);
+        CHECK("rebuild first next_hdr=UDP", out[6] == 17);
+        CHECK("rebuild first payload_len=4", out[4] == 0 && out[5] == 4);
+        CHECK("rebuild first payload", memcmp(out + 40, payload, 4) == 0);
+    }
+
+    // 16. ip6_reasm_rebuild：巢狀（Fragment 在 Hop-by-Hop 之後）
+    {
+        unsigned char hdr[48] = {0};
+        hdr[0] = 0x60;
+        hdr[6] = 0;            // Hop-by-Hop
+        hdr[40] = 44;          // Hop-by-Hop 的 next header = Fragment（待移除）
+        hdr[41] = 0;
+        unsigned char payload[] = {0x01, 0x02};
+        unsigned char out[64];
+        int n = ip6_reasm_rebuild(hdr, 48, 40, 17, payload, 2, out, sizeof out);
+        CHECK("rebuild nested len=50", n == 50);
+        CHECK("rebuild nested next_hdr patched", out[40] == 17);
+        CHECK("rebuild nested base next_hdr=Hop-by-Hop", out[6] == 0);
+        CHECK("rebuild nested payload_len=10", out[4] == 0 && out[5] == 10);
+        CHECK("rebuild nested payload", memcmp(out + 48, payload, 2) == 0);
+    }
+
+    // 17. 端到端多分片重組：Fragment 為首個 ext header
+    //（frag0 offset=0/M=1 + frag1 offset=8/M=0 → reasm_insert_seg 完成 → ip6_reasm_rebuild）
+    {
+        unsigned char f0[56] = {0};
+        f0[0] = 0x60; f0[6] = 44;          // Fragment
+        f0[40] = 17;                        // Fragment.next = UDP
+        f0[42] = 0x00; f0[43] = 0x01;       // offset=0, M=1
+        f0[44] = 0x12; f0[45] = 0x34; f0[46] = 0x56; f0[47] = 0x78;
+        unsigned char d0[8] = {0xA0,0xA1,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7};
+        memcpy(f0 + 48, d0, 8);
+
+        unsigned char f1[52] = {0};
+        f1[0] = 0x60; f1[6] = 44;
+        f1[40] = 17;
+        f1[42] = 0x00; f1[43] = 0x08;       // offset=1(×8)=8, M=0
+        f1[44] = 0x12; f1[45] = 0x34; f1[46] = 0x56; f1[47] = 0x78;
+        unsigned char d1[4] = {0xB0,0xB1,0xB2,0xB3};
+        memcpy(f1 + 48, d1, 4);
+
+        size_t soff[REASM_MAX_FRAGS], slen[REASM_MAX_FRAGS];
+        int nseg = 0;
+        unsigned char rbuf[64];
+        size_t total_len = 0; int have_last = 0;
+        unsigned char pre_hdr[40]; size_t pre_len = 0, patch_off = 0, fdo; uint8_t proto = 0;
+
+        uint8_t nh0; uint32_t id0; size_t fo0; int mf0;
+        int r0 = ipv6_find_fragment(f0, 56, &nh0, &fo0, &mf0, &id0, &fdo, &pre_len, &patch_off);
+        CHECK("e2e frag0 parse", r0 == 1 && nh0 == 17 && fo0 == 0 && mf0 == 1 && pre_len == 40 && patch_off == 6);
+        memcpy(pre_hdr, f0, pre_len);
+        proto = nh0;
+        CHECK("e2e frag0 insert not done", reasm_insert_seg(soff, slen, &nseg, rbuf, fo0, f0 + fdo, 8, mf0, &total_len, &have_last) == 0);
+
+        uint8_t nh1; uint32_t id1; size_t fo1; int mf1;
+        int r1 = ipv6_find_fragment(f1, 52, &nh1, &fo1, &mf1, &id1, &fdo, &pre_len, &patch_off);
+        CHECK("e2e frag1 parse", r1 == 1 && fo1 == 8 && mf1 == 0);
+        CHECK("e2e frag1 insert done", reasm_insert_seg(soff, slen, &nseg, rbuf, fo1, f1 + fdo, 4, mf1, &total_len, &have_last) == 1);
+        CHECK("e2e total_len=12", total_len == 12);
+
+        unsigned char out[64];
+        int n = ip6_reasm_rebuild(pre_hdr, 40, 6, proto, rbuf, total_len, out, sizeof out);
+        CHECK("e2e rebuild len=52", n == 52);
+        CHECK("e2e rebuild next=UDP", out[6] == 17);
+        CHECK("e2e rebuild payload_len=12", out[4] == 0 && out[5] == 12);
+        CHECK("e2e rebuild payload order", memcmp(out + 40, d0, 8) == 0 && memcmp(out + 48, d1, 4) == 0);
+    }
+
+    // 18. 端到端多分片重組：Fragment 巢狀於 Hop-by-Hop 之後
+    {
+        unsigned char f0[64] = {0};
+        f0[0] = 0x60; f0[6] = 0;            // Hop-by-Hop
+        f0[40] = 44; f0[41] = 0;            // Hop-by-Hop.next=Fragment, hdr ext len=8
+        f0[48] = 17;                        // Fragment.next = UDP
+        f0[50] = 0x00; f0[51] = 0x01;       // offset=0, M=1
+        f0[52]=0x12; f0[53]=0x34; f0[54]=0x56; f0[55]=0x78;
+        unsigned char d0[8] = {0xC0,0xC1,0xC2,0xC3,0xC4,0xC5,0xC6,0xC7};
+        memcpy(f0 + 56, d0, 8);
+
+        unsigned char f1[60] = {0};
+        f1[0] = 0x60; f1[6] = 0;
+        f1[40] = 44; f1[41] = 0;
+        f1[48] = 17;
+        f1[50] = 0x00; f1[51] = 0x08;       // offset=8, M=0
+        f1[52]=0x12; f1[53]=0x34; f1[54]=0x56; f1[55]=0x78;
+        unsigned char d1[4] = {0xD0,0xD1,0xD2,0xD3};
+        memcpy(f1 + 56, d1, 4);
+
+        size_t soff[REASM_MAX_FRAGS], slen[REASM_MAX_FRAGS];
+        int nseg = 0;
+        unsigned char rbuf[64];
+        size_t total_len = 0; int have_last = 0;
+        unsigned char pre_hdr[48]; size_t pre_len, patch_off, fdo; uint8_t proto;
+
+        uint8_t nh0; uint32_t id0; size_t fo0; int mf0;
+        int r0 = ipv6_find_fragment(f0, 64, &nh0, &fo0, &mf0, &id0, &fdo, &pre_len, &patch_off);
+        CHECK("e2e nested frag0 parse", r0 == 1 && nh0 == 17 && fo0 == 0 && mf0 == 1 && pre_len == 48 && patch_off == 40);
+        memcpy(pre_hdr, f0, pre_len);
+        proto = nh0;
+        CHECK("e2e nested frag0 insert", reasm_insert_seg(soff, slen, &nseg, rbuf, fo0, f0 + fdo, 8, mf0, &total_len, &have_last) == 0);
+
+        uint8_t nh1; uint32_t id1; size_t fo1; int mf1;
+        int r1 = ipv6_find_fragment(f1, 60, &nh1, &fo1, &mf1, &id1, &fdo, &pre_len, &patch_off);
+        CHECK("e2e nested frag1 parse", r1 == 1 && fo1 == 8 && mf1 == 0);
+        CHECK("e2e nested frag1 insert done", reasm_insert_seg(soff, slen, &nseg, rbuf, fo1, f1 + fdo, 4, mf1, &total_len, &have_last) == 1);
+        CHECK("e2e nested total_len=12", total_len == 12);
+
+        unsigned char out[64];
+        int n = ip6_reasm_rebuild(pre_hdr, 48, 40, proto, rbuf, total_len, out, sizeof out);
+        CHECK("e2e nested rebuild len=60", n == 60);
+        CHECK("e2e nested base next=Hop-by-Hop", out[6] == 0);
+        CHECK("e2e nested patched=UDP", out[40] == 17);
+        CHECK("e2e nested payload_len=20", out[4] == 0 && out[5] == 20);
+        CHECK("e2e nested payload", memcmp(out + 48, d0, 8) == 0 && memcmp(out + 56, d1, 4) == 0);
     }
 
     printf(g_fail ? "\nRESULT: FAIL\n" : "\nRESULT: PASS\n");

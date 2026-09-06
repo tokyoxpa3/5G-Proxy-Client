@@ -120,4 +120,4 @@ export JAVA_HOME=<JDK 17 路徑>
 ### IPv6
 
 - TUN 同時配置 `fd00::2/128`；IPv6 封包解析、checksum（pseudo-header）、SOCKS5 ATYP=0x04（CONNECT 與 UDP 雙向）皆已支援
-- 已知限制：IPv6 Fragment 僅於「Fragment 為首個 extension header」時重組（巢狀 Fragment 仍丟棄）；ICMP/ICMPv6 僅本機回應 echo 與 NDP，不經 SOCKS5 轉發
+- IPv6 Fragment 完整重組：支援巢狀 extension header（Fragment 位於 Hop-by-Hop / Routing / Destination 等 ext header 之後）；ICMP/ICMPv6 仍僅本機回應 echo 與 NDP，不經 SOCKS5 轉發

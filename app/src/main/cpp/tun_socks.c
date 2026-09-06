@@ -343,7 +343,7 @@ static unsigned udp_hash_idx(const ip_addr_t *ip, uint16_t port) {
 }
 
 // ---------- TUN 封包處理 ----------
-// (parse_ipv4 / parse_ipv6 / ipv6_first_frag 已抽離至 ip_parse.c)
+// (parse_ipv4 / parse_ipv6 / ipv6_find_fragment 已抽離至 ip_parse.c)
 
 // 回覆 App 的 IP 封包（relay 回應 → TUN）；_ex 版本以顯式位址取代 session
 static void write_ipv4_udp_to_tun_ex(const ip_addr_t *app_ip, uint16_t app_port,
@@ -1852,6 +1852,8 @@ static void handle_icmp6_ns(const unsigned char *pkt, size_t len, const ip_addr_
 // 僅處理「Fragment 為首個 ext header」的一般情況，重疊/超大/逾時一律丟棄。
 #define REASM_MAX_ENTRIES 16
 #define REASM_TIMEOUT_SEC 5
+// 分片前表頭鏈的上限：v4 IHL ≤ 60；v6 = base 40 + 前置 ext header（巢狀分片）。
+#define REASM_MAX_IPHDR 256
 
 typedef struct {
     int in_use;
@@ -1865,8 +1867,9 @@ typedef struct {
     size_t soff[REASM_MAX_FRAGS];
     size_t slen[REASM_MAX_FRAGS];
     int nseg;
-    unsigned char ip_hdr[40];
-    uint8_t ip_hdr_len;
+    unsigned char ip_hdr[REASM_MAX_IPHDR];
+    uint16_t ip_hdr_len;
+    size_t patch_off;       // v6：移除 Fragment 時需改寫的 next-header 欄位偏移（v4 恒 0）
     time_t last_active;
 } reasm_entry_t;
 
@@ -1934,14 +1937,15 @@ static int reasm_insert(int idx, size_t offset, const unsigned char *data, size_
 static void reasm_dispatch(uint8_t family, const ip_addr_t *src, const ip_addr_t *dst,
                            uint8_t proto, uint32_t id,
                            size_t offset, const unsigned char *data, size_t dlen, int mf,
-                           const unsigned char *ip_hdr, size_t ip_hdr_len) {
+                           const unsigned char *ip_hdr, size_t ip_hdr_len, size_t patch_off) {
     time_t now = time(NULL);
     int idx = reasm_find(family, src, dst, proto, id);
     if (idx < 0) idx = reasm_alloc(family, src, dst, proto, id, now);
     if (idx < 0) return;
     if (offset == 0 && ip_hdr_len <= sizeof(g_reasm[idx].ip_hdr)) {
         memcpy(g_reasm[idx].ip_hdr, ip_hdr, ip_hdr_len);
-        g_reasm[idx].ip_hdr_len = (uint8_t)ip_hdr_len;
+        g_reasm[idx].ip_hdr_len = (uint16_t)ip_hdr_len;
+        g_reasm[idx].patch_off = patch_off;
     }
     int done = reasm_insert(idx, offset, data, dlen, mf, now);
     if (done <= 0) return;
@@ -1949,9 +1953,9 @@ static void reasm_dispatch(uint8_t family, const ip_addr_t *src, const ip_addr_t
     reasm_entry_t *e = &g_reasm[idx];
     unsigned char *out = malloc(e->ip_hdr_len + e->total_len);
     if (!out) { reasm_clear_entry(idx); return; }
-    memcpy(out, e->ip_hdr, e->ip_hdr_len);
     if (family == AF_INET) {
         size_t outlen = e->ip_hdr_len + e->total_len;
+        memcpy(out, e->ip_hdr, e->ip_hdr_len);
         out[2] = (outlen >> 8) & 0xFF; out[3] = outlen & 0xFF;
         out[6] = 0; out[7] = 0;   // 清除 flags / fragment offset
         out[10] = 0; out[11] = 0;
@@ -1960,18 +1964,16 @@ static void reasm_dispatch(uint8_t family, const ip_addr_t *src, const ip_addr_t
         memcpy(out + e->ip_hdr_len, e->buf, e->total_len);
         handle_tun_packet(out, outlen);
     } else {
-        // v6：移除 Fragment header（僅處理「Fragment 為首個 ext header」的情況）
-        size_t outlen = e->ip_hdr_len + e->total_len;  // ip_hdr_len == 40
-        out[4] = (e->total_len >> 8) & 0xFF; out[5] = e->total_len & 0xFF;
-        out[6] = e->proto;  // Fragment 的 next header 即 L4 協定
-        memcpy(out + e->ip_hdr_len, e->buf, e->total_len);
-        handle_tun_packet(out, outlen);
+        // v6：移除 Fragment header（可為巢狀 ext header 中的任意位置）
+        int outlen = ip6_reasm_rebuild(e->ip_hdr, e->ip_hdr_len, e->patch_off, e->proto,
+                                       e->buf, e->total_len, out, e->ip_hdr_len + e->total_len);
+        if (outlen > 0) handle_tun_packet(out, (size_t)outlen);
     }
     free(out);
     reasm_clear_entry(idx);
 }
 
-// ipv6_first_frag 已抽離至 ip_parse.c
+// ipv6_find_fragment 已抽離至 ip_parse.c
 
 static void reasm_gc(time_t now) {
     for (int i = 0; i < REASM_MAX_ENTRIES; i++)
@@ -1998,7 +2000,7 @@ static void handle_tun_packet(const unsigned char *pkt, size_t len) {
                 uint32_t id = (uint16_t)((pkt[4] << 8) | pkt[5]);
                 reasm_dispatch(AF_INET, &saddr, &daddr, proto, id,
                                (size_t)off * 8, pkt + ihl, len - (size_t)ihl, mf,
-                               pkt, (size_t)ihl);
+                               pkt, (size_t)ihl, 0);
                 return;
             }
         }
@@ -2013,12 +2015,15 @@ static void handle_tun_packet(const unsigned char *pkt, size_t len) {
     }
     if (ver == 6) {
         uint8_t fnh; size_t foff; int fmf; uint32_t fid;
-        if (ipv6_first_frag(pkt, len, &fnh, &foff, &fmf, &fid)) {
+        size_t fdata_off, pre_len, patch_off;
+        int fr = ipv6_find_fragment(pkt, len, &fnh, &foff, &fmf, &fid,
+                                    &fdata_off, &pre_len, &patch_off);
+        if (fr == 1) {
             ip_addr_t saddr, daddr;
             saddr.family = AF_INET6; memcpy(saddr.ip, pkt + 8, 16);
             daddr.family = AF_INET6; memcpy(daddr.ip, pkt + 24, 16);
             reasm_dispatch(AF_INET6, &saddr, &daddr, fnh, fid, foff,
-                           pkt + 48, len - 48, fmf, pkt, 40);
+                           pkt + fdata_off, len - fdata_off, fmf, pkt, pre_len, patch_off);
             return;
         }
         uint8_t proto;

@@ -66,7 +66,7 @@ jobs:
             app/src/test/native/tcp_packet_test.c app/src/main/cpp/tcp_packet.c app/src/main/cpp/checksum.c
           ./tcp_packet_test
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o ip_parse_test \
-            app/src/test/native/ip_parse_test.c app/src/main/cpp/ip_parse.c
+            app/src/test/native/ip_parse_test.c app/src/main/cpp/ip_parse.c app/src/main/cpp/reasm.c
           ./ip_parse_test
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o reasm_test \
             app/src/test/native/reasm_test.c app/src/main/cpp/reasm.c
