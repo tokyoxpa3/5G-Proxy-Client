@@ -15,6 +15,7 @@
 #include <string.h>
 #include "ip_parse.h"
 #include "reasm.h"
+#include "dns_query.h"
 #include "dns_synth.h"
 #include "dns_tcp.h"
 #include "socks5_codec.h"
@@ -82,10 +83,13 @@ static void fuzz_reasm(void) {
 
 static void fuzz_dns(void) {
     unsigned char fake6[16]; size_t rlen;
+    char name[256]; uint16_t qtype, qclass; int supported; size_t qend;
     fill_random();
     dns_build_fake_ip6((int)rnd_range(1000), fake6);
     (void)dns_build_reply_pure(in, rnd_range(MAX_IN + 1),
                                (uint32_t)rng_next(), fake6, (int)rnd_range(2), dnsout, &rlen);
+    (void)dns_query_parse(in, rnd_range(MAX_IN + 1), name, sizeof name,
+                          &qtype, &qclass, &supported, &qend);
 }
 
 static void fuzz_dns_tcp(void) {

@@ -60,7 +60,7 @@ jobs:
             app/src/test/native/socks5_test.c app/src/main/cpp/socks5_codec.c
           ./socks5_test
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o dns_synth_test \
-            app/src/test/native/dns_synth_test.c app/src/main/cpp/dns_synth.c
+            app/src/test/native/dns_synth_test.c app/src/main/cpp/dns_synth.c app/src/main/cpp/dns_query.c
           ./dns_synth_test
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o tcp_packet_test \
             app/src/test/native/tcp_packet_test.c app/src/main/cpp/tcp_packet.c app/src/main/cpp/checksum.c
@@ -84,18 +84,21 @@ jobs:
             app/src/test/native/udp_session_test.c app/src/main/cpp/udp_session.c
           ./udp_session_test
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o fake_dns_test \
-            app/src/test/native/fake_dns_test.c app/src/main/cpp/fake_dns.c app/src/main/cpp/dns_synth.c
+            app/src/test/native/fake_dns_test.c app/src/main/cpp/fake_dns.c app/src/main/cpp/dns_synth.c app/src/main/cpp/dns_query.c
           ./fake_dns_test
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o dns_tcp_test \
             app/src/test/native/dns_tcp_test.c app/src/main/cpp/dns_tcp.c
           ./dns_tcp_test
+          gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o dns_query_test \
+            app/src/test/native/dns_query_test.c app/src/main/cpp/dns_query.c
+          ./dns_query_test
 
       - name: Verify engine uses extracted modules (no parallel drift)
         run: |
           set -e
           for sym in socks5_build_connect_request socks5_build_udp_frame \
                      tcp_build_segment tcp_build_synack udp_build_packet \
-                     dns_build_reply_pure dns_build_fake_ip6 \
+                     dns_query_parse dns_build_reply_pure dns_build_fake_ip6 \
                      reasm_insert_seg tcp_seq_gt tcp_win_field_pure tcp_parse_window_scale \
                      ip_hash_bucket tcp_isn_generate tcp_win_scaled tcp_flow_window_full \
                      tcp_srv_should_send_fin tcp_app_can_shutdown_write \
@@ -128,6 +131,7 @@ jobs:
             app/src/test/native/fuzz_parsers.c \
             app/src/main/cpp/ip_parse.c \
             app/src/main/cpp/reasm.c \
+            app/src/main/cpp/dns_query.c \
             app/src/main/cpp/dns_synth.c \
             app/src/main/cpp/dns_tcp.c \
             app/src/main/cpp/socks5_codec.c \
@@ -153,6 +157,7 @@ jobs:
           gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
             -I app/src/main/cpp -o dns_synth_test \
             app/src/test/native/dns_synth_test.c \
+            app/src/main/cpp/dns_query.c \
             app/src/main/cpp/dns_synth.c
           ./dns_synth_test
           gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
@@ -170,6 +175,7 @@ jobs:
             -I app/src/main/cpp -o fake_dns_test \
             app/src/test/native/fake_dns_test.c \
             app/src/main/cpp/fake_dns.c \
+            app/src/main/cpp/dns_query.c \
             app/src/main/cpp/dns_synth.c
           ./fake_dns_test
           gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
@@ -177,3 +183,8 @@ jobs:
             app/src/test/native/dns_tcp_test.c \
             app/src/main/cpp/dns_tcp.c
           ./dns_tcp_test
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I app/src/main/cpp -o dns_query_test \
+            app/src/test/native/dns_query_test.c \
+            app/src/main/cpp/dns_query.c
+          ./dns_query_test
