@@ -19,6 +19,7 @@
 #include "dns_synth.h"
 #include "dns_tcp.h"
 #include "socks5_codec.h"
+#include "icmp_packet.h"
 #include "tcp_packet.h"
 #include "checksum.h"
 
@@ -142,6 +143,14 @@ static void fuzz_checksum(void) {
     (void)transport_checksum(AF_INET6, in, in, (uint8_t)rng_next(), in, rnd_range(MAX_IN + 1));
 }
 
+static void fuzz_icmp(void) {
+    fill_random();
+    (void)icmp4_build_echo_reply(in, rnd_range(MAX_IN + 1), (int)rnd_range(64),
+                                 in, in, out, sizeof out);
+    (void)icmp6_build_echo_reply(in, rnd_range(MAX_IN + 1), in, in, out, sizeof out);
+    (void)icmp6_build_na(in, in, out, rnd_range(OUT_CAP + 1));
+}
+
 int main(int argc, char **argv) {
     unsigned long iters = 200000;
     if (argc > 1) iters = strtoul(argv[1], NULL, 10);
@@ -155,6 +164,7 @@ int main(int argc, char **argv) {
         fuzz_socks5();
         fuzz_tcp();
         fuzz_checksum();
+        fuzz_icmp();
     }
     fprintf(stderr, "fuzz_parsers: PASS (%lu iterations)\n", iters);
     return 0;

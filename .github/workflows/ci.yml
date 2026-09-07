@@ -92,12 +92,16 @@ jobs:
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o dns_query_test \
             app/src/test/native/dns_query_test.c app/src/main/cpp/dns_query.c
           ./dns_query_test
+          gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o icmp_packet_test \
+            app/src/test/native/icmp_packet_test.c app/src/main/cpp/icmp_packet.c app/src/main/cpp/checksum.c
+          ./icmp_packet_test
 
       - name: Verify engine uses extracted modules (no parallel drift)
         run: |
           set -e
           for sym in socks5_build_connect_request socks5_build_udp_frame \
                      tcp_build_segment tcp_build_synack udp_build_packet \
+                     icmp4_build_echo_reply icmp6_build_echo_reply icmp6_build_na \
                      dns_query_parse dns_build_reply_pure dns_build_fake_ip6 \
                      reasm_insert_seg tcp_seq_gt tcp_win_field_pure tcp_parse_window_scale \
                      ip_hash_bucket tcp_isn_generate tcp_win_scaled tcp_flow_window_full \
@@ -135,6 +139,7 @@ jobs:
             app/src/main/cpp/dns_synth.c \
             app/src/main/cpp/dns_tcp.c \
             app/src/main/cpp/socks5_codec.c \
+            app/src/main/cpp/icmp_packet.c \
             app/src/main/cpp/tcp_packet.c \
             app/src/main/cpp/checksum.c
           ./fuzz_parsers 200000
@@ -188,3 +193,9 @@ jobs:
             app/src/test/native/dns_query_test.c \
             app/src/main/cpp/dns_query.c
           ./dns_query_test
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I app/src/main/cpp -o icmp_packet_test \
+            app/src/test/native/icmp_packet_test.c \
+            app/src/main/cpp/icmp_packet.c \
+            app/src/main/cpp/checksum.c
+          ./icmp_packet_test

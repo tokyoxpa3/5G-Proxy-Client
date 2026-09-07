@@ -24,6 +24,7 @@
 #include "checksum.h"
 #include "socks5_codec.h"
 #include "tcp_packet.h"
+#include "icmp_packet.h"
 #include "dns_query.h"
 #include "dns_synth.h"
 #include "fake_dns.h"
@@ -1650,20 +1651,9 @@ static void handle_icmp4(const unsigned char *pkt, size_t len, int ihl,
     if (pkt[t] != 8 || pkt[t + 1] != 0) return;   // 僅處理 echo request
     if (len > TUN_MTU) return;
     unsigned char reply[TUN_MTU];
-    memcpy(reply, pkt, len);
-    // 交換 IP 來源/目的，重算 IP checksum
-    memcpy(reply + 12, daddr->ip, 4);
-    memcpy(reply + 16, saddr->ip, 4);
-    reply[8] = 64;
-    reply[10] = 0; reply[11] = 0;
-    uint16_t csum = checksum16(reply, (size_t)ihl);
-    reply[10] = csum >> 8; reply[11] = csum & 0xFF;
-    // echo reply，重算 ICMP checksum
-    reply[t] = 0;
-    reply[t + 2] = 0; reply[t + 3] = 0;
-    uint16_t icsum = checksum16(reply + t, len - t);
-    reply[t + 2] = icsum >> 8; reply[t + 3] = icsum & 0xFF;
-    ssize_t w = write(g.tun_fd, reply, len);
+    ssize_t total = icmp4_build_echo_reply(pkt, len, ihl, daddr->ip, saddr->ip, reply, sizeof reply);
+    if (total < 0) return;
+    ssize_t w = write(g.tun_fd, reply, (size_t)total);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun icmp4 failed: %s", strerror(errno));
 }
 
@@ -1673,17 +1663,9 @@ static void handle_icmp6(const unsigned char *pkt, size_t len,
     if (len < 48 || len > TUN_MTU) return;
     if (pkt[40] != 128 || pkt[41] != 0) return;   // 僅處理 echo request
     unsigned char reply[TUN_MTU];
-    memcpy(reply, pkt, len);
-    // 交換 IPv6 來源/目的
-    memcpy(reply + 8, daddr->ip, 16);
-    memcpy(reply + 24, saddr->ip, 16);
-    reply[7] = 64;
-    // echo reply，重算 ICMPv6 checksum（含 pseudo-header）
-    reply[40] = 129;
-    reply[42] = 0; reply[43] = 0;
-    uint16_t icsum = tcpudp_checksum6(daddr->ip, saddr->ip, 58, reply + 40, len - 40);
-    reply[42] = icsum >> 8; reply[43] = icsum & 0xFF;
-    ssize_t w = write(g.tun_fd, reply, len);
+    ssize_t total = icmp6_build_echo_reply(pkt, len, daddr->ip, saddr->ip, reply, sizeof reply);
+    if (total < 0) return;
+    ssize_t w = write(g.tun_fd, reply, (size_t)total);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun icmp6 failed: %s", strerror(errno));
 }
 
@@ -1701,19 +1683,9 @@ static void handle_icmp6_ns(const unsigned char *pkt, size_t len, const ip_addr_
     if (target[0] != 0xFD) return;   // 僅回應隧道空間 fd00::/8
 
     unsigned char reply[64];
-    memset(reply, 0, sizeof(reply));
-    reply[0] = 0x60;
-    reply[4] = 0; reply[5] = 24;             // payload length
-    reply[6] = 58;                            // next header ICMPv6
-    reply[7] = 255;                           // hop limit
-    memcpy(reply + 8, target, 16);            // 來源 = 目標（宣告擁有權）
-    memcpy(reply + 24, saddr->ip, 16);        // 目的 = NS 來源
-    reply[40] = 136;                          // Neighbor Advertisement
-    reply[44] = 0x60;                         // R=0 S=1 O=1
-    memcpy(reply + 48, target, 16);
-    uint16_t csum = tcpudp_checksum6(reply + 8, reply + 24, 58, reply + 40, 24);
-    reply[42] = csum >> 8; reply[43] = csum & 0xFF;
-    ssize_t w = write(g.tun_fd, reply, sizeof(reply));
+    ssize_t total = icmp6_build_na(target, saddr->ip, reply, sizeof reply);
+    if (total < 0) return;
+    ssize_t w = write(g.tun_fd, reply, (size_t)total);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun icmp6 NA failed: %s", strerror(errno));
 }
 
