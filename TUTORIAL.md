@@ -14,7 +14,7 @@
 
 ### 整體架構
 
-![整體架構](docs/figures/fig1_architecture.png)
+[整體架構](docs/figures/fig1_architecture.png)
 
 流量路徑：
 
@@ -42,32 +42,50 @@
 
 ### 3.1 開啟 App，確認連接埠
 
-![Server 初始畫面](docs/shots/server_initial_annotated.png)
+[Server 初始畫面](docs/shots/server_initial_annotated.png)
 
 1. **代理端口**：設為要對外提供的埠（預設 `1080`；本教學沿用 `1080`）
 2. **使用者 / 密碼**：兩欄都留空 = 開放代理；**兩欄都填**才會啟用認證（RFC 1929）
 3. 點 **「🚀 一鍵開啟 5G 代理」**
 
-> 首次啟動（Android 13+）會要求**通知權限**，請允許，前景服務通知才能正常顯示。
-> 另外依品牌提示（小米/三星/OPPO/Vivo）加入**電池最佳化白名單**，避免系統在背景殺掉 App 導致 5G 掉線。
+> 1.6.3 版新增 **「📈 流量」即時統計卡片**（上/下傳速率與總量），以及下方的 **「🧪 自我檢測」** 按鈕，可隨時驗證 SOCKS5 服務是否正常。
 
-### 3.2 啟動成功後，取得 Server 的 IP 與 Port
+### 3.2 首次啟動的兩個提醒視窗
 
-![Server 運行中](docs/shots/server_running_annotated.png)
+> 首次安裝後第一次點「一鍵開啟」會依序跳出兩個視窗；之後就不會再出現（除非重裝）。
+
+**① 電池最佳化提醒（小米/POCO 用戶）**
+
+[電池最佳化提醒](docs/shots/server_battery_annotated.png)
+
+- 點 **「仍然繼續」** 直接啟動（不加入白名單也能跑，但背景較可能被系統切斷）
+- 或點 **「前往設定」** → 關閉【5G 智慧省電】、把 App 省電策略設為「無限制」，能更穩定鎖定 5G
+
+**② 通知權限（Android 13+）**
+
+[通知權限](docs/shots/server_notifperm_annotated.png)
+
+- 點 **「允許」**，前景服務通知才能正常顯示。
+
+### 3.3 啟動成功後，取得 Server 的 IP 與 Port
+
+[Server 運行中](docs/shots/server_running_annotated.png)
 
 啟動後畫面會顯示（3 秒後自動刷新）：
 
 - **✅ 5G Proxy Running** → 代理已運行
 - **📶 Wi-Fi 代理: `192.168.1.178:1080`** ← **記下這個 IP:Port**（Client 端要輸入的值）
-- **📲 5G 行動 IP: `49.215.85.39`** ← 驗證用：所有經代理出去的流量，出口 IP 都應等於它
+- **📲 5G 行動 IP: `49.215.24.54`** ← 驗證用：所有經代理出去的流量，出口 IP 都應等於它
+  - 註：5G 行動 IP 是電信商 NAT 動態分配，隨時可能變動，以你裝置上實際顯示為準。
+- **📈 流量**：上/下傳即時速率與累計總量
 
 > 監聽器只綁定 Wi-Fi / 熱點 / USB 分享等 LAN 介面，**不會暴露在行動網路介面上**。
 
-### 3.3 Server 端前景服務通知
+### 3.4 Server 端前景服務通知
 
-![Server 通知](docs/shots/server_notification_annotated.png)
+[Server 通知](docs/shots/server_notification_annotated.png)
 
-通知列會常駐 **「5G SOCKS5 Proxying / Locked 5G - Listening Port 1080」**，確認代理確實在監聽。
+通知列會常駐 **「✅ 5G Proxy Running / 已鎖定 5G - 監聽 Port 1080」**，確認代理確實在監聽。
 
 ---
 
@@ -75,7 +93,7 @@
 
 ### 4.1 填入 Server 的 IP 與 Port
 
-![Client 設定畫面](docs/shots/client_filled_annotated.png)
+[Client 設定畫面](docs/shots/client_filled_annotated.png)
 
 | 欄位 | 填入 | 說明 |
 |---|---|---|
@@ -83,12 +101,22 @@
 | **連接埠** | `1080` | Server 端「Wi-Fi 代理」顯示的 Port |
 | 使用者名稱 / 密碼 | （留空） | 只有 Server 端有設帳密才需要填 |
 | **UDP relay 走 TCP** | 勾選 | 建議勾選（與 5G Proxy Pro 搭配，DNS/QUIC 更穩） |
+| **Remote DNS** | 勾選 | 由伺服器端解析網域（預設已勾） |
 
+> 1.5.1 版新增：**DNS（可選）**、**隧道模式**（全局 / 指定 App / 排除 App 三選）、**Remote DNS**、**斷線保護（Kill Switch）**。
 > 伺服器位址會在建立 VPN **之前**解析，避免自己的 DNS 查詢被隧道捕捉。
 
-### 4.2 點「🚀 啟動隧道」→ 允許 VPN
+### 4.2 點「🚀 啟動隧道」→ 允許通知與 VPN
 
-![VPN 授權](docs/shots/client_vpn_annotated.png)
+**① 通知權限（Android 13+）**
+
+[Client 通知權限](docs/shots/client_notifperm_annotated.png)
+
+點 **「允許」**。
+
+**② VPN 連線要求**
+
+[VPN 授權](docs/shots/client_vpn_annotated.png)
 
 第一次啟動會出現系統 **「連線要求」** 對話框：
 
@@ -98,13 +126,13 @@
 
 ### 4.3 啟動成功
 
-![Client 運行中](docs/shots/client_running_annotated.png)
+[Client 運行中](docs/shots/client_running_annotated.png)
 
-- 畫面顯示 **「✅ 隧道已啟用 (192.168.1.178:1080)」** → 成功
+- 按鈕變為 **「🛑 停止隧道」**、設定欄位鎖定 → 隧道已啟用
 - 狀態列出現 **鑰匙圖示**（VPN 作用中）
-- 通知列常駐 **「5G Proxy Client / Tunnel active」**：
 
-![Client 通知](docs/shots/client_notification_annotated.png)
+> 註：1.5.1 版不再顯示「✅ 隧道已啟用」那行文字，改以「停止隧道」按鈕 + 欄位鎖定表示運行中。
+> 前景服務通知改用低重要性的「隧道狀態」頻道，即時顯示 ↑/↓ bytes 與 TCP/UDP session 數；在部分機型（如三星）可能被折疊進「背景執行」區，展開通知列即可看到。
 
 > 停止方式：回到 App 點「🛑 停止隧道」，或從系統設定撤銷 VPN。
 
@@ -112,7 +140,7 @@
 
 ## 5. 步驟 3：驗證流量真的走 5G
 
-驗證原理：Server 端「5G 行動 IP」= 49.215.85.39，任何**經代理出去的流量**，出口 IP 都應等於它。
+驗證原理：Server 端「5G 行動 IP」= 49.215.24.54，任何**經代理出去的流量**，出口 IP 都應等於它。
 
 ### 方法 A：PC 上透過代理存取（本教學實測）
 
@@ -123,7 +151,7 @@ curl.exe -s --proxy socks5h://192.168.1.178:1080 https://api.ipify.org
 本教學實際執行結果：
 
 ```text
-49.215.85.39        <- 與 Server 端「5G 行動 IP」完全一致（成功）
+49.215.24.54        <- 與 Server 端「5G 行動 IP」完全一致（成功）
 ```
 
 ### 方法 B：Client 手機本機驗證（隧道內流量）
@@ -131,13 +159,13 @@ curl.exe -s --proxy socks5h://192.168.1.178:1080 https://api.ipify.org
 在 Client 手機（透過 adb）執行：
 
 ```bash
-adb -s 192.168.1.192:39013 shell "curl -s https://api.ipify.org"
+adb -s 192.168.1.192:45643 shell "curl -s https://api.ipify.org"
 ```
 
 本教學實際執行結果：
 
 ```text
-49.215.85.39        <- Client 手機的出口 IP = Server 的 5G IP，證明流量全部走隧道（成功）
+49.215.24.54        <- Client 手機的出口 IP = Server 的 5G IP，證明流量全部走隧道（成功）
 ```
 
 ### 方法 C：其他驗證
@@ -147,7 +175,7 @@ adb -s 192.168.1.192:39013 shell "curl -s https://api.ipify.org"
 | **測速** | `curl.exe -o NUL --proxy socks5h://192.168.1.178:1080 https://speed.cloudflare.com/__down?bytes=100000000` | 有吞吐量即代表 CONNECT 轉發正常 |
 | **DNS 穿透** | 代理為 `socks5h`（H 代表 DNS 由代理解析） | 任何網域都可解析 |
 | **UDP/QUIC** | Client 手機用 Chrome（支援 QUIC）開 YouTube | 能播放 = UDP relay（UDP-in-TCP）正常 |
-| **排除 App** | Client 端「🚫 Excluded Apps」勾選某 App | 該 App 出口 IP 為 Wi-Fi 線路（如 PC 直連的 59.126.201.28），其餘仍走 5G |
+| **排除 App** | Client 端「🚫 Excluded Apps」勾選某 App | 該 App 出口 IP 為 Wi-Fi 線路，其餘仍走 5G |
 
 ---
 
@@ -156,7 +184,7 @@ adb -s 192.168.1.192:39013 shell "curl -s https://api.ipify.org"
 | 症狀 | 原因 | 解決方法 |
 |---|---|---|
 | Client 一直「正在解析伺服器位址…」 | 伺服器 IP/Port 填錯 | 回 Server 端重新確認「Wi-Fi 代理」顯示的值 |
-| 連到 Server 但 SOCKS5 握手無回應 | 填到了 **ADB 埠**（35577/39013）而非代理埠 | 代理埠以 App「Wi-Fi 代理」顯示為準（預設 1080） |
+| 連到 Server 但 SOCKS5 握手無回應 | 填到了 **ADB 埠**（41723/45643）而非代理埠 | 代理埠以 App「Wi-Fi 代理」顯示為準（預設 1080） |
 | Server 顯示「❌ Proxy Failed to Start」 | 手機沒有 LAN 介面或 5G 訊號 | 確認 Wi-Fi 已連線、SIM 卡有訊號 |
 | Server 的 5G 常掉線 | 電池最佳化把 App 掛在背景 | 依品牌設定加入電池白名單（小米關閉「5G 電池省電模式」等） |
 | Client 按啟動沒反應 / Toast 顯示輸入錯誤 | 伺服器位址或埠格式不對 | 確認 IP 格式、Port 在 1~65535 之間 |
@@ -171,12 +199,12 @@ adb -s 192.168.1.192:39013 shell "curl -s https://api.ipify.org"
 
 ```powershell
 # Server 手機（小米）
-adb connect 192.168.1.178:35577
-adb -s 192.168.1.178:35577 shell am start -n com.tokyoxpa3.androidproxy/.DebugActivity
+adb connect 192.168.1.178:41723
+adb -s 192.168.1.178:41723 shell am start -n com.tokyoxpa3.androidproxy/.DebugActivity
 
 # Client 手機（三星）
-adb connect 192.168.1.192:39013
-adb -s 192.168.1.192:39013 shell am start -n com.tokyoxpa3.socksclient/.MainActivity
+adb connect 192.168.1.192:45643
+adb -s 192.168.1.192:45643 shell am start -n com.tokyoxpa3.socksclient/.MainActivity
 
 # 截圖
 adb -s <serial> shell screencap -p /sdcard/s.png

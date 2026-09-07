@@ -29,8 +29,6 @@ WHITE = (255, 255, 255)
 DARK = (33, 37, 41)
 STRIP_BG = (250, 250, 250)
 
-# token 化：CJK/全形字元一個一個；連續英數（含 . : / ( ) + - _）不切斷；
-# 空白可斷行；其餘（含 emoji）單一字元
 TOKEN_RE = re.compile(
     r"[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]"
     r"|[A-Za-z0-9][A-Za-z0-9_.:/()+\-]*"
@@ -47,10 +45,9 @@ def is_emoji(ch):
 
 
 def draw_mixed(d, xy, text, font, ef):
-    """逐段繪製：emoji 用彩色 emoji 字型，其餘用中文字型"""
     x, y = xy
     seg = ""
-    mode = None  # None=一般, 'e'=emoji
+    mode = None
     for ch in text:
         m = "e" if is_emoji(ch) else None
         if m != mode and seg:
@@ -72,7 +69,6 @@ def draw_mixed(d, xy, text, font, ef):
 
 
 def wrap_text(text, max_w, font, ef):
-    """依像素寬度換行；token 不可被切斷；空格優先作為斷點"""
     tokens = TOKEN_RE.findall(text)
     lines, cur, cur_w = [], "", 0.0
     for tok in tokens:
@@ -96,7 +92,6 @@ def wrap_text(text, max_w, font, ef):
 
 
 def annotate(src, dst, items, scale_h=1350, strip_w=560, title=None):
-    """items: list of (num, img_x, img_y, text)"""
     im = Image.open(src).convert("RGB")
     w, h = im.size
     scale = scale_h / h
@@ -142,7 +137,6 @@ def annotate(src, dst, items, scale_h=1350, strip_w=560, title=None):
         for ln in lines:
             draw_mixed(d, (bx + 16, ty), ln, fr, ef)
             ty += line_h
-        # 折線箭頭：號碼圓 → 框左側
         sx, sy = bx, by + bh // 2
         d.line([cx + r + 4, cy, (sx + bx) // 2, cy, (sx + bx) // 2, sy, sx, sy],
                fill=RED, width=3)
@@ -151,21 +145,45 @@ def annotate(src, dst, items, scale_h=1350, strip_w=560, title=None):
 
     canvas.save(dst)
     print(("OVERFLOW!" if overflow else "OK   "), os.path.basename(dst),
-          canvas.size, "| lines:", [len(wrap_text(t, box_w, fr, ef)) for _, _, _, t in items])
+          canvas.size)
 
 
 def main():
     S = SHOTS
 
+    # --- Server 端 ---
+
     annotate(
         os.path.join(S, "server_initial.png"),
         os.path.join(S, "server_initial_annotated.png"),
         [
-            (1, 735, 777, "檢查「代理端口」，改成要對外提供的埠（預設 1080）"),
-            (2, 712, 946, "帳號密碼留空 = 開放代理；兩欄都填才會啟用認證"),
-            (3, 610, 1299, "點「🚀 一鍵開啟 5G 代理」啟動服務"),
+            (1, 735, 777, "代理端口（預設 1080）"),
+            (2, 706, 956, "使用者/密碼留空 = 開放代理；兩欄都填才啟用認證"),
+            (3, 610, 1299, "點「🚀 一鍵開啟 5G 代理」"),
+            (4, 610, 2075, "新增「📈 流量」即時統計（上/下傳速率與總量）"),
         ],
         title="Server 端：5G Proxy Pro 啟動",
+    )
+
+    annotate(
+        os.path.join(S, "server_battery.png"),
+        os.path.join(S, "server_battery_annotated.png"),
+        [
+            (1, 609, 926, "小米/POCO 用戶的電池最佳化提醒"),
+            (2, 253, 1748, "「仍然繼續」= 不加白名單也照樣啟動"),
+            (3, 966, 1748, "「前往設定」= 關閉「5G 智慧省電」以穩定鎖定 5G"),
+        ],
+        title="Server 端：電池最佳化提醒",
+    )
+
+    annotate(
+        os.path.join(S, "server_notifperm.png"),
+        os.path.join(S, "server_notifperm_annotated.png"),
+        [
+            (1, 609, 1894, "Android 13+ 首次啟動會要求通知權限"),
+            (2, 609, 2164, "點「允許」前景服務通知才能顯示"),
+        ],
+        title="Server 端：通知權限",
     )
 
     annotate(
@@ -173,22 +191,45 @@ def main():
         os.path.join(S, "server_running_annotated.png"),
         [
             (1, 610, 593, "✅ 5G Proxy Running = 代理已運行"),
-            (2, 610, 1497, "記下「Wi-Fi 代理」的 IP:Port → 192.168.1.178:1080（Client 要輸入這個）"),
-            (3, 610, 1770, "「5G 行動 IP」= 49.215.85.39（驗證用：其他裝置出口 IP 應等於它）"),
-            (4, 610, 1293, "停止代理請按「🛑 停止代理服務」"),
+            (2, 610, 1624, "記下「Wi-Fi 代理」IP:Port → 192.168.1.178:1080"),
+            (3, 610, 1897, "「5G 行動 IP」= 出口 IP（其他裝置走代理後應等於它）"),
+            (4, 610, 2069, "即時流量統計（上/下傳速率與總量）"),
+            (5, 610, 1293, "「🛑 停止代理服務」關閉"),
         ],
         title="Server 端：運行中，取得 IP:Port",
+    )
+
+    annotate(
+        os.path.join(S, "server_notification.png"),
+        os.path.join(S, "server_notification_annotated.png"),
+        [
+            (1, 603, 977, "「已鎖定 5G - 監聽 Port 1080」= 已鎖定 5G 並監聽"),
+        ],
+        title="Server 端：前景服務通知",
+    )
+
+    # --- Client 端 ---
+
+    annotate(
+        os.path.join(S, "client_notifperm.png"),
+        os.path.join(S, "client_notifperm_annotated.png"),
+        [
+            (1, 360, 1195, "Android 13+ 首次啟動要求通知權限"),
+            (2, 360, 1284, "點「允許」"),
+        ],
+        title="Client 端：通知權限",
     )
 
     annotate(
         os.path.join(S, "client_filled.png"),
         os.path.join(S, "client_filled_annotated.png"),
         [
-            (1, 360, 335, "填 Server 的 IP：192.168.1.178"),
-            (2, 360, 402, "填 Server 的連接埠：1080"),
-            (3, 360, 610, "Server 端有設帳密才需要填（本教學兩端都留空）"),
-            (4, 360, 677, "建議勾選「UDP relay 走 TCP」（與 5G Proxy Pro 的 UDP-in-TCP 搭配，DNS/QUIC 更穩）"),
-            (5, 360, 748, "點「🚀 啟動隧道」開始"),
+            (1, 360, 299, "伺服器 IP：192.168.1.178"),
+            (2, 360, 366, "連接埠：1080"),
+            (3, 360, 707, "認證留空（開放代理）"),
+            (4, 360, 1321, "建議勾選「UDP relay 走 TCP」"),
+            (5, 360, 1385, "「Remote DNS」由伺服器端解析"),
+            (6, 360, 1181, "點「🚀 啟動隧道」"),
         ],
         title="Client 端：5G Proxy Client 設定",
     )
@@ -197,8 +238,8 @@ def main():
         os.path.join(S, "client_vpn.png"),
         os.path.join(S, "client_vpn_annotated.png"),
         [
-            (1, 360, 780, "第一次啟動會出現系統「連線要求」對話框"),
-            (2, 506, 1396, "點「確定」允許 VPN（拒絕則無法建立隧道）"),
+            (1, 360, 980, "首次啟動出現系統「連線要求」"),
+            (2, 506, 1396, "點「確定」允許 VPN"),
         ],
         title="Client 端：VPN 授權",
     )
@@ -207,29 +248,10 @@ def main():
         os.path.join(S, "client_running.png"),
         os.path.join(S, "client_running_annotated.png"),
         [
-            (1, 360, 968, "「✅ 隧道已啟用 (192.168.1.178:1080)」= 成功"),
-            (2, 360, 90, "狀態列出現鑰匙圖示（VPN 作用中）"),
-            (3, 360, 824, "「🛑 停止隧道」可隨時關閉"),
+            (1, 360, 1181, "按鈕變為「🛑 停止隧道」= 隧道已啟用"),
+            (2, 360, 1321, "執行中設定欄位鎖定"),
         ],
         title="Client 端：隧道已啟用",
-    )
-
-    annotate(
-        os.path.join(S, "client_notification.png"),
-        os.path.join(S, "client_notification_annotated.png"),
-        [
-            (1, 360, 420, "通知列常駐「5G Proxy Client / Tunnel active」前景服務通知"),
-        ],
-        title="Client 端：前景服務通知",
-    )
-
-    annotate(
-        os.path.join(S, "server_notification.png"),
-        os.path.join(S, "server_notification_annotated.png"),
-        [
-            (1, 610, 420, "通知顯示「Locked 5G - Listening Port 1080」：已鎖定 5G 並監聽"),
-        ],
-        title="Server 端：前景服務通知",
     )
 
 
