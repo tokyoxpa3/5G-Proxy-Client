@@ -33,6 +33,7 @@
 #include "ip_hash.h"
 #include "tcp_state.h"
 #include "udp_session.h"
+#include "udp_tcp.h"
 #include "reasm.h"
 
 #define LOG_TAG "TunSocks"
@@ -126,7 +127,7 @@ typedef struct udp_sess {
     unsigned char *tx_buf; size_t tx_len, tx_off, tx_cap;   // → server 的待送佇列
     int tx_armed;               // control_fd 已註冊 EPOLLOUT
     unsigned char *rx_buf; size_t rx_len, rx_off, rx_cap;   // ← server 的串流緩衝
-    int rx_want;                // -1 = 待讀 2-byte 長度欄；>=0 = 待讀 datagram 長度
+    udp_tcp_stream_t rx_stream;  // frame 串流解析狀態（純邏輯在 udp_tcp.c）
     atomic_int thread_done;     // handshake 線程結束標記（釋放前檢查）
     struct udp_sess *next;  // hash chain
 } udp_sess_t;
@@ -459,6 +460,11 @@ static int udp_tcp_flush(udp_sess_t *sess) {
     return 0;
 }
 
+// udp_tcp_consume 的 frame 回呼：把解析出的 payload 交給 handle_relay_udp。
+static void udp_tcp_on_frame(void *ctx, const unsigned char *payload, size_t payload_len) {
+    handle_relay_udp((udp_sess_t *)ctx, payload, (ssize_t)payload_len);
+}
+
 // 從 control_fd 讀入並解析 frames；回傳 <0 = 連線已死
 static int udp_tcp_read(udp_sess_t *sess) {
     // 1. 讀入可用位元組
@@ -475,22 +481,12 @@ static int udp_tcp_read(udp_sess_t *sess) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
         return -1;
     }
-    // 2. 解析 frames
-    for (;;) {
-        if (sess->rx_want < 0) {
-            if (sess->rx_len < 2) break;
-            int L = (sess->rx_buf[sess->rx_off] << 8) | sess->rx_buf[sess->rx_off + 1];
-            if (L < 4 || L > (int)sess->rx_cap) return -1;
-            sess->rx_off += 2;
-            sess->rx_len -= 2;
-            sess->rx_want = L;
-        }
-        if ((size_t)sess->rx_want > sess->rx_len) break;
-        handle_relay_udp(sess, sess->rx_buf + sess->rx_off, sess->rx_want);
-        sess->rx_off += sess->rx_want;
-        sess->rx_len -= sess->rx_want;
-        sess->rx_want = -1;
-    }
+    // 2. 解析 frames（純 length-prefixed 解析在 udp_tcp.c，golden/fuzz 覆蓋）
+    long consumed = udp_tcp_consume(&sess->rx_stream, sess->rx_buf + sess->rx_off,
+                                    sess->rx_len, sess->rx_cap, udp_tcp_on_frame, sess);
+    if (consumed < 0) return -1;
+    sess->rx_off += (size_t)consumed;
+    sess->rx_len -= (size_t)consumed;
     if (sess->rx_len == 0) sess->rx_off = 0;
     return 0;
 }
@@ -798,7 +794,7 @@ static void *udp_session_thread(void *arg) {
         sess->tx_buf = malloc(sess->tx_cap);
         sess->rx_cap = 8192;
         sess->rx_buf = malloc(sess->rx_cap);
-        sess->rx_want = -1;
+        udp_tcp_stream_init(&sess->rx_stream);
         if (!sess->tx_buf || !sess->rx_buf) goto fail;
     }
 

@@ -95,6 +95,9 @@ jobs:
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o icmp_packet_test \
             app/src/test/native/icmp_packet_test.c app/src/main/cpp/icmp_packet.c app/src/main/cpp/checksum.c
           ./icmp_packet_test
+          gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o udp_tcp_test \
+            app/src/test/native/udp_tcp_test.c app/src/main/cpp/udp_tcp.c
+          ./udp_tcp_test
 
       - name: Verify engine uses extracted modules (no parallel drift)
         run: |
@@ -110,7 +113,7 @@ jobs:
                      udp_should_buffer_first_pkt udp_is_idle \
                      fake_dns_alloc fake_dns_lookup fake_dns_lookup6 \
                      fake_dns_find_domain fake_dns_reset fake_dns_key \
-                     dns_tcp_scan_frames dns_tcp_frame_len; do
+                     dns_tcp_scan_frames dns_tcp_frame_len udp_tcp_consume udp_tcp_stream_init; do
             n=$(grep -c "\\b$sym\\b" app/src/main/cpp/tun_socks.c || true)
             if [ "$n" -eq 0 ]; then
               echo "ERROR: $sym 未在 tun_socks.c 中呼叫——抽離模組與引擎實作已分叉"
@@ -142,6 +145,7 @@ jobs:
             app/src/main/cpp/socks5_codec.c \
             app/src/main/cpp/icmp_packet.c \
             app/src/main/cpp/tcp_packet.c \
+            app/src/main/cpp/udp_tcp.c \
             app/src/main/cpp/checksum.c
           ./fuzz_parsers 200000
 
@@ -200,3 +204,8 @@ jobs:
             app/src/main/cpp/icmp_packet.c \
             app/src/main/cpp/checksum.c
           ./icmp_packet_test
+          gcc -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I app/src/main/cpp -o udp_tcp_test \
+            app/src/test/native/udp_tcp_test.c \
+            app/src/main/cpp/udp_tcp.c
+          ./udp_tcp_test

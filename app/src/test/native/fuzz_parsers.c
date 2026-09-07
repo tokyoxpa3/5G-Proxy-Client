@@ -22,6 +22,7 @@
 #include "icmp_packet.h"
 #include "tcp_packet.h"
 #include "checksum.h"
+#include "udp_tcp.h"
 
 // xorshift64*：deterministic、快速、足夠好的 fuzz PRNG
 static uint64_t rng_state = 0x9E3779B97F4A7C15ull;
@@ -151,6 +152,20 @@ static void fuzz_icmp(void) {
     (void)icmp6_build_na(in, in, out, rnd_range(OUT_CAP + 1));
 }
 
+static void fuzz_udp_tcp(void) {
+    udp_tcp_stream_t st;
+    fill_random();
+    udp_tcp_stream_init(&st);
+    // 單一批隨機輸入；cap 隨機（含小值以觸發長度欄越界檢查）
+    size_t cap = (size_t)rnd_range(MAX_IN) + 1;
+    (void)udp_tcp_consume(&st, in, rnd_range(MAX_IN + 1), cap, NULL, NULL);
+    // 多批拼接：模擬跨 recv 邊界（狀態跨呼叫保留）
+    udp_tcp_stream_init(&st);
+    for (int i = 0; i < 4; i++) {
+        (void)udp_tcp_consume(&st, in, rnd_range(MAX_IN + 1), 8192, NULL, NULL);
+    }
+}
+
 int main(int argc, char **argv) {
     unsigned long iters = 200000;
     if (argc > 1) iters = strtoul(argv[1], NULL, 10);
@@ -165,6 +180,7 @@ int main(int argc, char **argv) {
         fuzz_tcp();
         fuzz_checksum();
         fuzz_icmp();
+        fuzz_udp_tcp();
     }
     fprintf(stderr, "fuzz_parsers: PASS (%lu iterations)\n", iters);
     return 0;
