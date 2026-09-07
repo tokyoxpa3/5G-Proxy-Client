@@ -98,6 +98,9 @@ jobs:
           gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o udp_tcp_test \
             app/src/test/native/udp_tcp_test.c app/src/main/cpp/udp_tcp.c
           ./udp_tcp_test
+          gcc -std=c11 -Wall -Wextra -I app/src/main/cpp -o tcp_buf_test \
+            app/src/test/native/tcp_buf_test.c app/src/main/cpp/tcp_buf.c
+          ./tcp_buf_test
 
       - name: Verify engine uses extracted modules (no parallel drift)
         run: |
@@ -110,6 +113,9 @@ jobs:
                      reasm_insert_seg tcp_seq_gt tcp_win_field_pure tcp_parse_window_scale \
                      ip_hash_bucket tcp_isn_generate tcp_win_scaled tcp_flow_window_full \
                      tcp_srv_should_send_fin tcp_app_can_shutdown_write tcp_classify_in \
+                     tcp_is_idle tcp_post_fin_send_rst tcp_server_drained tcp_recv_full_should_close \
+                     tcp_buf_reserve_should_compact tcp_buf_reserve_fits tcp_buf_should_compact_half \
+                     tcp_buf_full tcp_buf_recv_want \
                      udp_should_buffer_first_pkt udp_is_idle \
                      fake_dns_alloc fake_dns_lookup fake_dns_lookup6 \
                      fake_dns_find_domain fake_dns_reset fake_dns_key \

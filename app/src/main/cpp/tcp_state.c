@@ -25,6 +25,18 @@ int tcp_is_idle(int state, time_t now, time_t last_active) {
     return state == 1 && now - last_active > TCP_IDLE_TIMEOUT_SEC;
 }
 
+int tcp_post_fin_send_rst(size_t payload_len) {
+    return payload_len != 0;
+}
+
+int tcp_server_drained(int srv_eof, size_t srv_len) {
+    return srv_eof && srv_len == 0;
+}
+
+int tcp_recv_full_should_close(size_t srv_len) {
+    return srv_len == 0;
+}
+
 tcp_in_class_t tcp_classify_in(uint8_t flags, uint32_t seq_host, uint32_t app_next,
                                size_t payload_len, int srv_fin_sent) {
     if ((flags & 0x02) && !(flags & 0x10)) return TCP_IN_SYN_ONLY;   // SYN && !ACK

@@ -47,6 +47,22 @@ int tcp_app_can_shutdown_write(int app_fin, size_t app_len);
 // state 由引擎以 atomic_load 載入後傳入；closed 判斷留給引擎。
 int tcp_is_idle(int state, time_t now, time_t last_active);
 
+// ---------- 收尾 / recv 路徑判定 ----------
+
+// POST-FIN 收尾：我方已送 FIN（srv_fin_sent）後又收到對端封包。
+// payload==0 → 正常收尾（回傳 0 = 不送 RST）；payload>0 → 半關後仍送資料，違反半關，
+// 回傳 1 = 應送 RST 關閉。
+int tcp_post_fin_send_rst(size_t payload_len);
+
+// server→App 是否已完全排空：server 已 EOF 且 srv_buf 已排空（srv_len==0）。
+// 是 App FIN 收尾關閉的條件二；亦為 tcp_srv_should_send_fin 的「已排空」子條件。
+int tcp_server_drained(int srv_eof, size_t srv_len);
+
+// recv 路徑滿緩衝處置：srv_buf 已滿（off+len >= cap）時。
+// srv_len==0 表示無待送資料卻仍滿（單筆封包塞爆、異常）→ 回傳 1 = 應關閉（送 RST）。
+// 否則回傳 0 = 應暫停讀取（回壓，待 flush 消化後重開）。
+int tcp_recv_full_should_close(size_t srv_len);
+
 // ---------- 進入封包分類（handle_tun_tcp 的狀態機 dispatch） ----------
 // 依序判定進入的 TCP 封包屬於哪種事件；分支順序與引擎 handle_tun_tcp 完全一致，
 // 影響 early-return 的優先序（SYN-only 先於 RST、RST 先於亂序、亂序先於 post-FIN、

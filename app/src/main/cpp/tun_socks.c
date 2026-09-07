@@ -32,6 +32,7 @@
 #include "ip_parse.h"
 #include "ip_hash.h"
 #include "tcp_state.h"
+#include "tcp_buf.h"
 #include "udp_session.h"
 #include "udp_tcp.h"
 #include "reasm.h"
@@ -1168,8 +1169,8 @@ static void flush_tcp_srv_buf(tcp_sess_t *sess) {
         sess->srv_len -= chunk;
         if (sess->srv_len == 0) sess->srv_off = 0;
     }
-    // 已送出超過一半前綴 → 搬移回收空間（分攤成本，避免逐 segment memmove）
-    if (sess->srv_off >= TCP_SRV_BUF_CAP / 2) {
+// 已送出超過一半前綴 → 搬移回收空間（分攤成本，避免逐 segment memmove）
+    if (tcp_buf_should_compact_half(sess->srv_off, TCP_SRV_BUF_CAP)) {
         memmove(sess->srv_buf, sess->srv_buf + sess->srv_off, sess->srv_len);
         sess->srv_off = 0;
     }
@@ -1213,11 +1214,11 @@ static void flush_tcp_app_buf(tcp_sess_t *sess) {
 static unsigned char *app_buf_reserve(tcp_sess_t *sess, size_t need) {
     if (sess->app_buf == NULL) sess->app_buf = malloc(TCP_APP_BUF_CAP);
     if (!sess->app_buf) return NULL;
-    if (sess->app_off > 0 && sess->app_len > 0) {
+    if (tcp_buf_reserve_should_compact(sess->app_off, sess->app_len)) {
         memmove(sess->app_buf, sess->app_buf + sess->app_off, sess->app_len);
         sess->app_off = 0;
     }
-    if (sess->app_off + sess->app_len + need > TCP_APP_BUF_CAP) return NULL;
+    if (!tcp_buf_reserve_fits(sess->app_off, sess->app_len, TCP_APP_BUF_CAP, need)) return NULL;
     return sess->app_buf + sess->app_off + sess->app_len;
 }
 
@@ -1500,8 +1501,7 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
         return;
     }
     case TCP_IN_POST_FIN: {                                // 我方已送 FIN
-        if (payload_len == 0) close_tcp_session(sess, 0);
-        else close_tcp_session(sess, 1);
+        close_tcp_session(sess, tcp_post_fin_send_rst(payload_len));
         return;
     }
     case TCP_IN_PURE_ACK: {                                // 純 ACK（FIN 需先送進 FIN 分支處理）
@@ -1559,7 +1559,7 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
             int sfd = atomic_load(&sess->srv_fd);
             if (sfd >= 0) shutdown(sfd, SHUT_WR);
         }
-        if (sess->srv_eof && sess->srv_len == 0) close_tcp_session(sess, 0);
+        if (tcp_server_drained(sess->srv_eof, sess->srv_len)) close_tcp_session(sess, 0);
     }
 
     if (sess->srv_len > 0) {                               // App ACK/開窗 → 續送
@@ -1585,19 +1585,18 @@ static void handle_tcp_event(tcp_sess_t *sess, uint32_t ev, time_t now) {
             if (sess->srv_buf == NULL) sess->srv_buf = malloc(TCP_SRV_BUF_CAP);
             if (!sess->srv_buf) { close_tcp_session(sess, 1); return; }
             // 前綴已送出超過一半 → 搬移回收空間（分攤成本）
-            if (sess->srv_off >= TCP_SRV_BUF_CAP / 2) {
+            if (tcp_buf_should_compact_half(sess->srv_off, TCP_SRV_BUF_CAP)) {
                 memmove(sess->srv_buf, sess->srv_buf + sess->srv_off, sess->srv_len);
                 sess->srv_off = 0;
             }
             size_t used = sess->srv_off + sess->srv_len;
-            if (used >= TCP_SRV_BUF_CAP) {
+            if (tcp_buf_full(sess->srv_off, sess->srv_len, TCP_SRV_BUF_CAP)) {
                 // 緩衝滿：暫停讀取，等 App 消化後（flush 內）再續，靠 relay TCP 回壓
-                if (sess->srv_len == 0) { close_tcp_session(sess, 1); return; }
+                if (tcp_recv_full_should_close(sess->srv_len)) { close_tcp_session(sess, 1); return; }
                 set_srv_in(sess, 0);
                 break;
             }
-            size_t want = TCP_SRV_BUF_CAP - used;
-            if (want > TCP_READ_CHUNK) want = TCP_READ_CHUNK;
+            size_t want = tcp_buf_recv_want(sess->srv_off, sess->srv_len, TCP_SRV_BUF_CAP, TCP_READ_CHUNK);
             ssize_t r = recv(sfd, sess->srv_buf + used, want, 0);
             if (r > 0) {
                 atomic_fetch_add(&g.bytes_from_server, (unsigned long long)r);

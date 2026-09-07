@@ -143,6 +143,37 @@ int main(void) {
         CHECK("classify_in 隨機對照舊 if 鏈 200k", ok);
     }
 
+    // ---------- 收尾 / recv 路徑判定 ----------
+    // POST-FIN 收尾：payload==0 → 不送 RST；payload>0 → 送 RST
+    CHECK("post-fin payload0 no-rst", tcp_post_fin_send_rst(0) == 0);
+    CHECK("post-fin payload>0 rst", tcp_post_fin_send_rst(1) == 1);
+    CHECK("post-fin payload large rst", tcp_post_fin_send_rst(4096) == 1);
+
+    // server→App 已排空：srv_eof && srv_len==0
+    CHECK("drained eof+0 -> 1", tcp_server_drained(1, 0) == 1);
+    CHECK("drained no eof -> 0", tcp_server_drained(0, 0) == 0);
+    CHECK("drained pending -> 0", tcp_server_drained(1, 100) == 0);
+    CHECK("drained neither -> 0", tcp_server_drained(0, 100) == 0);
+
+    // recv 滿緩衝：srv_len==0 → 關閉（送 RST）；否則暫停讀取（回壓）
+    CHECK("recv-full len0 close", tcp_recv_full_should_close(0) == 1);
+    CHECK("recv-full len>0 pause", tcp_recv_full_should_close(1) == 0);
+    CHECK("recv-full len large pause", tcp_recv_full_should_close(1048576) == 0);
+
+    // ---------- 差分：收尾/recv 判定隨機對照內聯公式 ----------
+    {
+        int ok = 1;
+        for (int i = 0; i < 200000 && ok; i++) {
+            size_t plen = xs_rand();
+            int eof = (int)(xs_rand() & 1);
+            size_t slen = xs_rand() % 1000000;
+            if (tcp_post_fin_send_rst(plen) != (plen != 0 ? 1 : 0)) ok = 0;
+            if (tcp_server_drained(eof, slen) != ((eof && slen == 0) ? 1 : 0)) ok = 0;
+            if (tcp_recv_full_should_close(slen) != (slen == 0 ? 1 : 0)) ok = 0;
+        }
+        CHECK("收尾/recv 判定隨機對照內聯公式 200k", ok);
+    }
+
     printf(g_fail ? "\nRESULT: FAIL\n" : "\nRESULT: PASS\n");
     return g_fail;
 }
