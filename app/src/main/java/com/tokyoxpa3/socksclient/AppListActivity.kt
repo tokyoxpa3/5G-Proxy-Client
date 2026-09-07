@@ -92,10 +92,12 @@ class AppListActivity : Activity() {
         root.addView(empty)
 
         fun applyFilter(q: String) {
-            val base = if (showSystem) allApps else allApps.filterNot { it.system }
-            val filtered = if (q.isBlank()) base else
-                base.filter { it.label.contains(q, ignoreCase = true) || it.pkg.contains(q, ignoreCase = true) }
-            adapter.replaceAll(filtered)
+            val filtered = AppListFilter.filter(
+                allApps.map { AppListFilter.Entry(it.pkg, it.label, it.system) },
+                q, showSystem
+            )
+            val keep = filtered.map { it.pkg }.toSet()
+            adapter.replaceAll(allApps.filter { it.pkg in keep })
             empty.visibility = if (filtered.isEmpty()) View.VISIBLE else View.GONE
             list.visibility = if (filtered.isEmpty()) View.GONE else View.VISIBLE
         }

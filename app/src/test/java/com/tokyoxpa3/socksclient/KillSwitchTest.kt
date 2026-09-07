@@ -39,4 +39,20 @@ class KillSwitchTest {
     fun ownAppWithLockdown_isLockdown() {
         assertEquals(KillSwitchStatus.LOCKDOWN, KillSwitch.status(ourPackage, ourPackage, true))
     }
+
+    @Test
+    fun serviceFlagsLockdown_wins() {
+        assertEquals(KillSwitchStatus.LOCKDOWN, KillSwitch.statusFromServiceFlags(true, true))
+        assertEquals(KillSwitchStatus.LOCKDOWN, KillSwitch.statusFromServiceFlags(true, false))
+    }
+
+    @Test
+    fun serviceFlagsAlwaysOn() {
+        assertEquals(KillSwitchStatus.ALWAYS_ON, KillSwitch.statusFromServiceFlags(false, true))
+    }
+
+    @Test
+    fun serviceFlagsNone() {
+        assertEquals(KillSwitchStatus.NONE, KillSwitch.statusFromServiceFlags(false, false))
+    }
 }

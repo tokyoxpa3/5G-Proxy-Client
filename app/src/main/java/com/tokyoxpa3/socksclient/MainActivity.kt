@@ -317,17 +317,18 @@ class MainActivity : Activity() {
         try {
             val host = etHost.text.toString().trim()
             val port = etPort.text.toString().trim().toIntOrNull()
-            if (host.isEmpty() || port == null || port !in 1..65535) {
+            // 保留 port == null 判斷以觸發智慧轉型；isServerValid 為分離函式，無法 smart-cast port 為非空
+            if (port == null || !ConfigValidator.isServerValid(host, port)) {
                 Toast.makeText(this, getString(R.string.toast_invalid_input), Toast.LENGTH_SHORT).show()
                 return
             }
             val dns1 = etDns1.text.toString().trim()
             val dns2 = etDns2.text.toString().trim()
-            if (dns1.isNotBlank() && !isValidIp(dns1)) {
+            if (!ConfigValidator.isDnsValid(dns1)) {
                 Toast.makeText(this, getString(R.string.err_invalid_dns, dns1), Toast.LENGTH_LONG).show()
                 return
             }
-            if (dns2.isNotBlank() && !isValidIp(dns2)) {
+            if (!ConfigValidator.isDnsValid(dns2)) {
                 Toast.makeText(this, getString(R.string.err_invalid_dns, dns2), Toast.LENGTH_LONG).show()
                 return
             }
@@ -538,9 +539,6 @@ class MainActivity : Activity() {
         spinnerProfile.setSelection(0)
     }
 
-    // 僅接受數字 IP：InetAddress.getByName 會對 hostname 發 DNS 查詢（主執行緒網路操作）
-    private fun isValidIp(s: String): Boolean = Config.isLiteralIp(s)
-
     private fun prefs() = Config.prefs(this)
 
     // 讀取系統 Always-on VPN / 封鎖無 VPN 設定，顯示斷線保護三態。
@@ -549,10 +547,10 @@ class MainActivity : Activity() {
     // 公開 API（isAlwaysOn / isLockdownEnabled）快取的值，未執行時才退回讀系統設定。
     private fun refreshKillSwitch() {
         val statusRes = if (TunSocksService.isRunning) {
-            when {
-                TunSocksService.lastLockdown -> R.string.ks_status_locked
-                TunSocksService.lastAlwaysOn -> R.string.ks_status_always_on
-                else -> R.string.ks_status_none
+            when (KillSwitch.statusFromServiceFlags(TunSocksService.lastLockdown, TunSocksService.lastAlwaysOn)) {
+                KillSwitchStatus.NONE -> R.string.ks_status_none
+                KillSwitchStatus.ALWAYS_ON -> R.string.ks_status_always_on
+                KillSwitchStatus.LOCKDOWN -> R.string.ks_status_locked
             }
         } else {
             try {

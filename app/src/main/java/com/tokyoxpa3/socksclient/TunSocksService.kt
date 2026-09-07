@@ -91,9 +91,14 @@ class TunSocksService : VpnService() {
     private val backgroundStartRetry = object : Runnable {
         override fun run() { startTunnel(null) }
     }
-    private var backgroundRetryCount = 0
     private var bootContext = false
-    private var flashLaunched = false
+
+    // 背景啟動重試狀態機（純邏輯，可獨立測試）；副作用留在 backgroundFail 執行
+    private val backgroundRetry = BackgroundStartRetry(
+        maxRetries = MAX_BACKGROUND_RETRIES,
+        flashAfterRetries = BOOT_FLASH_AFTER_RETRIES,
+        retryDelayMs = BACKGROUND_RETRY_DELAY_MS
+    )
 
     // 啟動進行中標記：DNS 解析移到背景執行緒後，防止「解析期間按下停止／重啟」
     // 後舊的啟動流程又回頭完成 VPN 建立（stop/restart 會清除此旗標使流程失效）
@@ -168,12 +173,11 @@ class TunSocksService : VpnService() {
         if (lastAlwaysOn || lastLockdown) {
             Log.w(TAG, "Kill switch active — auto-recovering tunnel")
             bootContext = true
-            flashLaunched = false
-            backgroundRetryCount = 0
+            backgroundRetry.reset()
             restartTunnel()
             return
         }
-        backgroundRetryCount = 0
+        backgroundRetry.reset()
         stopTunnel()
     }
 
@@ -206,7 +210,7 @@ class TunSocksService : VpnService() {
             remoteDns = prefs.getBoolean(Config.KEY_REMOTE_DNS, Config.DEFAULT_REMOTE_DNS)
             Log.i(TAG, "Using saved config: host=$host port=$port")
         }
-        if (host.isEmpty() || port <= 0 || port > 65535) {
+        if (!ConfigValidator.isServerValid(host, port)) {
             fail(getString(R.string.err_bad_params))
             return
         }
@@ -346,7 +350,7 @@ class TunSocksService : VpnService() {
             // isAlwaysOn / isLockdownEnabled 為 API 29+，minSdk 26 需防護
             lastAlwaysOn = Build.VERSION.SDK_INT >= 29 && isAlwaysOn
             lastLockdown = Build.VERSION.SDK_INT >= 29 && isLockdownEnabled
-            backgroundRetryCount = 0
+            backgroundRetry.reset()
             val wasAutoRestart = synchronized(serverEventLock) {
                 val w = autoRestartInProgress
                 autoRestartInProgress = false
@@ -438,19 +442,18 @@ class TunSocksService : VpnService() {
     }
 
     private fun backgroundFail(msg: String) {
-        if (backgroundRetryCount >= MAX_BACKGROUND_RETRIES) {
-            Log.e(TAG, "Background start retries exhausted: $msg")
-            fail(getString(R.string.err_start_retry_exhausted))
-            return
+        when (val d = backgroundRetry.onStartFailure(bootContext)) {
+            is BackgroundStartRetry.Decision.Fail -> {
+                Log.e(TAG, "Background start retries exhausted: $msg")
+                fail(getString(R.string.err_start_retry_exhausted))
+            }
+            is BackgroundStartRetry.Decision.Retry -> {
+                Log.i(TAG, "Background start failed ($msg), retry ${d.retryCount}/$MAX_BACKGROUND_RETRIES")
+                publishStatus(getString(R.string.status_start_retrying, d.retryCount))
+                if (d.launchFlash) launchAutoStartActivity()
+                mainHandler.postDelayed(backgroundStartRetry, d.delayMs)
+            }
         }
-        backgroundRetryCount++
-        Log.i(TAG, "Background start failed ($msg), retry $backgroundRetryCount/$MAX_BACKGROUND_RETRIES")
-        publishStatus(getString(R.string.status_start_retrying, backgroundRetryCount))
-        if (bootContext && !flashLaunched && backgroundRetryCount >= BOOT_FLASH_AFTER_RETRIES) {
-            flashLaunched = true
-            launchAutoStartActivity()
-        }
-        mainHandler.postDelayed(backgroundStartRetry, BACKGROUND_RETRY_DELAY_MS)
     }
 
     /**
@@ -498,9 +501,8 @@ class TunSocksService : VpnService() {
 
     private fun stopTunnel() {
         mainHandler.removeCallbacks(backgroundStartRetry)
-        backgroundRetryCount = 0
+        backgroundRetry.reset()
         bootContext = false
-        flashLaunched = false
         startPending = false   // 使仍在途中的啟動流程（背景 DNS 解析）失效
         // 使用者明確停止：自動重連退避一併歸零
         autoRestartInProgress = false

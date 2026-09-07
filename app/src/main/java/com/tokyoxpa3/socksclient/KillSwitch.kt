@@ -31,4 +31,15 @@ object KillSwitch {
         if (alwaysOnVpnApp != ourPackage) return KillSwitchStatus.NONE
         return if (lockdownEnabled) KillSwitchStatus.LOCKDOWN else KillSwitchStatus.ALWAYS_ON
     }
+
+    /**
+     * 隧道執行中：由服務端 VpnService 公開 API（isAlwaysOn / isLockdownEnabled）
+     * 快取的布林對映射三態（替代讀取 @hide 的 Settings.Secure 鍵，Android 12+ 會拋 SecurityException）。
+     */
+    fun statusFromServiceFlags(lastLockdown: Boolean, lastAlwaysOn: Boolean): KillSwitchStatus =
+        when {
+            lastLockdown -> KillSwitchStatus.LOCKDOWN
+            lastAlwaysOn -> KillSwitchStatus.ALWAYS_ON
+            else -> KillSwitchStatus.NONE
+        }
 }
