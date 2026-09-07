@@ -138,6 +138,7 @@ class TunSocksService : VpnService() {
                 try {
                     socket.close()
                 } catch (e: Exception) {
+                    Log.w(TAG, "close socket failed: ${e.message}")
                 }
             }
         }
@@ -432,7 +433,7 @@ class TunSocksService : VpnService() {
     private fun fail(msg: String) {
         DebugLog.recordError(msg)
         publishStatus(msg)
-        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (e: Exception) {}
+        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (e: Exception) { Log.w(TAG, "stopForeground failed: ${e.message}") }
         stopSelf()
     }
 
@@ -511,7 +512,7 @@ class TunSocksService : VpnService() {
         serviceScope.launch {
             stopEngineSync()
             publishStatus(getString(R.string.status_stopped))
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (e: Exception) {}
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (e: Exception) { Log.w(TAG, "stopForeground failed: ${e.message}") }
             stopSelf()
         }
     }
@@ -561,7 +562,7 @@ class TunSocksService : VpnService() {
             Log.w(TAG, "queryDns($server, $hostname) failed: ${e.message}")
             null
         } finally {
-            try { ds.close() } catch (e: Exception) { }
+            try { ds.close() } catch (e: Exception) { Log.w(TAG, "close DNS socket failed: ${e.message}") }
         }
     }
 
@@ -596,14 +597,14 @@ class TunSocksService : VpnService() {
         // 防禦性關閉可能殘留的 protected socket（正常情況引擎已 release 完畢）
         activeSockets.values.forEach {
             if (it is AutoCloseable) {
-                try { it.close() } catch (e: Exception) { }
+                try { it.close() } catch (e: Exception) { Log.w(TAG, "close socket failed: ${e.message}") }
             }
         }
         activeSockets.clear()
         statsJob?.cancel()
         statsJob = null
         publishStatus(getString(R.string.status_stopped))
-        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (e: Exception) {}
+        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (e: Exception) { Log.w(TAG, "stopForeground failed: ${e.message}") }
         stopSelf()
     }
 
@@ -622,6 +623,7 @@ class TunSocksService : VpnService() {
                 try {
                     it.close()
                 } catch (e: Exception) {
+                    Log.w(TAG, "close socket failed: ${e.message}")
                 }
             }
         }
