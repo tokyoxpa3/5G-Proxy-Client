@@ -2,6 +2,7 @@
 // 模擬：in-process 假 SOCKS5 伺服器 + socketpair 模擬 TUN fd
 // 目標：驗證 TCP 三向交握與 UDP relay 端到端（為 tun_socks_start/stop 的最高 ROI 投資）
 // 本 harness 為 host 可編譯的純 C 版本，展示整合測試架構；真機可連結 tun_socks.c 並以相同 fake server + socketpair 驅動
+#define _DEFAULT_SOURCE 1 // 使 usleep 於 -std=c11 嚴格模式下仍被 <unistd.h> 宣告（GCC 14 會將 implicit decl 視為錯誤）
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
