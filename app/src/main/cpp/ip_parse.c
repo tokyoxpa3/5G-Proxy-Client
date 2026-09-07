@@ -11,6 +11,10 @@ static inline uint32_t ip_ntohl(uint32_t x) {
 #define ntohl ip_ntohl
 #endif
 
+int ip_addr_eq(const ip_addr_t *a, const ip_addr_t *b) {
+    return a->family == b->family && memcmp(a->ip, b->ip, 16) == 0;
+}
+
 int parse_ipv4(const unsigned char *pkt, size_t len, uint8_t *proto, ip_addr_t *saddr, ip_addr_t *daddr, int *ihl) {
     if (len < 20) return -1;
     if ((pkt[0] >> 4) != 4) return -1;

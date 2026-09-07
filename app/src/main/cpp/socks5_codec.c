@@ -112,6 +112,24 @@ int socks5_build_auth(const char *user, const char *pass, unsigned char *out, si
     return (int)(3 + ul + pl);
 }
 
+s5_greet_class_t socks5_classify_greet_reply(const unsigned char reply[2]) {
+    if (reply[0] != 0x05) return S5_ERR_NOT_SOCKS5;
+    if (reply[1] == 0x00) return S5_GREET_NO_AUTH;
+    if (reply[1] == 0x02) return S5_GREET_NEED_AUTH;
+    return S5_ERR_NO_METHOD;
+}
+
+int socks5_auth_reply_ok(const unsigned char reply[2]) {
+    return reply[0] == 0x01 && reply[1] == 0x00;
+}
+
+int socks5_atyp_bnd_len(uint8_t atyp) {
+    if (atyp == 0x01) return 6;
+    if (atyp == 0x04) return 18;
+    if (atyp == 0x03) return -2;
+    return -1;
+}
+
 int socks5_parse_udp_datagram(const unsigned char *dg, size_t dlen,
                               unsigned char *src_ip_out, int *family_out,
                               uint16_t *src_port_n,

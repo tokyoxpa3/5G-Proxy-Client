@@ -114,6 +114,9 @@ static void fuzz_socks5(void) {
     (void)socks5_build_auth((const char *)in, (const char *)in, out, sizeof out);
     (void)socks5_parse_udp_datagram(in, rnd_range(MAX_IN + 1),
                                     src, &fam, &port, domain, sizeof domain, &pld, &plen);
+    (void)socks5_classify_greet_reply(in);
+    (void)socks5_auth_reply_ok(in);
+    (void)socks5_atyp_bnd_len((uint8_t)rng_next());
 }
 
 static void fuzz_tcp(void) {

@@ -98,7 +98,9 @@ SYMBOLS := socks5_build_connect_request socks5_build_udp_frame \
            udp_should_buffer_first_pkt udp_is_idle \
            fake_dns_alloc fake_dns_lookup fake_dns_lookup6 \
            fake_dns_find_domain fake_dns_reset fake_dns_key \
-           dns_tcp_scan_frames dns_tcp_frame_len udp_tcp_consume udp_tcp_stream_init
+           dns_tcp_scan_frames dns_tcp_frame_len udp_tcp_consume udp_tcp_stream_init \
+           socks5_classify_greet_reply socks5_auth_reply_ok socks5_atyp_bnd_len \
+           ip_addr_eq
 
 check-symbols:
 	@fail=0; for sym in $(SYMBOLS); do n=$$(grep -c "\b$$sym\b" $(MAIN)/tun_socks.c || true); if [ "$$n" -eq 0 ]; then echo "ERROR: $$sym 未在 tun_socks.c 中呼叫——抽離模組與引擎實作已分叉"; fail=1; fi; done; if [ "$$fail" -ne 0 ]; then exit 1; fi; echo "所有抽離模組均已接回引擎"

@@ -20,6 +20,9 @@ typedef struct {
     unsigned char ip[16];   // 網路序位址（v4 存前 4 bytes）
 } ip_addr_t;
 
+// 位址相等比較：family 相同且 16-byte ip 全等（v4 僅前 4 bytes 有意義、其餘為 0）。純判斷。
+int ip_addr_eq(const ip_addr_t *a, const ip_addr_t *b);
+
 // 解析 IPv4 頭：回傳 0 成功 / -1 失敗；輸出 proto、來源/目的位址、ihl（位元組）
 int parse_ipv4(const unsigned char *pkt, size_t len, uint8_t *proto,
                ip_addr_t *saddr, ip_addr_t *daddr, int *ihl);

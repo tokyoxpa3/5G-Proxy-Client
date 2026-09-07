@@ -55,10 +55,6 @@ static atomic_int g_reset_requested = 0;
 // ---------- 位址抽象（v4 / v6 共用 session 結構） ----------
 // ip_addr_t 定義移至 ip_parse.h（純解析模組共用）
 
-static int ip_addr_eq(const ip_addr_t *a, const ip_addr_t *b) {
-    return a->family == b->family && memcmp(a->ip, b->ip, 16) == 0;
-}
-
 static void ip_to_str(const ip_addr_t *a, char *out, size_t n) {
     if (a->family == AF_INET6) inet_ntop(AF_INET6, a->ip, out, n);
     else inet_ntop(AF_INET, a->ip, out, n);
@@ -682,15 +678,15 @@ static int socks5_greet_auth(int fd,
     int n = socks5_build_hello(g.auth_user, g.auth_pass, buf, cap);
     if (n < 0 || send_fn(fd, buf, (size_t)n) < 0) return SE_EVENT_NETWORK_FAIL;
     if (recv_fn(fd, buf, 2) < 0) return SE_EVENT_NETWORK_FAIL;
-    if (buf[0] != 0x05) return SE_EVENT_PROTOCOL_FAIL;   // 對方不是 SOCKS5
-    if (buf[1] == 0x02) {
+    s5_greet_class_t cls = socks5_classify_greet_reply(buf);
+    if (cls == S5_ERR_NOT_SOCKS5) return SE_EVENT_PROTOCOL_FAIL;   // 對方不是 SOCKS5
+    if (cls == S5_ERR_NO_METHOD) return SE_EVENT_AUTH_FAIL;        // 伺服器拒絕認證方式
+    if (cls == S5_GREET_NEED_AUTH) {
         // RFC 1929 認證
         n = socks5_build_auth(g.auth_user, g.auth_pass, buf, cap);
         if (n < 0 || send_fn(fd, buf, (size_t)n) < 0) return SE_EVENT_NETWORK_FAIL;
         if (recv_fn(fd, buf, 2) < 0) return SE_EVENT_NETWORK_FAIL;
-        if (buf[0] != 0x01 || buf[1] != 0x00) return SE_EVENT_AUTH_FAIL;   // 認證被拒
-    } else if (buf[1] != 0x00) {
-        return SE_EVENT_AUTH_FAIL;   // 伺服器拒絕認證方式
+        if (!socks5_auth_reply_ok(buf)) return SE_EVENT_AUTH_FAIL;   // 認證被拒
     }
     return 0;   // 握手成功
 }
@@ -737,14 +733,12 @@ static void *udp_session_thread(void *arg) {
         if (buf[1] == 0x00) {
             // 伺服器支援：relay 就是這條 TCP 連線，吃掉 BND.ADDR/PORT 即可
             int atyp_r = buf[3];
-            if (atyp_r == 0x01) {
-                if (recv_all(cfd, buf, 6) < 0) goto fail;
-            } else if (atyp_r == 0x04) {
-                if (recv_all(cfd, buf, 18) < 0) goto fail;
-            } else {
+            int bnd_len = socks5_atyp_bnd_len(atyp_r);
+            if (bnd_len < 0) {   // 0x03 變長或未知 ATYP：UDP-in-TCP 不支援網域 relay
                 fail_code = SE_EVENT_PROTOCOL_FAIL;
                 goto fail;
             }
+            if (recv_all(cfd, buf, bnd_len) < 0) goto fail;
             udp_tcp = 1;
         } else {
             // 伺服器不支援 0x04：同一連線退回標準 UDP ASSOCIATE（0x03）
@@ -762,25 +756,26 @@ static void *udp_session_thread(void *arg) {
 
     if (!udp_tcp) {
         int atyp = buf[3];
+        int bnd_len = socks5_atyp_bnd_len(atyp);
+        if (bnd_len < 0) {
+            // 不支援其他 ATYP（0x03 網域 relay 位址極少見，且此處無法解析）
+            LOGE("UDP ASSOCIATE 回覆 ATYP=%d 不支援", atyp);
+            fail_code = SE_EVENT_PROTOCOL_FAIL;
+            goto fail;
+        }
+        if (recv_all(cfd, buf, bnd_len) < 0) goto fail;
         if (atyp == 0x01) {
-            if (recv_all(cfd, buf, 6) < 0) goto fail;
             struct sockaddr_in *r4 = (struct sockaddr_in *)&relay;
             r4->sin_family = AF_INET;
             memcpy(&r4->sin_addr, buf, 4);
             memcpy(&r4->sin_port, buf + 4, 2);
             relay_len = sizeof(struct sockaddr_in);
-        } else if (atyp == 0x04) {
-            if (recv_all(cfd, buf, 18) < 0) goto fail;
+        } else {   // atyp == 0x04
             struct sockaddr_in6 *r6 = (struct sockaddr_in6 *)&relay;
             r6->sin6_family = AF_INET6;
             memcpy(&r6->sin6_addr, buf, 16);
             memcpy(&r6->sin6_port, buf + 16, 2);
             relay_len = sizeof(struct sockaddr_in6);
-        } else {
-            // 不支援其他 ATYP（0x03 網域 relay 位址極少見，且此處無法解析）
-            LOGE("UDP ASSOCIATE 回覆 ATYP=%d 不支援", atyp);
-            fail_code = SE_EVENT_PROTOCOL_FAIL;
-            goto fail;
         }
 
         // 4. UDP relay socket（Java protect，未 connect，由 sendto 指定目標）
@@ -1282,16 +1277,16 @@ static void *tcp_connect_thread(void *arg) {
     if (net_recv_all(sfd, buf, 4) < 0) goto fail;
     if (buf[0] != 0x05 || buf[1] != 0x00) { fail_code = SE_EVENT_PROTOCOL_FAIL; goto fail; }   // REP≠0：伺服器端結果，非網路斷線
     int atyp = buf[3];
-    if (atyp == 0x01) {
-        if (net_recv_all(sfd, buf, 6) < 0) goto fail;
-    } else if (atyp == 0x03) {
+    int bnd_len = socks5_atyp_bnd_len(atyp);
+    if (bnd_len == -2) {
+        // 0x03 變長網域：先讀 1-byte 長度，再讀 len+2
         unsigned char al;
         if (net_recv_all(sfd, buf, 1) < 0) goto fail;
         al = buf[0];
         if (net_recv_all(sfd, buf, al + 2) < 0) goto fail;
-    } else if (atyp == 0x04) {
-        if (net_recv_all(sfd, buf, 18) < 0) goto fail;
-    } else {
+    } else if (bnd_len > 0) {
+        if (net_recv_all(sfd, buf, bnd_len) < 0) goto fail;
+    } else {   // -1：未知 ATYP
         fail_code = SE_EVENT_PROTOCOL_FAIL;
         goto fail;
     }

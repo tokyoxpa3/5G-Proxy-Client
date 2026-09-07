@@ -135,6 +135,30 @@ int main(void){
         int rc=socks5_parse_udp_datagram(dg,n,NULL,&fam,&rport,dom,sizeof dom,&pl,&pln);
         CHECK("parse domain fam==-1", rc==0 && fam==-1 && strcmp(dom,"example.com")==0 && rport==port && pln==1 && pl[0]=='x');
     }
+    // 14. greet 回覆分類
+    {
+        unsigned char r[2];
+        r[0]=0x05; r[1]=0x00; CHECK("greet no-auth", socks5_classify_greet_reply(r)==S5_GREET_NO_AUTH);
+        r[0]=0x05; r[1]=0x02; CHECK("greet need-auth", socks5_classify_greet_reply(r)==S5_GREET_NEED_AUTH);
+        r[0]=0x04; r[1]=0x00; CHECK("greet not-socks5", socks5_classify_greet_reply(r)==S5_ERR_NOT_SOCKS5);
+        r[0]=0x05; r[1]=0xff; CHECK("greet no-method", socks5_classify_greet_reply(r)==S5_ERR_NO_METHOD);
+        r[0]=0x05; r[1]=0x03; CHECK("greet no-method (0x03)", socks5_classify_greet_reply(r)==S5_ERR_NO_METHOD);
+    }
+    // 15. RFC1929 auth 回覆
+    {
+        unsigned char r[2];
+        r[0]=0x01; r[1]=0x00; CHECK("auth ok", socks5_auth_reply_ok(r)==1);
+        r[0]=0x01; r[1]=0x01; CHECK("auth rejected", socks5_auth_reply_ok(r)==0);
+        r[0]=0x05; r[1]=0x00; CHECK("auth bad-version", socks5_auth_reply_ok(r)==0);
+    }
+    // 16. ATYP -> BND.ADDR 長度
+    {
+        CHECK("atyp 0x01=6", socks5_atyp_bnd_len(0x01)==6);
+        CHECK("atyp 0x04=18", socks5_atyp_bnd_len(0x04)==18);
+        CHECK("atyp 0x03=-2", socks5_atyp_bnd_len(0x03)==-2);
+        CHECK("atyp 0x00=-1", socks5_atyp_bnd_len(0x00)==-1);
+        CHECK("atyp 0xff=-1", socks5_atyp_bnd_len(0xff)==-1);
+    }
 
     printf(g_fail?"\nRESULT: FAIL\n":"\nRESULT: PASS\n");
     return g_fail;
