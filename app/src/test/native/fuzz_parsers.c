@@ -16,6 +16,7 @@
 #include "ip_parse.h"
 #include "reasm.h"
 #include "dns_synth.h"
+#include "dns_tcp.h"
 #include "socks5_codec.h"
 #include "tcp_packet.h"
 #include "checksum.h"
@@ -87,6 +88,13 @@ static void fuzz_dns(void) {
                                (uint32_t)rng_next(), fake6, (int)rnd_range(2), dnsout, &rlen);
 }
 
+static void fuzz_dns_tcp(void) {
+    fill_random();
+    (void)dns_tcp_scan_frames(in, rnd_range(MAX_IN + 1));
+    // 直接以安全偏移呼叫 frame_len（in 至少 2 位元組餘量，涵蓋長度讀取本身）
+    (void)dns_tcp_frame_len(in + rnd_range(MAX_IN - 1));
+}
+
 static void fuzz_socks5(void) {
     unsigned char src[16]; int fam; uint16_t port; char domain[256];
     const unsigned char *pld; size_t plen;
@@ -139,6 +147,7 @@ int main(int argc, char **argv) {
         fuzz_parse();
         fuzz_reasm();
         fuzz_dns();
+        fuzz_dns_tcp();
         fuzz_socks5();
         fuzz_tcp();
         fuzz_checksum();

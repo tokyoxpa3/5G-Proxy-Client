@@ -26,6 +26,7 @@
 #include "tcp_packet.h"
 #include "dns_synth.h"
 #include "fake_dns.h"
+#include "dns_tcp.h"
 #include "ip_parse.h"
 #include "ip_hash.h"
 #include "tcp_state.h"
@@ -1415,16 +1416,16 @@ static void dns_tcp_ingest(tcp_sess_t *sess, const unsigned char *data, size_t l
     memcpy(sess->dns_rx_buf + sess->dns_rx_len, data, len);
     sess->dns_rx_len = need;
 
-    // 2. 解析完整 frame 並合成回覆
-    size_t off = 0;
-    while (off + 2 <= sess->dns_rx_len) {
-        size_t mlen = ((size_t)sess->dns_rx_buf[off] << 8) | sess->dns_rx_buf[off + 1];
-        if (off + 2 + mlen > sess->dns_rx_len) break;   // 不完整，等後續
+    // 2. 掃描完整 frame（純長度解析在 dns_tcp.c），再逐一合成回覆
+    size_t off = dns_tcp_scan_frames(sess->dns_rx_buf, sess->dns_rx_len);
+    size_t p = 0;
+    while (p + 2 <= off) {
+        size_t mlen = dns_tcp_frame_len(sess->dns_rx_buf + p);
         unsigned char reply[512];
         size_t rlen = 0;
-        if (dns_build_reply(sess->dns_rx_buf + off + 2, mlen, 1, reply, &rlen))
+        if (dns_build_reply(sess->dns_rx_buf + p + 2, mlen, 1, reply, &rlen))
             dns_tcp_emit(sess, reply, rlen);
-        off += 2 + mlen;
+        p += 2 + mlen;
     }
     // 3. 移除已處理的前綴
     if (off > 0) {
