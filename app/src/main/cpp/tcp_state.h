@@ -47,6 +47,23 @@ int tcp_app_can_shutdown_write(int app_fin, size_t app_len);
 // state 由引擎以 atomic_load 載入後傳入；closed 判斷留給引擎。
 int tcp_is_idle(int state, time_t now, time_t last_active);
 
+// ---------- 進入封包分類（handle_tun_tcp 的狀態機 dispatch） ----------
+// 依序判定進入的 TCP 封包屬於哪種事件；分支順序與引擎 handle_tun_tcp 完全一致，
+// 影響 early-return 的優先序（SYN-only 先於 RST、RST 先於亂序、亂序先於 post-FIN、
+// post-FIN 先於純 ACK、純 ACK 排除 FIN）。
+typedef enum {
+    TCP_IN_SYN_ONLY = 1,   // SYN && !ACK（連線建立／重傳）
+    TCP_IN_RST,            // RST
+    TCP_IN_OUT_OF_ORDER,   // seq != app_next（亂序/重傳 → 重複 ACK）
+    TCP_IN_POST_FIN,       // 我方已送 FIN，進入關閉尾聲
+    TCP_IN_PURE_ACK,       // 純 ACK（無 payload、非 FIN）
+    TCP_IN_FALLTHROUGH,    // 需續走 payload/FIN 尾段
+} tcp_in_class_t;
+
+// 純函式：分類進入封包（不碰全域、不 I/O、不取時間）。
+tcp_in_class_t tcp_classify_in(uint8_t flags, uint32_t seq_host, uint32_t app_next,
+                               size_t payload_len, int srv_fin_sent);
+
 #ifdef __cplusplus
 }
 #endif

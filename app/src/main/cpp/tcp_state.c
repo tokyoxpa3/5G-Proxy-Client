@@ -24,3 +24,13 @@ int tcp_app_can_shutdown_write(int app_fin, size_t app_len) {
 int tcp_is_idle(int state, time_t now, time_t last_active) {
     return state == 1 && now - last_active > TCP_IDLE_TIMEOUT_SEC;
 }
+
+tcp_in_class_t tcp_classify_in(uint8_t flags, uint32_t seq_host, uint32_t app_next,
+                               size_t payload_len, int srv_fin_sent) {
+    if ((flags & 0x02) && !(flags & 0x10)) return TCP_IN_SYN_ONLY;   // SYN && !ACK
+    if (flags & 0x04) return TCP_IN_RST;                            // RST
+    if (seq_host != app_next) return TCP_IN_OUT_OF_ORDER;           // 亂序/重傳
+    if (srv_fin_sent) return TCP_IN_POST_FIN;                       // 我方已送 FIN
+    if (payload_len == 0 && (flags & 0x10) && !(flags & 0x01)) return TCP_IN_PURE_ACK;  // 純 ACK（排除 FIN）
+    return TCP_IN_FALLTHROUGH;
+}

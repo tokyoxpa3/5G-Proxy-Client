@@ -18,6 +18,17 @@ static uint32_t xs_rand(void) {
     return x;
 }
 
+// 參考實作：tun_socks.c 抽離前的原始分支順序（供差分對照）
+static tcp_in_class_t ref_classify(uint8_t flags, uint32_t seq_host, uint32_t app_next,
+                                   size_t payload_len, int srv_fin_sent) {
+    if ((flags & 0x02) && !(flags & 0x10)) return TCP_IN_SYN_ONLY;
+    if (flags & 0x04) return TCP_IN_RST;
+    if (seq_host != app_next) return TCP_IN_OUT_OF_ORDER;
+    if (srv_fin_sent) return TCP_IN_POST_FIN;
+    if (payload_len == 0 && (flags & 0x10) && !(flags & 0x01)) return TCP_IN_PURE_ACK;
+    return TCP_IN_FALLTHROUGH;
+}
+
 int main(void) {
     // 1. ISN 生成（金值由獨立 Python 實作算得）
     {
@@ -92,6 +103,45 @@ int main(void) {
     CHECK("app_shutdown no fin -> 0", tcp_app_can_shutdown_write(0, 0) == 0);
     CHECK("app_shutdown data pending -> 0", tcp_app_can_shutdown_write(1, 100) == 0);
     CHECK("app_shutdown neither -> 0", tcp_app_can_shutdown_write(0, 100) == 0);
+
+    // ---------- 進入封包分類器：tcp_classify_in 分支優先序真值表 ----------
+    // flags bit: FIN=0x01 SYN=0x02 RST=0x04 PSH=0x08 ACK=0x10
+    // 1. SYN-only（SYN && !ACK）→ SYN_ONLY（優先於 RST）
+    CHECK("cls SYN-only -> SYN_ONLY", tcp_classify_in(0x02, 0, 0, 0, 0) == TCP_IN_SYN_ONLY);
+    CHECK("cls SYN-only wins over RST", tcp_classify_in(0x06, 0, 0, 0, 0) == TCP_IN_SYN_ONLY);
+    CHECK("cls SYN|ACK not SYN-only", tcp_classify_in(0x12, 100, 100, 0, 0) == TCP_IN_PURE_ACK);
+    // 2. RST（非 SYN-only）→ RST，即使帶 payload
+    CHECK("cls RST -> RST", tcp_classify_in(0x04, 100, 100, 0, 0) == TCP_IN_RST);
+    CHECK("cls RST+payload still RST", tcp_classify_in(0x04, 100, 100, 10, 0) == TCP_IN_RST);
+    CHECK("cls RST|ACK -> RST", tcp_classify_in(0x14, 100, 100, 0, 0) == TCP_IN_RST);
+    // 3. 亂序：seq != app_next → OUT_OF_ORDER（優先於 post-FIN）
+    CHECK("cls out-of-order", tcp_classify_in(0x10, 100, 101, 0, 0) == TCP_IN_OUT_OF_ORDER);
+    CHECK("cls out-of-order wins over post-fin", tcp_classify_in(0x10, 100, 101, 0, 1) == TCP_IN_OUT_OF_ORDER);
+    // 4. post-FIN：我方已送 FIN → POST_FIN（優先於純 ACK）
+    CHECK("cls post-fin", tcp_classify_in(0x10, 100, 100, 0, 1) == TCP_IN_POST_FIN);
+    CHECK("cls post-fin + payload", tcp_classify_in(0x18, 100, 100, 10, 1) == TCP_IN_POST_FIN);
+    // 5. 純 ACK：payload==0 && ACK && !FIN → PURE_ACK
+    CHECK("cls pure ack", tcp_classify_in(0x10, 100, 100, 0, 0) == TCP_IN_PURE_ACK);
+    CHECK("cls pure ack PSH|ACK", tcp_classify_in(0x18, 100, 100, 0, 0) == TCP_IN_PURE_ACK);
+    // 6. FIN|ACK（payload==0）：非純 ACK，續走 FIN 尾段 → FALLTHROUGH
+    CHECK("cls FIN|ACK not pure-ack", tcp_classify_in(0x11, 100, 100, 0, 0) == TCP_IN_FALLTHROUGH);
+    // 7. payload > 0 → FALLTHROUGH（資料分支）
+    CHECK("cls data -> fallthrough", tcp_classify_in(0x18, 100, 100, 10, 0) == TCP_IN_FALLTHROUGH);
+    CHECK("cls FIN+data -> fallthrough", tcp_classify_in(0x19, 100, 100, 10, 0) == TCP_IN_FALLTHROUGH);
+
+    // ---------- 差分/覆蓋：隨機對照舊 if 鏈公式，鎖死抽離前後逐位等價 ----------
+    {
+        int ok = 1;
+        for (int i = 0; i < 200000 && ok; i++) {
+            uint8_t flags = (uint8_t)xs_rand();
+            uint32_t seq = xs_rand(), next = xs_rand();
+            size_t plen = xs_rand() & 0xFFFF;
+            int fin_sent = (int)(xs_rand() & 1);
+            if (tcp_classify_in(flags, seq, next, plen, fin_sent) !=
+                ref_classify(flags, seq, next, plen, fin_sent)) ok = 0;
+        }
+        CHECK("classify_in 隨機對照舊 if 鏈 200k", ok);
+    }
 
     printf(g_fail ? "\nRESULT: FAIL\n" : "\nRESULT: PASS\n");
     return g_fail;

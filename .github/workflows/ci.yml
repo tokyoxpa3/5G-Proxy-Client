@@ -105,7 +105,7 @@ jobs:
                      dns_query_parse dns_build_reply_pure dns_build_fake_ip6 \
                      reasm_insert_seg tcp_seq_gt tcp_win_field_pure tcp_parse_window_scale \
                      ip_hash_bucket tcp_isn_generate tcp_win_scaled tcp_flow_window_full \
-                     tcp_srv_should_send_fin tcp_app_can_shutdown_write \
+                     tcp_srv_should_send_fin tcp_app_can_shutdown_write tcp_classify_in \
                      udp_should_buffer_first_pkt udp_is_idle \
                      fake_dns_alloc fake_dns_lookup fake_dns_lookup6 \
                      fake_dns_find_domain fake_dns_reset fake_dns_key \

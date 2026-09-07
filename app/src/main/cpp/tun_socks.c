@@ -1504,12 +1504,11 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
     // 普通大小比較會拒絕更新 ack → app_acked 凍結 → 流控誤判窗口耗盡而卡死
     if (tcp_seq_gt(ack_host, sess->app_acked)) sess->app_acked = ack_host;
 
-    if ((flags & 0x02) && !(flags & 0x10)) {               // SYN 重傳
+    switch (tcp_classify_in(flags, seq_host, sess->app_next, payload_len, sess->srv_fin_sent)) {
+    case TCP_IN_SYN_ONLY:                                  // SYN 重傳
         if (atomic_load(&sess->state) == 0) send_tcp_synack(sess);
         return;
-    }
-
-    if (flags & 0x04) {                                    // RST
+    case TCP_IN_RST: {                                     // RST
         char b1[64];
         ip_to_str(src_ip, b1, sizeof b1);
         LOGI("tcp RST from app state=%d %s:%d", atomic_load(&sess->state),
@@ -1517,22 +1516,22 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
         close_tcp_session(sess, 0);
         return;
     }
-
-    if (seq_host != sess->app_next) {                     // 亂序 / 重傳 → 重複 ACK
+    case TCP_IN_OUT_OF_ORDER: {                            // 亂序 / 重傳 → 重複 ACK
         send_tcp_ack(sess);
         if (sess->srv_len > 0) flush_tcp_srv_buf(sess);    // dup-ACK 仍可能開窗
         return;
     }
-
-    if (sess->srv_fin_sent) {                              // 我方已送 FIN
+    case TCP_IN_POST_FIN: {                                // 我方已送 FIN
         if (payload_len == 0) close_tcp_session(sess, 0);
         else close_tcp_session(sess, 1);
         return;
     }
-
-    if (payload_len == 0 && (flags & 0x10) && !(flags & 0x01)) {   // 純 ACK（FIN 需先送進 FIN 分支處理）
+    case TCP_IN_PURE_ACK: {                                // 純 ACK（FIN 需先送進 FIN 分支處理）
         if (sess->srv_len > 0) flush_tcp_srv_buf(sess);    // ACK 開窗 → 續送
         return;
+    }
+    case TCP_IN_FALLTHROUGH:
+        break;
     }
 
     if (payload_len > 0) {
