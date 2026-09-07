@@ -21,6 +21,7 @@ set(SOURCE_FILES
     src/main/cpp/fake_dns.c
     src/main/cpp/dns_tcp.c
     src/main/cpp/tcp_packet.c
+    src/main/cpp/tcp_buf.c
     src/main/cpp/icmp_packet.c
     src/main/cpp/ip_parse.c
     src/main/cpp/ip_hash.c
