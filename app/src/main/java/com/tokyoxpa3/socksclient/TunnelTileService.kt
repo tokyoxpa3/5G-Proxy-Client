@@ -9,6 +9,7 @@ import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import android.util.Log
+import androidx.core.content.ContextCompat
 
 /**
  * Quick Settings 快速磁貼：一鍵開關隧道。
@@ -27,11 +28,14 @@ class TunnelTileService : TileService() {
         super.onStartListening()
         updateTile()
         try {
-            if (Build.VERSION.SDK_INT >= 33) {
-                registerReceiver(statusReceiver, IntentFilter(TunSocksService.ACTION_STATUS), Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                registerReceiver(statusReceiver, IntentFilter(TunSocksService.ACTION_STATUS))
-            }
+            // ContextCompat 於 API < 33 忽略 flag、API ≥ 33 套用 NOT_EXPORTED，
+            // 單一呼叫涵蓋全版本，避免三參數 overload（API 33+）在舊裝置 NoSuchMethodError。
+            ContextCompat.registerReceiver(
+                this,
+                statusReceiver,
+                IntentFilter(TunSocksService.ACTION_STATUS),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
         } catch (e: Exception) {
             Log.w(TAG, "registerReceiver failed: ${e.message}")
         }
@@ -73,7 +77,11 @@ class TunnelTileService : TileService() {
         val active = TunSocksService.isRunning
         tile.state = if (active) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
         tile.label = getString(R.string.tile_label)
-        tile.subtitle = getString(if (active) R.string.tile_state_active else R.string.tile_state_inactive)
+        // Tile.setSubtitle 於 API 29（Android 10）才加入；minSdk 26 上直接呼叫會
+        // NoSuchMethodError 崩潰，僅在支援時設定副標。
+        if (Build.VERSION.SDK_INT >= 29) {
+            tile.subtitle = getString(if (active) R.string.tile_state_active else R.string.tile_state_inactive)
+        }
         tile.updateTile()
     }
 

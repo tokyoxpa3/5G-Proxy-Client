@@ -26,6 +26,7 @@ import android.widget.AdapterView
 import android.os.PowerManager
 import android.net.Uri
 import android.annotation.SuppressLint
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 
@@ -107,11 +108,14 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         // Android 14+ (targetSdk 34)：context-registered receiver 必須指定 export flag，
-        // 否則 SecurityException 直接崩潰（小米 Pad Mini / Android 15 上閃退的主因）
-        registerReceiver(
+        // 否則 SecurityException 直接崩潰（小米 Pad Mini / Android 15 上閃退的主因）。
+        // ContextCompat.registerReceiver 於 API < 33 忽略 flag、API ≥ 33 套用 NOT_EXPORTED，
+        // 單一呼叫涵蓋全版本，避免三參數 overload（API 33+）在舊裝置 NoSuchMethodError。
+        ContextCompat.registerReceiver(
+            this,
             statusReceiver,
             IntentFilter(TunSocksService.ACTION_STATUS),
-            Context.RECEIVER_NOT_EXPORTED
+            ContextCompat.RECEIVER_NOT_EXPORTED
         )
         updateStatus(TunSocksService.lastStatus)
         refreshKillSwitch()
@@ -399,11 +403,7 @@ class MainActivity : Activity() {
             putExtra(TunSocksService.EXTRA_REMOTE_DNS, cbRemoteDns.isChecked)
         }
         try {
-            if (android.os.Build.VERSION.SDK_INT >= 26) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
-            }
+            startForegroundService(intent)
         } catch (e: Exception) {
             android.util.Log.e("MainActivity", "startForegroundService error", e)
             DebugLog.recordError(getString(R.string.toast_service_start_failed, e.message))

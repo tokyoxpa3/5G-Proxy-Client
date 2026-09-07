@@ -13,28 +13,6 @@
     </issue>
 
     <issue
-        id="InlinedApi"
-        message="Field requires API level 33 (current min is 26): `android.content.Context#RECEIVER_NOT_EXPORTED`"
-        errorLine1="            Context.RECEIVER_NOT_EXPORTED"
-        errorLine2="            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/tokyoxpa3/socksclient/MainActivity.kt"
-            line="114"
-            column="13"/>
-    </issue>
-
-    <issue
-        id="NewApi"
-        message="Call requires API level 29 (current min is 26): `android.service.quicksettings.Tile#setSubtitle`"
-        errorLine1="        tile.subtitle = getString(if (active) R.string.tile_state_active else R.string.tile_state_inactive)"
-        errorLine2="             ~~~~~~~~">
-        <location
-            file="src/main/java/com/tokyoxpa3/socksclient/TunnelTileService.kt"
-            line="76"
-            column="14"/>
-    </issue>
-
-    <issue
         id="StartActivityAndCollapseDeprecated"
         message="TileService#startActivityAndCollapse(Intent) is deprecated. Use TileService#startActivityAndCollapse(PendingIntent) instead."
         errorLine1="                startActivityAndCollapse(i)"
@@ -54,17 +32,6 @@
             file="src/main/AndroidManifest.xml"
             line="12"
             column="22"/>
-    </issue>
-
-    <issue
-        id="UnspecifiedRegisterReceiverFlag"
-        message="`statusReceiver` is missing `RECEIVER_EXPORTED` or `RECEIVER_NOT_EXPORTED` flag for unprotected broadcasts registered for com.tokyoxpa3.socksclient.STATUS"
-        errorLine1="                registerReceiver(statusReceiver, IntentFilter(TunSocksService.ACTION_STATUS))"
-        errorLine2="                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/tokyoxpa3/socksclient/TunnelTileService.kt"
-            line="33"
-            column="17"/>
     </issue>
 
     <issue
@@ -90,28 +57,6 @@
     </issue>
 
     <issue
-        id="SystemPermissionTypo"
-        message="Did you mean `android.permission.FOREGROUND_SERVICE`?"
-        errorLine1="    &lt;uses-permission android:name=&quot;android.permission.FOREGROUND_SERVICE_VPN&quot; />"
-        errorLine2="                                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/AndroidManifest.xml"
-            line="5"
-            column="36"/>
-    </issue>
-
-    <issue
-        id="DataExtractionRules"
-        message="The attribute `android:allowBackup` is deprecated from Android 12 and higher and may be removed in future versions. Consider adding the attribute `android:dataExtractionRules` specifying an `@xml` resource which configures cloud backups and device transfers on Android 12 and higher."
-        errorLine1="        android:allowBackup=&quot;false&quot;"
-        errorLine2="                             ~~~~~">
-        <location
-            file="src/main/AndroidManifest.xml"
-            line="15"
-            column="30"/>
-    </issue>
-
-    <issue
         id="QueryAllPackagesPermission"
         message="A `&lt;queries>` declaration should generally be used instead of QUERY_ALL_PACKAGES; see https://g.co/dev/packagevisibility for details"
         errorLine1="    &lt;uses-permission android:name=&quot;android.permission.QUERY_ALL_PACKAGES&quot; />"
@@ -120,28 +65,6 @@
             file="src/main/AndroidManifest.xml"
             line="8"
             column="22"/>
-    </issue>
-
-    <issue
-        id="ObsoleteSdkInt"
-        message="Unnecessary; SDK_INT is always >= 26"
-        errorLine1="            if (Build.VERSION.SDK_INT >= 26) {"
-        errorLine2="                ~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/tokyoxpa3/socksclient/BootReceiver.kt"
-            line="29"
-            column="17"/>
-    </issue>
-
-    <issue
-        id="ObsoleteSdkInt"
-        message="Unnecessary; SDK_INT is always >= 26"
-        errorLine1="            if (android.os.Build.VERSION.SDK_INT >= 26) {"
-        errorLine2="                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
-        <location
-            file="src/main/java/com/tokyoxpa3/socksclient/MainActivity.kt"
-            line="402"
-            column="17"/>
     </issue>
 
     <issue

@@ -3,7 +3,6 @@ package com.tokyoxpa3.socksclient
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.util.Log
 
 /**
@@ -26,11 +25,7 @@ class BootReceiver : BroadcastReceiver() {
         try {
             val i = Config.startIntent(context)
             i.putExtra(TunSocksService.EXTRA_BOOT_START, true)
-            if (Build.VERSION.SDK_INT >= 26) {
-                context.startForegroundService(i)
-            } else {
-                context.startService(i)
-            }
+            context.startForegroundService(i)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start tunnel on boot", e)
         }
