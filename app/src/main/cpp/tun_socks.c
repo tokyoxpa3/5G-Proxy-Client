@@ -674,6 +674,30 @@ static int recv_all(int fd, unsigned char *buf, size_t len) {
     return 0;
 }
 
+// SOCKS5 greeting + 選擇性 RFC 1929 認證（TCP CONNECT 與 UDP ASSOCIATE 共用）。
+// send_fn / recv_fn 抽象底層 I/O 差異：TCP 用 net_send_all/net_recv_all（非阻塞 + poll），
+// UDP 用 send_all/recv_all（阻塞）。成功回 0，失敗回對應的 SE_EVENT_* 分類碼，
+// 呼叫端可直接指派給 fail_code 後 goto fail。
+static int socks5_greet_auth(int fd,
+                             int (*send_fn)(int, const unsigned char *, size_t),
+                             int (*recv_fn)(int, unsigned char *, size_t),
+                             unsigned char *buf, size_t cap) {
+    int n = socks5_build_hello(g.auth_user, g.auth_pass, buf, cap);
+    if (n < 0 || send_fn(fd, buf, (size_t)n) < 0) return SE_EVENT_NETWORK_FAIL;
+    if (recv_fn(fd, buf, 2) < 0) return SE_EVENT_NETWORK_FAIL;
+    if (buf[0] != 0x05) return SE_EVENT_PROTOCOL_FAIL;   // 對方不是 SOCKS5
+    if (buf[1] == 0x02) {
+        // RFC 1929 認證
+        n = socks5_build_auth(g.auth_user, g.auth_pass, buf, cap);
+        if (n < 0 || send_fn(fd, buf, (size_t)n) < 0) return SE_EVENT_NETWORK_FAIL;
+        if (recv_fn(fd, buf, 2) < 0) return SE_EVENT_NETWORK_FAIL;
+        if (buf[0] != 0x01 || buf[1] != 0x00) return SE_EVENT_AUTH_FAIL;   // 認證被拒
+    } else if (buf[1] != 0x00) {
+        return SE_EVENT_AUTH_FAIL;   // 伺服器拒絕認證方式
+    }
+    return 0;   // 握手成功
+}
+
 // 釋放 session 的動態緩衝（pend / udp-in-tcp 收發佇列）；呼叫者仍需 free(sess)
 static void udp_sess_free_bufs(udp_sess_t *sess) {
     if (sess->pend_data) { free(sess->pend_data); sess->pend_data = NULL; }
@@ -700,25 +724,9 @@ static void *udp_session_thread(void *arg) {
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 
-    // 2. SOCKS5 握手
-    buf[0] = 0x05; buf[1] = 0x01; buf[2] = g.auth_enabled ? 0x02 : 0x00;
-    if (send_all(cfd, buf, 3) < 0) goto fail;
-    if (recv_all(cfd, buf, 2) < 0) goto fail;
-    if (buf[0] != 0x05) { fail_code = SE_EVENT_PROTOCOL_FAIL; goto fail; }   // 對方不是 SOCKS5
-    if (buf[1] == 0x02) {
-        // RFC 1929
-        size_t ul = strlen(g.auth_user), pl = strlen(g.auth_pass);
-        buf[0] = 0x01; buf[1] = (unsigned char)ul;
-        memcpy(buf + 2, g.auth_user, ul);
-        buf[2 + ul] = (unsigned char)pl;
-        memcpy(buf + 3 + ul, g.auth_pass, pl);
-        if (send_all(cfd, buf, 3 + ul + pl) < 0) goto fail;
-        if (recv_all(cfd, buf, 2) < 0) goto fail;
-        if (buf[0] != 0x01 || buf[1] != 0x00) { fail_code = SE_EVENT_AUTH_FAIL; goto fail; }   // 認證被拒
-    } else if (buf[1] != 0x00) {
-        fail_code = SE_EVENT_AUTH_FAIL;   // 伺服器拒絕認證方式
-        goto fail;
-    }
+    // 2. SOCKS5 握手（greeting + 選擇性 RFC 1929 認證，與 TCP CONNECT 共用 helper）
+    int hs = socks5_greet_auth(cfd, send_all, recv_all, buf, sizeof buf);
+    if (hs != 0) { fail_code = hs; goto fail; }
 
     // 3. UDP ASSOCIATE
     unsigned char req[10] = {0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
@@ -1263,23 +1271,9 @@ static void *tcp_connect_thread(void *arg) {
     if (!g.running) { fail_code = SE_EVENT_NONE; goto fail; }
     set_nonblocking(sfd);
 
-    buf[0] = 0x05; buf[1] = 0x01; buf[2] = g.auth_enabled ? 0x02 : 0x00;
-    if (net_send_all(sfd, buf, 3) < 0) goto fail;
-    if (net_recv_all(sfd, buf, 2) < 0) goto fail;
-    if (buf[0] != 0x05) { fail_code = SE_EVENT_PROTOCOL_FAIL; goto fail; }   // 對方不是 SOCKS5：重連無益
-    if (buf[1] == 0x02) {
-        size_t ul = strlen(g.auth_user), pl = strlen(g.auth_pass);
-        buf[0] = 0x01; buf[1] = (unsigned char)ul;
-        memcpy(buf + 2, g.auth_user, ul);
-        buf[2 + ul] = (unsigned char)pl;
-        memcpy(buf + 3 + ul, g.auth_pass, pl);
-        if (net_send_all(sfd, buf, 3 + ul + pl) < 0) goto fail;
-        if (net_recv_all(sfd, buf, 2) < 0) goto fail;
-        if (buf[0] != 0x01 || buf[1] != 0x00) { fail_code = SE_EVENT_AUTH_FAIL; goto fail; }   // 認證被拒
-    } else if (buf[1] != 0x00) {
-        fail_code = SE_EVENT_AUTH_FAIL;   // 伺服器拒絕認證方式
-        goto fail;
-    }
+    // SOCKS5 greeting + 選擇性 RFC 1929 認證（與 UDP ASSOCIATE 共用 helper）
+    int hs = socks5_greet_auth(sfd, net_send_all, net_recv_all, buf, sizeof buf);
+    if (hs != 0) { fail_code = hs; goto fail; }
 
     unsigned char req[300];
     int req_len = socks5_build_connect_request(
