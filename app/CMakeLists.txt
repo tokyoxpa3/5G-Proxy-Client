@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_STANDARD 11)
 
 # 設定編譯標誌
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -latomic -O3 -fno-semantic-interposition")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -fno-semantic-interposition")
 
 # 16KB page 對齊（Android 15+ 新裝置，如小米 Pad Mini）：
 # 未對齊的 .so 在 16KB page 裝置上會 dlopen 失敗（UnsatisfiedLinkError → 閃退）
