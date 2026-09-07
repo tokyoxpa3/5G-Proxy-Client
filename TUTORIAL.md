@@ -14,7 +14,7 @@
 
 ### 整體架構
 
-[整體架構](docs/figures/fig1_architecture.png)
+![整體架構](docs/figures/fig1_architecture.png)
 
 流量路徑：
 
@@ -42,7 +42,7 @@
 
 ### 3.1 開啟 App，確認連接埠
 
-[Server 初始畫面](docs/shots/server_initial_annotated.png)
+![Server 初始畫面](docs/shots/server_initial_annotated.png)
 
 1. **代理端口**：設為要對外提供的埠（預設 `1080`；本教學沿用 `1080`）
 2. **使用者 / 密碼**：兩欄都留空 = 開放代理；**兩欄都填**才會啟用認證（RFC 1929）
@@ -56,20 +56,20 @@
 
 **① 電池最佳化提醒（小米/POCO 用戶）**
 
-[電池最佳化提醒](docs/shots/server_battery_annotated.png)
+![電池最佳化提醒](docs/shots/server_battery_annotated.png)
 
 - 點 **「仍然繼續」** 直接啟動（不加入白名單也能跑，但背景較可能被系統切斷）
 - 或點 **「前往設定」** → 關閉【5G 智慧省電】、把 App 省電策略設為「無限制」，能更穩定鎖定 5G
 
 **② 通知權限（Android 13+）**
 
-[通知權限](docs/shots/server_notifperm_annotated.png)
+![通知權限](docs/shots/server_notifperm_annotated.png)
 
 - 點 **「允許」**，前景服務通知才能正常顯示。
 
 ### 3.3 啟動成功後，取得 Server 的 IP 與 Port
 
-[Server 運行中](docs/shots/server_running_annotated.png)
+![Server 運行中](docs/shots/server_running_annotated.png)
 
 啟動後畫面會顯示（3 秒後自動刷新）：
 
@@ -83,7 +83,7 @@
 
 ### 3.4 Server 端前景服務通知
 
-[Server 通知](docs/shots/server_notification_annotated.png)
+![Server 通知](docs/shots/server_notification_annotated.png)
 
 通知列會常駐 **「✅ 5G Proxy Running / 已鎖定 5G - 監聽 Port 1080」**，確認代理確實在監聽。
 
@@ -93,7 +93,7 @@
 
 ### 4.1 填入 Server 的 IP 與 Port
 
-[Client 設定畫面](docs/shots/client_filled_annotated.png)
+![Client 設定畫面](docs/shots/client_filled_annotated.png)
 
 | 欄位 | 填入 | 說明 |
 |---|---|---|
@@ -110,13 +110,13 @@
 
 **① 通知權限（Android 13+）**
 
-[Client 通知權限](docs/shots/client_notifperm_annotated.png)
+![Client 通知權限](docs/shots/client_notifperm_annotated.png)
 
 點 **「允許」**。
 
 **② VPN 連線要求**
 
-[VPN 授權](docs/shots/client_vpn_annotated.png)
+![VPN 授權](docs/shots/client_vpn_annotated.png)
 
 第一次啟動會出現系統 **「連線要求」** 對話框：
 
@@ -126,7 +126,7 @@
 
 ### 4.3 啟動成功
 
-[Client 運行中](docs/shots/client_running_annotated.png)
+![Client 運行中](docs/shots/client_running_annotated.png)
 
 - 按鈕變為 **「🛑 停止隧道」**、設定欄位鎖定 → 隧道已啟用
 - 狀態列出現 **鑰匙圖示**（VPN 作用中）
