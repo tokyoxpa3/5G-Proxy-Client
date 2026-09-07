@@ -14,6 +14,8 @@ android {
         versionCode 12
         versionName "1.5.1"
 
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
         }
@@ -86,4 +88,8 @@ dependencies {
     testImplementation 'junit:junit:4.13.2'
     // Profile 序列化使用 org.json（Android 內建），JVM 單元測試需提供實作
     testImplementation 'org.json:json:20231013'
+
+    // 儀器化測試（真機）：SecretCipher 依賴 AndroidKeyStore，JVM 無法提供
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test:runner:1.5.2'
 }
