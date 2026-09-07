@@ -25,6 +25,7 @@
 #include "socks5_codec.h"
 #include "tcp_packet.h"
 #include "dns_synth.h"
+#include "fake_dns.h"
 #include "ip_parse.h"
 #include "ip_hash.h"
 #include "tcp_state.h"
@@ -135,20 +136,7 @@ static void udp_sess_free_bufs(udp_sess_t *sess);
 // 攔截 App 的 DNS 查詢（UDP/53），回覆保留網段的 fake IP；
 // 之後 App 對 fake IP 的連線（TCP/UDP）改以網域名稱（ATYP=0x03）向 SOCKS5 伺服器撥號，
 // 由伺服器端解析——即使 SOCKS5 伺服器不支援 UDP relay 也能解析網域。
-// 引擎單執行緒與 UDP handshake 線程皆會存取，以 mutex 保護。
-
-#define FAKE_DNS_ENTRIES 512
-#define FAKE_DNS_REPLY_TTL_SEC 60
-#define FAKE_DNS_IDLE_SEC 300
-#define FAKE_IP_BASE 0xC6120000u   // 198.18.0.0（RFC 2544 保留網段）
-
-typedef struct {
-    uint32_t fake_ip;            // 網路序（v4 fake）
-    unsigned char fake_ip6[16];  // 對應的 fake IPv6（供 AAAA 回覆）
-    char domain[256];
-    time_t last_used;
-    int in_use;
-} fake_dns_entry_t;
+// 純邏輯與狀態表在 fake_dns.c；引擎單執行緒與 UDP handshake 線程皆會存取，以 mutex 保護。
 
 // ---------- 引擎 context ----------
 // 所有可變狀態收在單一 struct：啟動時可整體重置、停止後不殘留（流量統計 / fakedns 快取）。
@@ -189,9 +177,8 @@ typedef struct {
     udp_sess_t *udp_hash[UDP_HASH_BUCKETS];
     udp_sess_t *udp_graveyard;
 
-    // Remote DNS（fakedns）
-    fake_dns_entry_t fake_dns[FAKE_DNS_ENTRIES];
-    unsigned fake_dns_next;
+    // Remote DNS（fakedns）——純邏輯與狀態表在 fake_dns.c，引擎以 mutex 同步
+    fake_dns_table_t fake_dns;
 
     // handshake 執行緒池
     pthread_t hs_workers[HS_POOL_WORKERS];
@@ -222,115 +209,31 @@ static void srv_snapshot(char *host_out, size_t host_len, int *port_out) {
     pthread_mutex_unlock(&g_srv_cfg_lock);
 }
 
-// 取得 fake IP 對應的 32-bit 鍵（非 v4 回傳 0）
-static uint32_t fake_dns_key(const ip_addr_t *ip) {
-    if (ip->family != AF_INET) return 0;
-    uint32_t k;
-    memcpy(&k, ip->ip, 4);
-    return k;
-}
-
-// 分配（或重用）網域的 fake IP；回傳網路序 IP（0=失敗），ip6_out 帶出對應 fake IPv6
-static uint32_t fake_dns_alloc(const char *domain, unsigned char ip6_out[16]) {
-    time_t now = time(NULL);
-    uint32_t fake = 0;
+// fake_dns.c 為純邏輯（無鎖、不取時間），鎖由引擎持有——引擎單執行緒與
+// handshake 執行緒皆會存取 fake DNS 表。以下薄封裝補上 mutex 與 time(NULL)。
+static uint32_t fd_alloc(const char *domain, unsigned char ip6_out[16]) {
     pthread_mutex_lock(&g_fake_dns_lock);
-    // 1. 同網域已有映射 → 直接回傳（刷新 last_used）
-    for (int i = 0; i < FAKE_DNS_ENTRIES; i++) {
-        fake_dns_entry_t *e = &g.fake_dns[i];
-        if (e->in_use && strcmp(e->domain, domain) == 0) {
-            e->last_used = now;
-            fake = e->fake_ip;
-            if (ip6_out) memcpy(ip6_out, e->fake_ip6, 16);
-            goto out;
-        }
-    }
-    // 2. 依序尋找空位或已閒置逾時的項目
-    for (int round = 0; round < FAKE_DNS_ENTRIES; round++) {
-        unsigned idx = (g.fake_dns_next + (unsigned)round) % FAKE_DNS_ENTRIES;
-        fake_dns_entry_t *e = &g.fake_dns[idx];
-        if (!e->in_use || now - e->last_used > FAKE_DNS_IDLE_SEC) {
-            e->in_use = 1;
-            e->fake_ip = htonl(FAKE_IP_BASE + idx + 1);
-            strncpy(e->domain, domain, sizeof(e->domain) - 1);
-            e->domain[sizeof(e->domain) - 1] = '\0';
-            e->last_used = now;
-            g.fake_dns_next = (idx + 1) % FAKE_DNS_ENTRIES;
-            fake = e->fake_ip;
-            dns_build_fake_ip6((int)idx, e->fake_ip6);
-            if (ip6_out) memcpy(ip6_out, e->fake_ip6, 16);
-            goto out;
-        }
-    }
-    // 3. 全滿且皆未逾時 → LRU 淘汰最舊者
-    {
-        unsigned oldest = 0;
-        for (int i = 1; i < FAKE_DNS_ENTRIES; i++)
-            if (g.fake_dns[i].last_used < g.fake_dns[oldest].last_used) oldest = (unsigned)i;
-        fake_dns_entry_t *e = &g.fake_dns[oldest];
-        e->in_use = 1;
-        e->fake_ip = htonl(FAKE_IP_BASE + oldest + 1);
-        strncpy(e->domain, domain, sizeof(e->domain) - 1);
-        e->domain[sizeof(e->domain) - 1] = '\0';
-        e->last_used = now;
-        g.fake_dns_next = (oldest + 1) % FAKE_DNS_ENTRIES;
-        fake = e->fake_ip;
-        dns_build_fake_ip6((int)oldest, e->fake_ip6);
-        if (ip6_out) memcpy(ip6_out, e->fake_ip6, 16);
-    }
-out:
+    uint32_t r = fake_dns_alloc(&g.fake_dns, domain, time(NULL), ip6_out);
     pthread_mutex_unlock(&g_fake_dns_lock);
-    return fake;
+    return r;
 }
-
-// 查詢 fake IP → 網域；回傳 1=找到（domain 帶出），0=無映射
-static int fake_dns_lookup(uint32_t fake_ip, char *domain, size_t dn) {
+static int fd_lookup(uint32_t fake_ip, char *domain, size_t dn) {
     pthread_mutex_lock(&g_fake_dns_lock);
-    for (int i = 0; i < FAKE_DNS_ENTRIES; i++) {
-        fake_dns_entry_t *e = &g.fake_dns[i];
-        if (e->in_use && e->fake_ip == fake_ip) {
-            e->last_used = time(NULL);
-            strncpy(domain, e->domain, dn - 1);
-            domain[dn - 1] = '\0';
-            pthread_mutex_unlock(&g_fake_dns_lock);
-            return 1;
-        }
-    }
+    int r = fake_dns_lookup(&g.fake_dns, fake_ip, time(NULL), domain, dn);
     pthread_mutex_unlock(&g_fake_dns_lock);
-    return 0;
+    return r;
 }
-
-// 依網域找對應的 fake IP（大小寫不敏感；找不到回傳 0）
-static uint32_t fake_dns_find_domain(const char *domain) {
-    uint32_t fake = 0;
+static uint32_t fd_find_domain(const char *domain) {
     pthread_mutex_lock(&g_fake_dns_lock);
-    for (int i = 0; i < FAKE_DNS_ENTRIES; i++) {
-        fake_dns_entry_t *e = &g.fake_dns[i];
-        if (e->in_use && strcasecmp(e->domain, domain) == 0) {
-            e->last_used = time(NULL);
-            fake = e->fake_ip;
-            break;
-        }
-    }
+    uint32_t r = fake_dns_find_domain(&g.fake_dns, domain, time(NULL));
     pthread_mutex_unlock(&g_fake_dns_lock);
-    return fake;
+    return r;
 }
-
-// 查詢 fake IPv6 → 網域；回傳 1=找到（domain 帶出），0=無映射
-static int fake_dns_lookup6(const unsigned char ip6[16], char *domain, size_t dn) {
+static int fd_lookup6(const unsigned char ip6[16], char *domain, size_t dn) {
     pthread_mutex_lock(&g_fake_dns_lock);
-    for (int i = 0; i < FAKE_DNS_ENTRIES; i++) {
-        fake_dns_entry_t *e = &g.fake_dns[i];
-        if (e->in_use && memcmp(e->fake_ip6, ip6, 16) == 0) {
-            e->last_used = time(NULL);
-            strncpy(domain, e->domain, dn - 1);
-            domain[dn - 1] = '\0';
-            pthread_mutex_unlock(&g_fake_dns_lock);
-            return 1;
-        }
-    }
+    int r = fake_dns_lookup6(&g.fake_dns, ip6, time(NULL), domain, dn);
     pthread_mutex_unlock(&g_fake_dns_lock);
-    return 0;
+    return r;
 }
 
 static void set_nonblocking(int fd) {
@@ -595,12 +498,10 @@ static void forward_udp_to_server(udp_sess_t *sess, const ip_addr_t *dst, uint16
     char dom[256];
     const char *domain = NULL;
     if (g.remote_dns && dst->family == AF_INET) {
-        uint32_t k;
-        memcpy(&k, dst->ip, 4);
-        if (fake_dns_lookup(k, dom, sizeof dom)) domain = dom;
+        if (fd_lookup(fake_dns_key(dst), dom, sizeof dom)) domain = dom;
     } else if (g.remote_dns && dst->family == AF_INET6) {
         // fake IPv6 → 以網域撥號（Remote DNS 的 AAAA 路徑）
-        if (fake_dns_lookup6(dst->ip, dom, sizeof dom)) domain = dom;
+        if (fd_lookup6(dst->ip, dom, sizeof dom)) domain = dom;
     }
     int flen = socks5_build_udp_frame(dst->ip, dst->family, dst_port, domain,
                                       payload, plen, frame, sizeof frame);
@@ -665,7 +566,7 @@ static int dns_build_reply(const unsigned char *q, size_t qlen, int always_answe
     unsigned char fake6[16];
     uint32_t fake = 0;
     if (qtype == 1 || qtype == 28) {
-        fake = fake_dns_alloc(name, fake6);
+        fake = fd_alloc(name, fake6);
         if (!fake) return 0;
     }
 
@@ -1041,7 +942,7 @@ static void handle_relay_udp(udp_sess_t *sess, const unsigned char *buf, ssize_t
         uint16_t rport;
         memcpy(&rport, buf + 5 + dl, 2);
         size_t plen = (size_t)len - 7u - dl;
-        uint32_t fake = fake_dns_find_domain(dom);
+        uint32_t fake = fd_find_domain(dom);
         if (!fake) return;   // 無映射（非 Remote DNS 流量）→ 丟棄
         ip_addr_t remote = { .family = AF_INET };
         memcpy(remote.ip, &fake, 4);
@@ -1575,11 +1476,9 @@ static void handle_tun_tcp(const unsigned char *pkt, size_t len, size_t t,
         if (g.remote_dns) {
             // fake IP（v4/v6）→ 記錄網域，connect 線程以 ATYP=0x03 撥號（由伺服器端解析）
             if (dst_ip->family == AF_INET) {
-                uint32_t k;
-                memcpy(&k, dst_ip->ip, 4);
-                fake_dns_lookup(k, sess->dst_domain, sizeof(sess->dst_domain));
+                fd_lookup(fake_dns_key(dst_ip), sess->dst_domain, sizeof(sess->dst_domain));
             } else if (dst_ip->family == AF_INET6) {
-                fake_dns_lookup6(dst_ip->ip, sess->dst_domain, sizeof(sess->dst_domain));
+                fd_lookup6(dst_ip->ip, sess->dst_domain, sizeof(sess->dst_domain));
             }
         }
         atomic_store(&sess->srv_fd, -1);
@@ -2095,8 +1994,7 @@ static void engine_soft_reset(void) {
     atomic_store(&g.bytes_from_server, 0);
     g.isn_counter = 0;
     pthread_mutex_lock(&g_fake_dns_lock);
-    for (int i = 0; i < FAKE_DNS_ENTRIES; i++) g.fake_dns[i].in_use = 0;
-    g.fake_dns_next = 0;
+    fake_dns_reset(&g.fake_dns);
     pthread_mutex_unlock(&g_fake_dns_lock);
     reasm_table_clear();
 
@@ -2325,8 +2223,7 @@ static void engine_ctx_reset(void) {
     atomic_store(&g.handshake_inflight, 0);
     g.isn_counter = 0;
     pthread_mutex_lock(&g_fake_dns_lock);
-    for (int i = 0; i < FAKE_DNS_ENTRIES; i++) g.fake_dns[i].in_use = 0;
-    g.fake_dns_next = 0;
+    fake_dns_reset(&g.fake_dns);
     pthread_mutex_unlock(&g_fake_dns_lock);
     reasm_table_clear();
 }
