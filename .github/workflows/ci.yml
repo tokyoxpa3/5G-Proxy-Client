@@ -100,6 +100,7 @@ jobs:
         run: |
           set -e
           for sym in socks5_build_connect_request socks5_build_udp_frame \
+                     socks5_parse_udp_datagram \
                      tcp_build_segment tcp_build_synack udp_build_packet \
                      icmp4_build_echo_reply icmp6_build_echo_reply icmp6_build_na \
                      dns_query_parse dns_build_reply_pure dns_build_fake_ip6 \

@@ -886,43 +886,31 @@ fail:
 // relay 回應 → 還原成 IP 封包寫回 TUN
 static void handle_relay_udp(udp_sess_t *sess, const unsigned char *buf, ssize_t len) {
     if (len < 4) return;
-    int atyp = buf[3];
-    if (atyp == 0x01) {
-        if (len < 10) return;
-        ip_addr_t remote = { .family = AF_INET };
-        memcpy(remote.ip, buf + 4, 4);
-        uint16_t rport;
-        memcpy(&rport, buf + 8, 2);
-        size_t plen = (size_t)len - 10;
-        write_udp_to_tun(sess, &remote, rport, buf + 10, plen);
-    } else if (atyp == 0x04) {
-        if (len < 22) return;
-        ip_addr_t remote = { .family = AF_INET6 };
-        memcpy(remote.ip, buf + 4, 16);
-        uint16_t rport;
-        memcpy(&rport, buf + 20, 2);
-        size_t plen = (size_t)len - 22;
-        write_udp_to_tun(sess, &remote, rport, buf + 22, plen);
-    } else if (atyp == 0x03) {
+    unsigned char ip[16] = {0};
+    int fam = 0;
+    uint16_t rport = 0;
+    char dom[256];
+    const unsigned char *payload = NULL;
+    size_t plen = 0;
+    // 委派給純函式解析回應表頭（socks5_codec.c，fuzz/golden 覆蓋）
+    if (socks5_parse_udp_datagram(buf, (size_t)len, ip, &fam, &rport,
+                                  dom, sizeof dom, &payload, &plen) < 0)
+        return;
+    ip_addr_t remote;
+    memset(remote.ip, 0, sizeof(remote.ip));
+    if (fam == AF_INET || fam == AF_INET6) {
+        remote.family = fam;
+        memcpy(remote.ip, ip, 16);
+    } else if (fam == -1) {
         // 伺服器以網域回應：改以該網域的 fake IP 作為來源，App 才認得
-        if (len < 7) return;
-        uint8_t dl = buf[4];
-        if ((size_t)len < 7u + dl) return;
-        char dom[256];
-        size_t n = dl < sizeof(dom) - 1 ? dl : sizeof(dom) - 1;
-        memcpy(dom, buf + 5, n);
-        dom[n] = '\0';
-        uint16_t rport;
-        memcpy(&rport, buf + 5 + dl, 2);
-        size_t plen = (size_t)len - 7u - dl;
         uint32_t fake = fd_find_domain(dom);
         if (!fake) return;   // 無映射（非 Remote DNS 流量）→ 丟棄
-        ip_addr_t remote = { .family = AF_INET };
+        remote.family = AF_INET;
         memcpy(remote.ip, &fake, 4);
-        write_udp_to_tun(sess, &remote, rport, buf + 7 + dl, plen);
     } else {
-        // 其他 ATYP 回應丟棄
+        return;   // 其他 ATYP 回應丟棄
     }
+    write_udp_to_tun(sess, &remote, rport, payload, plen);
 }
 
 static void close_session_fds(udp_sess_t *sess) {

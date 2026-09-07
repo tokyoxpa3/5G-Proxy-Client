@@ -116,6 +116,25 @@ int main(void){
         int rc=socks5_parse_udp_datagram(dg,n,NULL,NULL,NULL,dom,sizeof dom,&pl,&pln);
         CHECK("parse domain", rc==0 && strcmp(dom,"example.com")==0 && pln==1 && pl[0]=='x');
     }
+    // 12. parse ipv6: family_out == AF_INET6，16-byte IP 回填（engine 依 family 還原 ip_addr_t）
+    {
+        unsigned char ip6[16]={0x20,0x01,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,1};
+        uint16_t port=htons(1234);
+        unsigned char dg[64];
+        int n=socks5_build_udp_datagram(ip6,AF_INET6,port,NULL,(unsigned char*)"v6",2,dg,sizeof dg);
+        unsigned char rip[16]; int fam; uint16_t rport; const unsigned char *pl; size_t pln;
+        int rc=socks5_parse_udp_datagram(dg,n,rip,&fam,&rport,NULL,0,&pl,&pln);
+        CHECK("parse ipv6 fam", rc==0 && fam==AF_INET6 && memcmp(rip,ip6,16)==0 && rport==port && pln==2 && memcmp(pl,"v6",2)==0);
+    }
+    // 13. parse domain: family_out == -1（engine 以 -1 辨識網域回應分支）
+    {
+        unsigned char dg[64];
+        uint16_t port=htons(53);
+        int n=socks5_build_udp_datagram(NULL,AF_INET,port,"example.com",(unsigned char*)"x",1,dg,sizeof dg);
+        char dom[64]; int fam; uint16_t rport; const unsigned char *pl; size_t pln;
+        int rc=socks5_parse_udp_datagram(dg,n,NULL,&fam,&rport,dom,sizeof dom,&pl,&pln);
+        CHECK("parse domain fam==-1", rc==0 && fam==-1 && strcmp(dom,"example.com")==0 && rport==port && pln==1 && pl[0]=='x');
+    }
 
     printf(g_fail?"\nRESULT: FAIL\n":"\nRESULT: PASS\n");
     return g_fail;
