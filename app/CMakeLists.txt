@@ -27,7 +27,7 @@ set(SOURCE_FILES
     src/main/cpp/ip_hash.c
     src/main/cpp/reasm.c
     src/main/cpp/tcp_state.c
-    src/main/cpp/udp_session.c
+    src/main/cpp/udp_state.c
     src/main/cpp/udp_tcp.c
     src/main/cpp/engine_util.c
     src/main/cpp/hs_pool.c

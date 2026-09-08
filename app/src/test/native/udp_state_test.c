@@ -1,9 +1,9 @@
-// udp_session_test.c — UDP Fullcone 會話純決策 golden test
+// udp_state_test.c — UDP Fullcone 會話純決策 golden test
 // 驗證：首包緩衝門檻（1400）、閒置逾時判定（330 秒）。
 #include <stdio.h>
 #include <stdint.h>
 #include <time.h>
-#include "udp_session.h"
+#include "udp_state.h"
 
 static int g_fail = 0;
 #define CHECK(name, cond) do { if (cond) printf("PASS  %s\n", name); else { printf("FAIL  %s\n", name); g_fail = 1; } } while (0)

@@ -1,4 +1,4 @@
-#include "udp_session.h"
+#include "udp_state.h"
 
 int udp_should_buffer_first_pkt(size_t payload_len) {
     return payload_len <= UDP_FIRST_PKT_BUFFER_MAX;

@@ -30,7 +30,7 @@ SRC_reasm        := reasm.c ip_parse.c checksum.c
 SRC_ip_hash      := ip_hash.c
 SRC_tcp_state    := tcp_state.c
 SRC_tun_loopback := socks5_codec.c tcp_packet.c checksum.c
-SRC_udp_session  := udp_session.c
+SRC_udp_state    := udp_state.c
 SRC_fake_dns     := fake_dns.c dns_synth.c dns_query.c
 SRC_dns_tcp      := dns_tcp.c
 SRC_dns_query    := dns_query.c
@@ -46,7 +46,7 @@ EXTRA_engine_util  := -D_DEFAULT_SOURCE -I . -pthread
 EXTRA_hs_pool      := -D_DEFAULT_SOURCE -I . -pthread
 
 ALL_TESTS := checksum socks5 dns_synth tcp_packet ip_parse reasm ip_hash tcp_state \
-             tun_loopback udp_session fake_dns dns_tcp dns_query icmp_packet udp_tcp tcp_buf \
+             tun_loopback udp_state fake_dns dns_tcp dns_query icmp_packet udp_tcp tcp_buf \
              engine_util hs_pool
 
 # sanitizer 下的 golden 測試（原 CI 列舉的 offset-sensitive 子集）。
@@ -93,7 +93,7 @@ fuzz: $(OUT)/fuzz_parsers
 # 故以專用規則處理，不進入既有 test_template（其 SRC 一律以 $(MAIN) 為前綴）。
 ENGINE_SRC := tun_socks.c checksum.c socks5_codec.c dns_synth.c dns_query.c \
               fake_dns.c dns_tcp.c tcp_packet.c tcp_buf.c icmp_packet.c \
-              ip_parse.c ip_hash.c reasm.c tcp_state.c udp_session.c udp_tcp.c \
+              ip_parse.c ip_hash.c reasm.c tcp_state.c udp_state.c udp_tcp.c \
               engine_util.c hs_pool.c udp_sess.c tcp_sess.c
 
 $(OUT)/tun_engine: tun_engine_test.c host_jni_bridge.c $(addprefix $(MAIN)/,$(ENGINE_SRC))

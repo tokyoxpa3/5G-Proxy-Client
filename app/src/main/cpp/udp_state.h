@@ -1,5 +1,5 @@
-#ifndef UDP_SESSION_H
-#define UDP_SESSION_H
+#ifndef UDP_STATE_H
+#define UDP_STATE_H
 #include <stddef.h>
 #include <time.h>
 
