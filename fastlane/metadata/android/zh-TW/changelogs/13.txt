@@ -1,0 +1,8 @@
+- 新增：軟重連會重新解析 hostname，伺服器位址變更後重連即生效
+- 新增：憑證改用 Android Keystore 加密儲存，不再以明文存放
+- 新增：匯出的設定檔不再包含明文憑證
+- 新增：IPv6 — 支援巢狀 extension header 內的 fragment 重組
+- 修正：加密失敗不再降級為明文儲存
+- 修正：舊版 Android 裝置的相容性崩潰
+- 修正：伺服器位址驗證現在會拒絕純空白 host
+- 修正：引擎 — TCP FIN 半關閉不再誤發 RST，UDP-in-TCP 清理修正

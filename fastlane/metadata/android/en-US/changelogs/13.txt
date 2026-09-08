@@ -1,0 +1,8 @@
+- New: soft reconnect now re-resolves the hostname, so server address changes apply on reconnect
+- New: credentials are encrypted with Android Keystore instead of stored in plaintext
+- New: exported config files no longer include plaintext credentials
+- New: IPv6 — reassembly of fragments nested inside extension headers
+- Fix: encryption failure no longer falls back to storing plaintext
+- Fix: crash on older Android devices
+- Fix: server address validation now rejects blank hosts
+- Fix: engine — TCP FIN half-close no longer sends RST; UDP-in-TCP cleanup fixed
