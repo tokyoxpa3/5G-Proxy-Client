@@ -1,10 +1,17 @@
 // tun_engine_test.c — 主機端對端整合測試：連結真正的 tun_socks.c 引擎，
-// 以假 SOCKS5 伺服器（CONNECT echo + UDP ASSOCIATE relay echo）與
-// socketpair(SOCK_DGRAM) 當 TUN fd 驅動，驗證 ICMP / TCP / UDP 的端到端行為。
+// 以假 SOCKS5 伺服器與 socketpair(SOCK_DGRAM) 當 TUN fd 驅動，驗證端到端行為。
 //
-// 這是目前測試金字塔最薄的一環：既有單元測試與 fuzz 只測抽離的純邏輯，
-// 從未跑過真正的 epoll 事件迴圈、TUN 讀寫、handshake 執行緒與 SOCKS5 狀態機。
+// 這是測試金字塔最薄的一環：既有單元測試與 fuzz 只測抽離的純邏輯，
+// 未跑過真正的 epoll 事件迴圈、TUN 讀寫、handshake 執行緒與 SOCKS5 狀態機。
 // 僅測試用，需 host_jni_bridge.c 提供主機版 request_java_socket / notify_*。
+//
+// 覆蓋情境（每個情境獨立起一個引擎實例，假伺服器以全域旗標切換行為）：
+//   1. 預設引擎：ICMP echo、TCP CONNECT echo、UDP relay echo、IPv4 分片重組、
+//      TCP FIN 半關閉傳播、軟重連
+//   2. RFC 1929 認證成功 → TCP echo 正常
+//   3. RFC 1929 認證被拒 → RST + SE_EVENT_AUTH_FAIL
+//   4. UDP-in-TCP（自訂指令 0x04）frame relay echo
+//   5. UDP-in-TCP 伺服器不支援 → 退回標準 UDP ASSOCIATE(0x03) relay echo
 
 #define _DEFAULT_SOURCE 1
 
@@ -25,6 +32,7 @@
 #include "checksum.h"
 #include "ip_parse.h"
 #include "tcp_packet.h"
+#include "jni_bridge.h"
 
 // ---- 引擎公開介面（定義於 tun_socks.c，此處自行 extern，與 jni_bridge.c 一致） ----
 extern int tun_socks_start(int tun_fd, const char *host, int port,
@@ -32,6 +40,7 @@ extern int tun_socks_start(int tun_fd, const char *host, int port,
                            int udp_in_tcp, int remote_dns);
 extern void tun_socks_stop(void);
 extern int tun_socks_is_running(void);
+extern void tun_socks_reconnect(const char *new_host);
 
 // ---- host_jni_bridge.c 提供的測試斷言資料 ----
 extern atomic_int g_host_last_server_event;
@@ -44,11 +53,21 @@ static int g_fail = 0;
 } while (0)
 
 // ================= 假 SOCKS5 伺服器 =================
-// TCP 控制連線：no-auth greeting、CONNECT(0x01) echo、UDP ASSOCIATE(0x03) 回報 relay 位址。
-// UDP relay socket：收到 datagram 後原樣 echo 回送（引擎的 relay socket 來源位址）。
+// 每個情境在啟動引擎前設定全域旗標（引擎啟動/停止會重開所有連線，故無競態）：
+//   g_fake_require_auth    1 = greeting 選 0x02、要求 RFC 1929 認證
+//   g_fake_reject_auth     1 = 認證一律回 0x01 0x01（拒絶），測 AUTH_FAIL 路徑
+//   g_fake_reject_udp_tcp  1 = cmd 0x04 回 REP=0x07，觸發引擎退回標準 UDP-in-UDP
+// CONNECT(0x01) echo、UDP ASSOCIATE(0x03) relay echo、UDP-in-TCP(0x04) frame echo。
+// 記錄最近一次 ATYP=0x03 的網域到 g_fake_last_domain（Remote DNS 驗證用）。
 
 static int g_udp_relay_fd = -1;
 static uint16_t g_udp_relay_port = 0;
+
+static int g_fake_require_auth = 0;
+static int g_fake_reject_auth = 0;
+static int g_fake_reject_udp_tcp = 0;
+static char g_fake_last_domain[256];
+static volatile int g_fake_saw_domain = 0;
 
 static int recv_exact(int fd, void *buf, size_t len) {
     size_t off = 0;
@@ -78,47 +97,88 @@ static void *fake_client(void *arg) {
     if (recv_exact(fd, buf, 2) < 0) goto done;
     unsigned char nmethods = buf[1];
     if (recv_exact(fd, buf, nmethods) < 0) goto done;
-    {
+    if (g_fake_require_auth) {
+        unsigned char rep[2] = {0x05, 0x02};   // 要求 RFC 1929 認證
+        send_all(fd, rep, 2);
+        // RFC 1929：ver(1) ulen(1) user(ulen) plen(1) pass(plen)
+        if (recv_exact(fd, buf, 2) < 0) goto done;
+        unsigned char ulen = buf[1];
+        if (recv_exact(fd, buf, ulen) < 0) goto done;
+        if (recv_exact(fd, buf, 1) < 0) goto done;
+        unsigned char plen = buf[0];
+        if (recv_exact(fd, buf, plen) < 0) goto done;
+        unsigned char aok[2] = {0x01, g_fake_reject_auth ? 0x01 : 0x00};
+        send_all(fd, aok, 2);
+        if (g_fake_reject_auth) goto done;   // 拒絶後引擎會 RST 並關閉
+    } else {
         unsigned char rep[2] = {0x05, 0x00};   // no-auth
         send_all(fd, rep, 2);
     }
 
-    // 2. request header (ver, cmd, rsv, atyp)
-    if (recv_exact(fd, buf, 4) < 0) goto done;
-    unsigned char cmd = buf[1];
-    unsigned char atyp = buf[3];
+    // 2. 一條連線可接續多個 request（UDP-in-TCP 退回時引擎在同連線再送 0x03）
+    for (;;) {
+        if (recv_exact(fd, buf, 4) < 0) goto done;
+        unsigned char cmd = buf[1];
+        unsigned char atyp = buf[3];
 
-    // consume address (ATYP + ADDR + PORT)
-    if (atyp == 0x01) {
-        if (recv_exact(fd, buf, 6) < 0) goto done;   // 4-byte IP + 2-byte port
-    } else if (atyp == 0x04) {
-        if (recv_exact(fd, buf, 18) < 0) goto done;  // 16-byte IP + 2-byte port
-    } else if (atyp == 0x03) {
-        if (recv_exact(fd, buf, 1) < 0) goto done;
-        unsigned char dl = buf[0];
-        if (recv_exact(fd, buf, (size_t)dl + 2) < 0) goto done;   // domain + port
-    } else {
-        goto done;
-    }
-
-    if (cmd == 0x01) {
-        // CONNECT: reply success, BND 0.0.0.0:0
-        unsigned char ok[10] = {0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
-        send_all(fd, ok, 10);
-        // echo loop
-        for (;;) {
-            ssize_t n = recv(fd, buf, sizeof buf, 0);
-            if (n <= 0) break;
-            send_all(fd, buf, (size_t)n);
+        if (atyp == 0x01) {
+            if (recv_exact(fd, buf, 6) < 0) goto done;   // 4-byte IP + 2-byte port
+        } else if (atyp == 0x04) {
+            if (recv_exact(fd, buf, 18) < 0) goto done;  // 16-byte IP + 2-byte port
+        } else if (atyp == 0x03) {
+            if (recv_exact(fd, buf, 1) < 0) goto done;
+            unsigned char dl = buf[0];   // uint8_t，最大 255 < sizeof(256)，寫入必定安全
+            if (recv_exact(fd, buf, dl) < 0) goto done;
+            memcpy(g_fake_last_domain, buf, dl);
+            g_fake_last_domain[dl] = '\0';
+            g_fake_saw_domain = 1;
+            if (recv_exact(fd, buf, 2) < 0) goto done;   // port
+        } else {
+            goto done;
         }
-    } else if (cmd == 0x03) {
-        // UDP ASSOCIATE: reply with relay addr 127.0.0.1:g_udp_relay_port
-        unsigned char ok[10] = {0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1,
-                                (unsigned char)(g_udp_relay_port >> 8),
-                                (unsigned char)(g_udp_relay_port & 0xFF)};
-        send_all(fd, ok, 10);
-        // engine 會保持控制連線開啟直到 session 回收；此處阻塞直到關閉
-        while (recv(fd, buf, sizeof buf, 0) > 0) {}
+
+        if (cmd == 0x01) {
+            // CONNECT: reply success, BND 0.0.0.0:0，然後 echo 回送
+            unsigned char ok[10] = {0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+            send_all(fd, ok, 10);
+            for (;;) {
+                ssize_t n = recv(fd, buf, sizeof buf, 0);
+                if (n <= 0) break;
+                send_all(fd, buf, (size_t)n);
+            }
+            goto done;
+        } else if (cmd == 0x03) {
+            // UDP ASSOCIATE: reply relay addr 127.0.0.1:g_udp_relay_port
+            unsigned char ok[10] = {0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1,
+                                    (unsigned char)(g_udp_relay_port >> 8),
+                                    (unsigned char)(g_udp_relay_port & 0xFF)};
+            send_all(fd, ok, 10);
+            while (recv(fd, buf, sizeof buf, 0) > 0) {}   // 阻塞直到關閉
+            goto done;
+        } else if (cmd == 0x04) {
+            if (g_fake_reject_udp_tcp) {
+                // 不支援：REP=0x07 (command not supported)；期待引擎同連線退回 0x03
+                unsigned char no[10] = {0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+                send_all(fd, no, 10);
+                continue;
+            }
+            // 支援 UDP-in-TCP：回 success 後在同連線做 frame echo（2-byte len + datagram）
+            unsigned char ok[10] = {0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+            send_all(fd, ok, 10);
+            for (;;) {
+                if (recv_exact(fd, buf, 2) < 0) goto done;
+                unsigned short flen = (unsigned short)((buf[0] << 8) | buf[1]);
+                if (flen > sizeof buf) goto done;
+                if (recv_exact(fd, buf, flen) < 0) goto done;
+                unsigned char hdr[2];
+                hdr[0] = (unsigned char)(flen >> 8);
+                hdr[1] = (unsigned char)(flen & 0xFF);
+                if (send_all(fd, hdr, 2) < 0) goto done;
+                if (send_all(fd, buf, flen) < 0) goto done;
+            }
+        } else {
+            goto done;
+        }
     }
 
 done:
@@ -317,6 +377,22 @@ static int tcp_has_payload(const unsigned char *pkt, size_t len, void *vctx) {
     ssize_t plen = tcp_payload(pkt, len, &p);
     return plen == (ssize_t)c->nlen && plen > 0 && memcmp(p, c->needle, c->nlen) == 0;
 }
+// predicate：TCP 帶 FIN 旗標
+static int tcp_has_fin(const unsigned char *pkt, size_t len, void *vctx) {
+    (void)vctx;
+    if (len < 20 || (pkt[0] >> 4) != 4 || pkt[9] != 6) return 0;
+    int ihl = (pkt[0] & 0x0F) * 4;
+    if (len < (size_t)ihl + 14) return 0;
+    return (pkt[ihl + 13] & 0x01) != 0;
+}
+// predicate：TCP 帶 RST 旗標
+static int tcp_has_rst(const unsigned char *pkt, size_t len, void *vctx) {
+    (void)vctx;
+    if (len < 20 || (pkt[0] >> 4) != 4 || pkt[9] != 6) return 0;
+    int ihl = (pkt[0] & 0x0F) * 4;
+    if (len < (size_t)ihl + 14) return 0;
+    return (pkt[ihl + 13] & 0x04) != 0;
+}
 
 // 把一個完整 UDP datagram 拆成兩片 IPv4 分片（frag0 = UDP 頭 8 bytes + MF=1；
 // frag1 = 其餘 payload + MF=0）。分片偏移以 8 為單位，故首片固定取 8 bytes。
@@ -362,140 +438,360 @@ static void build_udp_fragments(const unsigned char src[4], const unsigned char 
     *f1len = (ssize_t)t1;
 }
 
+// 建構單一 DNS A-record 查詢封包（ID、RD=1、QDCOUNT=1、QNAME、QTYPE=A、QCLASS=IN）。
+// domain 為 '.' 分隔的 ASCII 網域；成功回傳長度，0 = 名稱非法或空間不足。
+static size_t build_dns_a_query(const char *domain, unsigned char *out, size_t cap) {
+    if (cap < 12) return 0;
+    memset(out, 0, cap);
+    out[0] = 0x12; out[1] = 0x34;   // 隨意 ID
+    out[2] = 0x01;                  // RD=1
+    out[5] = 0x01;                  // QDCOUNT=1
+    size_t off = 12;
+
+    const char *start = domain;
+    for (;;) {
+        const char *dot = strchr(start, '.');
+        size_t lbl = dot ? (size_t)(dot - start) : strlen(start);
+        if (lbl == 0 || lbl > 63) return 0;
+        if (off + 1 + lbl + 1 > cap) return 0;
+        out[off++] = (unsigned char)lbl;
+        memcpy(out + off, start, lbl);
+        off += lbl;
+        if (!dot) break;
+        start = dot + 1;
+    }
+    out[off++] = 0;                 // 名稱結尾
+    out[off++] = 0; out[off++] = 1; // QTYPE=A
+    out[off++] = 0; out[off++] = 1; // QCLASS=IN
+    return off;
+}
+
+// ================= 情境 helpers =================
+
+// 建立一對 socketpair TUN 並啟動引擎；成功回傳測試端 fd，失敗回傳 -1。
+static int start_engine(int tcp_port, const char *user, const char *pass,
+                        int udp_in_tcp, int remote_dns) {
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0) return -1;
+    if (tun_socks_start(sp[0], "127.0.0.1", tcp_port, user, pass, udp_in_tcp, remote_dns) != 0) {
+        close(sp[0]); close(sp[1]); return -1;
+    }
+    return sp[1];
+}
+
+// 完整 TCP CONNECT + "hello" echo：SYN → SYN-ACK → ACK → DATA → echo。
+// seq 自 1000 起算。成功回傳 srv_isn（非 0），失敗回傳 0。
+static uint32_t tcp_echo_hello(int test_fd, const unsigned char *app_ip,
+                               const unsigned char *target_ip, uint16_t sport, uint16_t dport) {
+    unsigned char pkt[512], rbuf[512];
+    ssize_t n = tcp_build_segment(app_ip, target_ip, AF_INET, sport, dport,
+                                  1000, 0, 0x02, NULL, 0, 64240, pkt, sizeof pkt);
+    if (n <= 0) return 0;
+    write(test_fd, pkt, (size_t)n);
+
+    ssize_t r = read_tun(test_fd, rbuf, sizeof rbuf, 3000);
+    if (r <= 0) return 0;
+    int ihl = (rbuf[0] & 0x0F) * 4;
+    uint8_t flags = rbuf[ihl + 13];
+    uint32_t ack_field; memcpy(&ack_field, rbuf + ihl + 8, 4);
+    if ((flags & 0x12) != 0x12 || ntohl(ack_field) != 1001) return 0;
+    uint32_t srv_isn = tcp_seq(rbuf);
+
+    unsigned char ackpkt[512];
+    ssize_t an = tcp_build_segment(app_ip, target_ip, AF_INET, sport, dport,
+                                   1001, srv_isn + 1, 0x10, NULL, 0, 64240, ackpkt, sizeof ackpkt);
+    write(test_fd, ackpkt, (size_t)an);
+
+    const unsigned char msg[] = "hello";
+    unsigned char dpkt[512];
+    ssize_t dn = tcp_build_segment(app_ip, target_ip, AF_INET, sport, dport,
+                                   1001, srv_isn + 1, 0x18, msg, sizeof msg, 64240, dpkt, sizeof dpkt);
+    write(test_fd, dpkt, (size_t)dn);
+
+    payload_ctx_t pctx = { msg, sizeof msg };
+    if (!wait_for_packet(test_fd, rbuf, sizeof rbuf, 5000, tcp_has_payload, &pctx)) return 0;
+    return srv_isn;
+}
+
 // ================= 主測試 =================
+
+static const unsigned char APP_IP[4] = {10, 8, 0, 2};
+static const unsigned char TARGET_IP[4] = {8, 8, 8, 8};
 
 int main(void) {
     printf("=== tun_engine integration test (real engine + fake SOCKS5 + socketpair TUN) ===\n");
 
-    // 1. 假伺服器
+    // 假伺服器（全域旗標在各情境間切換行為）
     int tcp_port;
     int lfd = start_fake_server(&tcp_port);
     CHECK("fake server start", lfd >= 0);
     printf("  fake SOCKS5 127.0.0.1:%d (udp relay :%d)\n", tcp_port, g_udp_relay_port);
 
-    // 2. socketpair(SOCK_DGRAM) 模擬 TUN（保留封包邊界）
-    int sp[2];
-    CHECK("socketpair TUN", socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) == 0);
-    int tun_fd = sp[0];   // 引擎端
-    int test_fd = sp[1];  // 測試端（注入 App 封包、讀取引擎回覆）
+    const unsigned char *app_ip = APP_IP;
+    const unsigned char *target_ip = TARGET_IP;
 
-    // 3. 啟動引擎（no auth、標準 UDP-in-UDP、關閉 remote DNS）
-    int rc = tun_socks_start(tun_fd, "127.0.0.1", tcp_port, "", "", 0, 0);
-    CHECK("engine start", rc == 0);
-    CHECK("engine running", tun_socks_is_running() == 1);
-
-    const unsigned char app_ip[4] = {10, 8, 0, 2};
-    const unsigned char target_ip[4] = {8, 8, 8, 8};
-
-    // ---------- 4. ICMP echo（不需伺服器） ----------
+    // ============ 情境 1：預設引擎（無認證、UDP-in-UDP、無 Remote DNS） ============
     {
+        int test_fd = start_engine(tcp_port, "", "", 0, 0);
+        CHECK("engine start (default)", test_fd >= 0);
+
+        // ---------- 1.1 ICMP echo（不需伺服器） ----------
+        {
+            unsigned char pkt[512], rbuf[512];
+            const unsigned char payload[] = "ping42";
+            ssize_t n = build_icmp_echo4(app_ip, target_ip, 0x1234, 1, payload, sizeof payload, pkt, sizeof pkt);
+            CHECK("icmp echo build", n > 0);
+            write(test_fd, pkt, (size_t)n);
+            ssize_t r = read_tun(test_fd, rbuf, sizeof rbuf, 3000);
+            CHECK("icmp reply received", r > 0);
+            if (r > 0) {
+                int is_ipv4 = (r > 20 && (rbuf[0] >> 4) == 4);
+                int is_icmp_echo_reply = (r > 28 && rbuf[9] == 1 && rbuf[20] == 0);
+                int dst_is_app = (r > 19 && memcmp(rbuf + 16, app_ip, 4) == 0);
+                CHECK("icmp reply is echo reply to app", is_ipv4 && is_icmp_echo_reply && dst_is_app);
+            }
+        }
+
+        // ---------- 1.2 TCP CONNECT 三向交握 + echo ----------
+        {
+            uint32_t srv_isn = tcp_echo_hello(test_fd, app_ip, target_ip, htons(12345), htons(80));
+            CHECK("tcp connect echo", srv_isn != 0);
+            CHECK("tcp server event OK", atomic_load(&g_host_last_server_event) == SE_EVENT_OK);
+        }
+
+        // ---------- 1.3 UDP relay echo ----------
+        {
+            const uint16_t sport = htons(53000);
+            const uint16_t dport = htons(53);
+            const unsigned char msg[] = "ping";
+            unsigned char pkt[512], rbuf[512];
+
+            ssize_t n = udp_build_packet(app_ip, target_ip, AF_INET, sport, dport,
+                                         msg, sizeof msg, pkt, sizeof pkt);
+            CHECK("udp packet build", n > 0);
+            write(test_fd, pkt, (size_t)n);
+
+            payload_ctx_t pctx = { msg, sizeof msg };
+            int got = wait_for_packet(test_fd, rbuf, sizeof rbuf, 5000, udp_has_payload, &pctx);
+            CHECK("udp relay echo", got == 1);
+        }
+
+        // ---------- 1.4 分片 UDP 端到端重組 echo ----------
+        {
+            const uint16_t sport = htons(54000);
+            const uint16_t dport = htons(53);
+            const unsigned char msg[] = "frag-echo";
+            unsigned char f0[512], f1[512], rbuf[512];
+            ssize_t n0, n1;
+            build_udp_fragments(app_ip, target_ip, sport, dport, msg, sizeof msg, 0x5678,
+                                f0, &n0, f1, &n1);
+            CHECK("frag udp build", n0 > 0 && n1 > 0);
+            write(test_fd, f0, (size_t)n0);
+            write(test_fd, f1, (size_t)n1);
+
+            payload_ctx_t pctx = { msg, sizeof msg };
+            int got = wait_for_packet(test_fd, rbuf, sizeof rbuf, 5000, udp_has_payload, &pctx);
+            CHECK("fragmented udp reassembly echo", got == 1);
+        }
+
+        // ---------- 1.5 TCP FIN 半關閉：App FIN → SHUT_WR → server EOF → 引擎回 FIN ----------
+        {
+            const uint16_t sport = htons(12346);
+            const uint16_t dport = htons(80);
+            unsigned char rbuf[512];
+            // 先完成一次 echo（"hello" 6 bytes），讓 seq 有確定基準：
+            // echo 後 App 下一個 seq = 1001+6 = 1007、srv_next = srv_isn+7。
+            uint32_t srv_isn = tcp_echo_hello(test_fd, app_ip, target_ip, sport, dport);
+            CHECK("fin: echo precondition", srv_isn != 0);
+            if (srv_isn != 0) {
+                unsigned char finpkt[512];
+                ssize_t fn = tcp_build_segment(app_ip, target_ip, AF_INET, sport, dport,
+                                               1007, srv_isn + 7, 0x11, NULL, 0, 64240,
+                                               finpkt, sizeof finpkt);
+                write(test_fd, finpkt, (size_t)fn);
+                int got = wait_for_packet(test_fd, rbuf, sizeof rbuf, 5000, tcp_has_fin, NULL);
+                CHECK("tcp FIN propagated back", got == 1);
+            }
+        }
+
+        // ---------- 1.6 軟重連：重置 session 但保留引擎，新連線仍可建立 ----------
+        {
+            const uint16_t sport = htons(12347);
+            const uint16_t dport = htons(80);
+            // 先建立一個活躍 session
+            uint32_t srv_isn = tcp_echo_hello(test_fd, app_ip, target_ip, sport, dport);
+            CHECK("reconnect: precondition session", srv_isn != 0);
+
+            tun_socks_reconnect(NULL);
+            usleep(300000);   // 等引擎迴圈處理 reset（kick + epoll 喚醒）
+
+            CHECK("engine still running after soft reconnect", tun_socks_is_running() == 1);
+
+            // 新 session 仍可建立（證明重置未破壞引擎）
+            unsigned char rbuf[512];
+            const uint16_t sport2 = htons(12348);
+            unsigned char syn[512];
+            ssize_t n = tcp_build_segment(app_ip, target_ip, AF_INET, sport2, dport,
+                                          1000, 0, 0x02, NULL, 0, 64240, syn, sizeof syn);
+            write(test_fd, syn, (size_t)n);
+            ssize_t r = read_tun(test_fd, rbuf, sizeof rbuf, 3000);
+            int got_synack = 0;
+            if (r > 0) {
+                int ihl = (rbuf[0] & 0x0F) * 4;
+                got_synack = (rbuf[ihl + 13] & 0x12) == 0x12;
+            }
+            CHECK("tcp SYN-ACK after soft reconnect", got_synack);
+        }
+
+        // ---------- 1.7 乾淨停止 ----------
+        tun_socks_stop();
+        CHECK("engine stopped (default)", tun_socks_is_running() == 0);
+        CHECK("no unexpected engine stop", atomic_load(&g_host_engine_stopped) == 0);
+        close(test_fd);
+    }
+
+    // ============ 情境 2：RFC 1929 認證成功 → TCP echo 正常 ============
+    {
+        g_fake_require_auth = 1;
+        g_fake_reject_auth = 0;
+        atomic_store(&g_host_last_server_event, SE_EVENT_NONE);
+        int test_fd = start_engine(tcp_port, "u", "p", 0, 0);
+        CHECK("engine start (auth-ok)", test_fd >= 0);
+
+        uint32_t srv_isn = tcp_echo_hello(test_fd, app_ip, target_ip, htons(12345), htons(80));
+        CHECK("auth-ok: tcp echo", srv_isn != 0);
+        CHECK("auth-ok: event OK", atomic_load(&g_host_last_server_event) == SE_EVENT_OK);
+
+        tun_socks_stop();
+        close(test_fd);
+        g_fake_require_auth = 0;
+    }
+
+    // ============ 情境 3：RFC 1929 認證被拒 → RST + AUTH_FAIL ============
+    {
+        g_fake_require_auth = 1;
+        g_fake_reject_auth = 1;
+        atomic_store(&g_host_last_server_event, SE_EVENT_NONE);
+        int test_fd = start_engine(tcp_port, "u", "p", 0, 0);
+        CHECK("engine start (auth-reject)", test_fd >= 0);
+
+        const uint16_t sport = htons(22345);
+        const uint16_t dport = htons(80);
         unsigned char pkt[512], rbuf[512];
-        const unsigned char payload[] = "ping42";
-        ssize_t n = build_icmp_echo4(app_ip, target_ip, 0x1234, 1, payload, sizeof payload, pkt, sizeof pkt);
-        CHECK("icmp echo build", n > 0);
+        ssize_t n = tcp_build_segment(app_ip, target_ip, AF_INET, sport, dport,
+                                      1000, 0, 0x02, NULL, 0, 64240, pkt, sizeof pkt);
         write(test_fd, pkt, (size_t)n);
         ssize_t r = read_tun(test_fd, rbuf, sizeof rbuf, 3000);
-        CHECK("icmp reply received", r > 0);
-        if (r > 0) {
-            int is_ipv4 = (r > 20 && (rbuf[0] >> 4) == 4);
-            int is_icmp_echo_reply = (r > 28 && rbuf[9] == 1 && rbuf[20] == 0);
-            int dst_is_app = (r > 19 && memcmp(rbuf + 16, app_ip, 4) == 0);
-            CHECK("icmp reply is echo reply to app", is_ipv4 && is_icmp_echo_reply && dst_is_app);
-        }
+        CHECK("auth-reject: SYN-ACK", r > 0);
+
+        // 認證被拒 → 引擎送 RST，並通知 AUTH_FAIL（不觸發看門狗）
+        int got = wait_for_packet(test_fd, rbuf, sizeof rbuf, 5000, tcp_has_rst, NULL);
+        CHECK("auth-reject: RST received", got == 1);
+        CHECK("auth-reject: event AUTH_FAIL", atomic_load(&g_host_last_server_event) == SE_EVENT_AUTH_FAIL);
+
+        tun_socks_stop();
+        close(test_fd);
+        g_fake_require_auth = 0;
+        g_fake_reject_auth = 0;
     }
 
-    // ---------- 5. TCP CONNECT 三向交握 + echo ----------
+    // ============ 情境 4：UDP-in-TCP（自訂指令 0x04）frame relay echo ============
     {
-        const uint16_t sport = htons(12345);
-        const uint16_t dport = htons(80);
-        unsigned char syn[512], rbuf[512];
+        g_fake_reject_udp_tcp = 0;
+        int test_fd = start_engine(tcp_port, "", "", 1, 0);
+        CHECK("engine start (udp-in-tcp)", test_fd >= 0);
 
-        // SYN
-        ssize_t n = tcp_build_segment(app_ip, target_ip, AF_INET, sport, dport,
-                                      1000, 0, 0x02, NULL, 0, 64240, syn, sizeof syn);
-        CHECK("tcp SYN build", n > 0);
-        write(test_fd, syn, (size_t)n);
-
-        // SYN-ACK
-        ssize_t r = read_tun(test_fd, rbuf, sizeof rbuf, 3000);
-        CHECK("tcp SYN-ACK received", r > 0);
-        int synack_ok = 0;
-        uint32_t srv_isn = 0;
-        if (r > 0) {
-            int ihl = (rbuf[0] & 0x0F) * 4;
-            uint8_t flags = rbuf[ihl + 13];
-            uint32_t ack_field;
-            memcpy(&ack_field, rbuf + ihl + 8, 4);
-            srv_isn = tcp_seq(rbuf);
-            uint32_t ack = ntohl(ack_field);
-            synack_ok = (flags & 0x12) == 0x12 && ack == 1001;
-            CHECK("tcp SYN-ACK flags/ack", synack_ok);
-        }
-
-        if (synack_ok) {
-            // ACK（完成三向交握）
-            unsigned char ackpkt[512];
-            ssize_t an = tcp_build_segment(app_ip, target_ip, AF_INET, sport, dport,
-                                           1001, srv_isn + 1, 0x10, NULL, 0, 64240, ackpkt, sizeof ackpkt);
-            write(test_fd, ackpkt, (size_t)an);
-
-            // DATA（PSH|ACK）
-            const unsigned char msg[] = "hello";
-            unsigned char dpkt[512];
-            ssize_t dn = tcp_build_segment(app_ip, target_ip, AF_INET, sport, dport,
-                                           1001, srv_isn + 1, 0x18, msg, sizeof msg, 64240, dpkt, sizeof dpkt);
-            write(test_fd, dpkt, (size_t)dn);
-
-            // echo 回來（可能夾帶 ACK，迴圈等 payload 相符）
-            payload_ctx_t pctx = { msg, sizeof msg };
-            int got = wait_for_packet(test_fd, rbuf, sizeof rbuf, 5000, tcp_has_payload, &pctx);
-            CHECK("tcp connect echo", got == 1);
-            // CONNECT 成功 → 應有 EVENT_OK
-            CHECK("tcp server event OK", atomic_load(&g_host_last_server_event) == 0);
-        }
-    }
-
-    // ---------- 6. UDP relay echo ----------
-    {
-        const uint16_t sport = htons(53000);
+        const uint16_t sport = htons(55000);
         const uint16_t dport = htons(53);
         const unsigned char msg[] = "ping";
         unsigned char pkt[512], rbuf[512];
-
         ssize_t n = udp_build_packet(app_ip, target_ip, AF_INET, sport, dport,
                                      msg, sizeof msg, pkt, sizeof pkt);
-        CHECK("udp packet build", n > 0);
+        CHECK("udp-in-tcp: packet build", n > 0);
         write(test_fd, pkt, (size_t)n);
 
         payload_ctx_t pctx = { msg, sizeof msg };
         int got = wait_for_packet(test_fd, rbuf, sizeof rbuf, 5000, udp_has_payload, &pctx);
-        CHECK("udp relay echo", got == 1);
+        CHECK("udp-in-tcp: relay echo", got == 1);
+
+        tun_socks_stop();
+        close(test_fd);
     }
 
-    // ---------- 7. 分片 UDP 端到端重組 echo（兩片 IPv4 分片 → 重組 → relay） ----------
+    // ============ 情境 5：UDP-in-TCP 伺服器不支援 → 退回標準 UDP ASSOCIATE ============
     {
-        const uint16_t sport = htons(54000);
+        g_fake_reject_udp_tcp = 1;
+        int test_fd = start_engine(tcp_port, "", "", 1, 0);
+        CHECK("engine start (udp-tcp-fallback)", test_fd >= 0);
+
+        const uint16_t sport = htons(56000);
         const uint16_t dport = htons(53);
-        const unsigned char msg[] = "frag-echo";
-        unsigned char f0[512], f1[512], rbuf[512];
-        ssize_t n0, n1;
-        build_udp_fragments(app_ip, target_ip, sport, dport, msg, sizeof msg, 0x5678,
-                            f0, &n0, f1, &n1);
-        CHECK("frag udp build", n0 > 0 && n1 > 0);
-        write(test_fd, f0, (size_t)n0);
-        write(test_fd, f1, (size_t)n1);
+        const unsigned char msg[] = "fb";
+        unsigned char pkt[512], rbuf[512];
+        ssize_t n = udp_build_packet(app_ip, target_ip, AF_INET, sport, dport,
+                                     msg, sizeof msg, pkt, sizeof pkt);
+        write(test_fd, pkt, (size_t)n);
 
         payload_ctx_t pctx = { msg, sizeof msg };
         int got = wait_for_packet(test_fd, rbuf, sizeof rbuf, 5000, udp_has_payload, &pctx);
-        CHECK("fragmented udp reassembly echo", got == 1);
+        CHECK("udp-tcp fallback: relay echo via 0x03", got == 1);
+
+        tun_socks_stop();
+        close(test_fd);
+        g_fake_reject_udp_tcp = 0;
     }
 
-    // ---------- 8. 乾淨停止 ----------
-    tun_socks_stop();
-    CHECK("engine stopped", tun_socks_is_running() == 0);
-    CHECK("no unexpected engine stop", atomic_load(&g_host_engine_stopped) == 0);
+    // ============ 情境 6：Remote DNS（fakedns）端到端 ============
+    // App 發 DNS A 查詢 → 引擎攔截回 fake IP（198.18/15）→ App 連 fake IP →
+    // 引擎查回網域、以 ATYP=0x03 撥號。tcp_echo_hello 的 echo 往返保證 CONNECT
+    // 已完成（假 server 也已在 ATYP=0x03 分支記錄網域），故其後讀網域無競態。
+    {
+        g_fake_saw_domain = 0;
+        g_fake_last_domain[0] = '\0';
+        int test_fd = start_engine(tcp_port, "", "", 0, 1);   // remote_dns=1
+        CHECK("engine start (remote-dns)", test_fd >= 0);
 
-    close(test_fd);   // 引擎已在 stop 時關閉 tun_fd(sp[0])
+        const unsigned char dns_ip[4] = {8, 8, 8, 8};
+        const uint16_t sport = htons(57000);
+
+        // 1. DNS A 查詢 example.com
+        unsigned char dnsq[512], pkt[512], rbuf[512];
+        size_t qlen = build_dns_a_query("example.com", dnsq, sizeof dnsq);
+        CHECK("remote-dns: dns query build", qlen > 0);
+        ssize_t n = udp_build_packet(app_ip, dns_ip, AF_INET, sport, htons(53),
+                                     dnsq, qlen, pkt, sizeof pkt);
+        CHECK("remote-dns: dns packet build", n > 0);
+        write(test_fd, pkt, (size_t)n);
+
+        // 2. 讀 DNS 回覆，解析 fake IP（A record 的 RDATA = 回覆末 4 bytes，網路序）
+        ssize_t r = read_tun(test_fd, rbuf, sizeof rbuf, 3000);
+        CHECK("remote-dns: dns reply received", r > 0);
+        unsigned char fake_ip[4] = {0, 0, 0, 0};
+        int dns_ok = 0;
+        if (r > 0) {
+            const unsigned char *payload;
+            ssize_t plen = udp_payload(rbuf, (size_t)r, &payload);
+            int qr = plen > 2 && (payload[2] & 0x80) != 0;             // QR=1
+            int an = plen > 7 && payload[6] == 0 && payload[7] == 1;   // ANCOUNT=1
+            if (qr && an && plen >= 4) {
+                memcpy(fake_ip, payload + plen - 4, 4);
+                dns_ok = (fake_ip[0] == 198 && fake_ip[1] == 18);      // 198.18.0.0/15
+            }
+        }
+        CHECK("remote-dns: fake IP in 198.18/15", dns_ok);
+
+        // 3. 連 fake IP：echo 往返完成 CONNECT，並驗證 server 收到網域
+        if (dns_ok) {
+            uint32_t srv_isn = tcp_echo_hello(test_fd, app_ip, fake_ip, htons(57001), htons(80));
+            CHECK("remote-dns: tcp echo via fake IP", srv_isn != 0);
+            CHECK("remote-dns: server saw domain", g_fake_saw_domain == 1);
+            CHECK("remote-dns: domain = example.com", strcmp(g_fake_last_domain, "example.com") == 0);
+        }
+
+        tun_socks_stop();
+        close(test_fd);
+    }
+
     close(lfd);
     if (g_udp_relay_fd >= 0) close(g_udp_relay_fd);
 
