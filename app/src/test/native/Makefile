@@ -37,16 +37,21 @@ SRC_dns_query    := dns_query.c
 SRC_icmp_packet  := icmp_packet.c checksum.c
 SRC_udp_tcp      := udp_tcp.c
 SRC_tcp_buf      := tcp_buf.c
+SRC_engine_util  := engine_util.c socks5_codec.c fake_dns.c dns_synth.c dns_query.c ip_hash.c tcp_state.c
+SRC_hs_pool      := hs_pool.c
 
 # 單一測試額外的 gcc flags（如 -pthread）。
 EXTRA_tun_loopback := -pthread
+EXTRA_engine_util  := -D_DEFAULT_SOURCE -I . -pthread
+EXTRA_hs_pool      := -D_DEFAULT_SOURCE -I . -pthread
 
 ALL_TESTS := checksum socks5 dns_synth tcp_packet ip_parse reasm ip_hash tcp_state \
-             tun_loopback udp_session fake_dns dns_tcp dns_query icmp_packet udp_tcp tcp_buf
+             tun_loopback udp_session fake_dns dns_tcp dns_query icmp_packet udp_tcp tcp_buf \
+             engine_util hs_pool
 
 # sanitizer 下的 golden 測試（原 CI 列舉的 offset-sensitive 子集）。
 GOLDEN_TESTS := ip_parse reasm dns_synth socks5 tcp_packet fake_dns dns_tcp \
-                dns_query icmp_packet udp_tcp
+                dns_query icmp_packet udp_tcp engine_util hs_pool
 
 # 產生每個測試的 build / run / san-build / san-run 目標。
 define test_template
@@ -128,7 +133,14 @@ SYMBOLS := socks5_build_connect_request socks5_build_udp_frame \
            fake_dns_find_domain fake_dns_reset fake_dns_key \
            dns_tcp_scan_frames dns_tcp_frame_len udp_tcp_consume udp_tcp_stream_init \
            socks5_classify_greet_reply socks5_auth_reply_ok socks5_atyp_bnd_len \
-           ip_addr_eq
+           ip_addr_eq \
+           tcp_handle_packet tcp_handle_event tcp_flush_all tcp_sweep \
+           tcp_soft_reset tcp_shutdown_collect tcp_idle_gc tcp_graveyard_collect \
+           udp_handle_packet udp_handle_event udp_soft_reset udp_shutdown_collect \
+           udp_idle_gc udp_graveyard_collect \
+           hs_pool_start hs_pool_stop hs_submit \
+           socks5_greet_auth srv_snapshot next_tcp_isn dns_build_reply \
+           set_nonblocking engine_fake_dns_reset engine_srv_host_update
 
 check-symbols:
 	@fail=0; for sym in $(SYMBOLS); do n=$$(cat $(MAIN)/*.c | grep -c "\b$$sym\b" || true); if [ "$$n" -eq 0 ]; then echo "ERROR: $$sym 未在引擎原始碼中呼叫——抽離模組與引擎實作已分叉"; fail=1; fi; done; if [ "$$fail" -ne 0 ]; then exit 1; fi; echo "所有抽離模組均已接回引擎"
