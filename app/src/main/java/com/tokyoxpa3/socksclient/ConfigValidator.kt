@@ -7,9 +7,9 @@ package com.tokyoxpa3.socksclient
  */
 object ConfigValidator {
 
-    /** 伺服器參數是否有效：host 非空且 port 在 1..65535。port 為 null（無法解析）視為無效。 */
+    /** 伺服器參數是否有效：host 非空白且 port 在 1..65535。port 為 null（無法解析）視為無效。 */
     fun isServerValid(host: String, port: Int?): Boolean =
-        host.isNotEmpty() && port != null && port in 1..65535
+        host.isNotBlank() && port != null && port in 1..65535
 
     /** 單一 DNS 欄位是否有效：空白視為有效（不填則用預設）；非空白須為數字 IP。 */
     fun isDnsValid(dns: String): Boolean =
