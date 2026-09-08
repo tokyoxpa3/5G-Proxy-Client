@@ -339,8 +339,18 @@ static void *udp_session_thread(void *arg) {
             if (recv_all(cfd, buf, bnd_len) < 0) goto fail;
             udp_tcp = 1;
         } else {
-            // 伺服器不支援 0x04：同一連線退回標準 UDP ASSOCIATE（0x03）
+            // 伺服器不支援 0x04：同一連線退回標準 UDP ASSOCIATE（0x03）。
+            // 失敗回覆仍含 BND.ADDR/PORT，須完整吃掉，否則殘留位元組會污染下一筆 0x03 的回覆。
             LOGI("伺服器不支援 UDP-in-TCP (REP=%d)，退回 UDP-in-UDP", buf[1]);
+            int atyp_r = buf[3];
+            int bnd_len = socks5_atyp_bnd_len(atyp_r);
+            if (bnd_len == -2) {   // 0x03 變長：先讀 1-byte 長度再讀 len+2
+                unsigned char al;
+                if (recv_all(cfd, &al, 1) < 0) goto fail;
+                if (recv_all(cfd, buf, (size_t)al + 2) < 0) goto fail;
+            } else if (bnd_len > 0) {
+                if (recv_all(cfd, buf, (size_t)bnd_len) < 0) goto fail;
+            }
             req[1] = 0x03;
             if (send_all(cfd, req, 10) < 0) goto fail;
             if (recv_all(cfd, buf, 4) < 0) goto fail;

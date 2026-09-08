@@ -608,7 +608,10 @@ void tcp_handle_event(tcp_sess_t *sess, uint32_t ev, time_t now) {
         if (sess->closed) { tcp_session_destroy(sess); return; }
     }
     if (ev & (EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP)) {
-        if (ev & (EPOLLERR | EPOLLHUP)) { close_tcp_session(sess, 1); return; }
+        // EPOLLHUP 常伴隨「本端已 SHUT_WR、對端完整關閉」的收尾出現（半關後的全關）。
+        // 若在此直接 RST 會丟掉 EOF 訊號，使 App 收不到對側 FIN；交由下方 recv 迴圈
+        // 分辨：recv==0 為乾淨 EOF（srv_eof→送 FIN），recv<0 且非 EAGAIN 才是真錯誤。
+        if (ev & EPOLLERR) { close_tcp_session(sess, 1); return; }
         for (;;) {
             if (sess->srv_buf == NULL) sess->srv_buf = malloc(TCP_SRV_BUF_CAP);
             if (!sess->srv_buf) { close_tcp_session(sess, 1); return; }
