@@ -36,6 +36,9 @@ captures/
 # ZCode workspace (session scratch: plans, stress-test scripts, screenshots)
 .zcode/
 
+# 本地開發備忘（含 SSH VM 憑證，勿提交）
+AGENTS.md
+
 # Scratch / test artifacts
 screen.png
 tunnel_config_test.xml

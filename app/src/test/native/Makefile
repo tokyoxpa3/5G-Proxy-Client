@@ -25,8 +25,8 @@ SRC_checksum     := checksum.c
 SRC_socks5       := socks5_codec.c
 SRC_dns_synth    := dns_synth.c dns_query.c
 SRC_tcp_packet   := tcp_packet.c checksum.c
-SRC_ip_parse     := ip_parse.c reasm.c
-SRC_reasm        := reasm.c
+SRC_ip_parse     := ip_parse.c reasm.c checksum.c
+SRC_reasm        := reasm.c ip_parse.c checksum.c
 SRC_ip_hash      := ip_hash.c
 SRC_tcp_state    := tcp_state.c
 SRC_tun_loopback := socks5_codec.c tcp_packet.c checksum.c
@@ -66,9 +66,9 @@ san-$(1): $(OUT)/san-$(1)
 endef
 $(foreach t,$(ALL_TESTS),$(eval $(call test_template,$(t))))
 
-.PHONY: test sanitize fuzz check-symbols clean
-test: $(addprefix run-,$(ALL_TESTS))
-sanitize: $(addprefix san-,$(GOLDEN_TESTS))
+.PHONY: test sanitize fuzz check-symbols clean tun_engine
+test: $(addprefix run-,$(ALL_TESTS)) run-tun_engine
+sanitize: $(addprefix san-,$(GOLDEN_TESTS)) san-tun_engine
 
 # 封包解析器 mutation fuzz（ASan/UBSan 抓越界與未定義行為）。
 FUZZ_SRC := ip_parse.c reasm.c dns_query.c dns_synth.c dns_tcp.c socks5_codec.c \
@@ -81,6 +81,33 @@ $(OUT)/fuzz_parsers: fuzz_parsers.c $(addprefix $(MAIN)/,$(FUZZ_SRC))
 fuzz: $(OUT)/fuzz_parsers
 	$(OUT)/fuzz_parsers 200000
 
+# ---------------------------------------------------------------------------
+# tun_engine 整合測試：連結真正的 tun_socks.c 引擎（epoll 事件迴圈 + handshake
+# 執行緒 + SOCKS5 狀態機）。與純邏輯單元測試不同，需 host_jni_bridge.c（主機版
+# request_java_socket）、-pthread、-I .（讓 <android/log.h> 解析到測試目錄 shim），
+# 故以專用規則處理，不進入既有 test_template（其 SRC 一律以 $(MAIN) 為前綴）。
+ENGINE_SRC := tun_socks.c checksum.c socks5_codec.c dns_synth.c dns_query.c \
+              fake_dns.c dns_tcp.c tcp_packet.c tcp_buf.c icmp_packet.c \
+              ip_parse.c ip_hash.c reasm.c tcp_state.c udp_session.c udp_tcp.c \
+              engine_util.c hs_pool.c udp_sess.c tcp_sess.c
+
+$(OUT)/tun_engine: tun_engine_test.c host_jni_bridge.c $(addprefix $(MAIN)/,$(ENGINE_SRC))
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -pthread -D_DEFAULT_SOURCE -I . -I $(MAIN) -o $@ tun_engine_test.c host_jni_bridge.c $(addprefix $(MAIN)/,$(ENGINE_SRC))
+
+run-tun_engine: $(OUT)/tun_engine
+	$(OUT)/tun_engine
+
+# 便捷別名：`make tun_engine` 單獨編譯執行整合測試（plan 文件驗證指令即用此名）
+tun_engine: run-tun_engine
+
+$(OUT)/san-tun_engine: tun_engine_test.c host_jni_bridge.c $(addprefix $(MAIN)/,$(ENGINE_SRC))
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) $(SAN) -pthread -D_DEFAULT_SOURCE -I . -I $(MAIN) -o $@ tun_engine_test.c host_jni_bridge.c $(addprefix $(MAIN)/,$(ENGINE_SRC))
+
+san-tun_engine: $(OUT)/san-tun_engine
+	$(OUT)/san-tun_engine
+
 # 驗證抽離模組均有被 tun_socks.c 直接接回，避免抽離後兩者分叉。
 # 僅列「tun_socks.c 直接呼叫」的第一層符號；二層輔助（如 dns_build_fake_ip6，
 # 由 fake_dns.c 呼叫）不在本清單，否則 grep tun_socks.c 會誤報為分叉。
@@ -89,7 +116,8 @@ SYMBOLS := socks5_build_connect_request socks5_build_udp_frame \
            tcp_build_segment tcp_build_synack udp_build_packet \
            icmp4_build_echo_reply icmp6_build_echo_reply icmp6_build_na \
            dns_query_parse dns_build_reply_pure \
-           reasm_insert_seg tcp_seq_gt tcp_win_field_pure tcp_parse_window_scale \
+           reasm_table_insert reasm_table_gc reasm_table_clear \
+           tcp_seq_gt tcp_win_field_pure tcp_parse_window_scale \
            ip_hash_bucket tcp_isn_generate tcp_win_scaled tcp_flow_window_full \
            tcp_srv_should_send_fin tcp_app_can_shutdown_write tcp_classify_in \
            tcp_is_idle tcp_post_fin_send_rst tcp_server_drained tcp_recv_full_should_close \
@@ -103,7 +131,7 @@ SYMBOLS := socks5_build_connect_request socks5_build_udp_frame \
            ip_addr_eq
 
 check-symbols:
-	@fail=0; for sym in $(SYMBOLS); do n=$$(grep -c "\b$$sym\b" $(MAIN)/tun_socks.c || true); if [ "$$n" -eq 0 ]; then echo "ERROR: $$sym 未在 tun_socks.c 中呼叫——抽離模組與引擎實作已分叉"; fail=1; fi; done; if [ "$$fail" -ne 0 ]; then exit 1; fi; echo "所有抽離模組均已接回引擎"
+	@fail=0; for sym in $(SYMBOLS); do n=$$(cat $(MAIN)/*.c | grep -c "\b$$sym\b" || true); if [ "$$n" -eq 0 ]; then echo "ERROR: $$sym 未在引擎原始碼中呼叫——抽離模組與引擎實作已分叉"; fail=1; fi; done; if [ "$$fail" -ne 0 ]; then exit 1; fi; echo "所有抽離模組均已接回引擎"
 
 clean:
 	rm -rf $(OUT)

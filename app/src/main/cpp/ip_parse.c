@@ -2,6 +2,7 @@
 // 獨立成檔以便 host 端編譯做單元測試；不依賴 POSIX/Android API、不碰引擎狀態。
 #include <string.h>
 #include "ip_parse.h"
+#include "checksum.h"
 
 // 網路序 → host 序（可攜版，避免依賴 arpa/inet.h）
 #ifndef ntohl
@@ -105,5 +106,27 @@ int ip6_reasm_rebuild(const unsigned char *pre_frag_hdr, size_t pre_frag_len,
     out[5] = (unsigned char)(payload_len & 0xFF);
     out[patch_off] = next_hdr;                       // 44 → L4 協定
     memcpy(out + pre_frag_len, payload, plen);
+    return (int)total;
+}
+
+// 重建重組完成的 IPv4 封包：拷貝 pre-fragment 表頭、重設 total length、
+// 清除 flags/frag offset、重算 header checksum、接上重組後 payload。
+// ip_hdr 指向含選項的 IPv4 表頭（ip_hdr_len 位元組），其 total length 欄位會被覆寫為實際總長。
+// 回傳總長，或 -1（ip_hdr_len 非法或 out_cap 不足）。
+int ip4_reasm_rebuild(const unsigned char *ip_hdr, size_t ip_hdr_len,
+                      const unsigned char *payload, size_t plen,
+                      unsigned char *out, size_t out_cap) {
+    if (ip_hdr_len < 20) return -1;
+    size_t total = ip_hdr_len + plen;
+    if (total > out_cap) return -1;
+    memcpy(out, ip_hdr, ip_hdr_len);
+    out[2] = (unsigned char)(total >> 8);            // total length（16-bit）
+    out[3] = (unsigned char)(total & 0xFF);
+    out[6] = 0; out[7] = 0;                          // 清除 flags / fragment offset
+    out[10] = 0; out[11] = 0;                        // 先清 checksum 再重算
+    uint16_t csum = checksum16(out, ip_hdr_len);
+    out[10] = (unsigned char)(csum >> 8);
+    out[11] = (unsigned char)(csum & 0xFF);
+    memcpy(out + ip_hdr_len, payload, plen);
     return (int)total;
 }

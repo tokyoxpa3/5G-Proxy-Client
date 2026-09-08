@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "ip_parse.h"
 #include "reasm.h"
+#include "checksum.h"
 
 static int g_fail = 0;
 
@@ -272,6 +273,31 @@ int main(void) {
         CHECK("e2e nested patched=UDP", out[40] == 17);
         CHECK("e2e nested payload_len=20", out[4] == 0 && out[5] == 20);
         CHECK("e2e nested payload", memcmp(out + 48, d0, 8) == 0 && memcmp(out + 56, d1, 4) == 0);
+    }
+
+    // 19. ip4_reasm_rebuild：v4 表頭 total length / 清 flags / 重算 checksum
+    {
+        unsigned char hdr[20] = {0};
+        hdr[0] = 0x45;                       // ver 4, IHL 5
+        hdr[8] = 64;                          // TTL
+        hdr[9] = 17;                          // proto UDP
+        hdr[12] = 10; hdr[13] = 0; hdr[14] = 0; hdr[15] = 1;   // src 10.0.0.1
+        hdr[16] = 192; hdr[17] = 168; hdr[18] = 1; hdr[19] = 1; // dst 192.168.1.1
+        // 模擬曾為分片的表頭殘留：total length 與 flags/frag offset 均為髒值，應被重設/清除
+        hdr[2] = 0x00; hdr[3] = 28;
+        hdr[6] = 0x20; hdr[7] = 0x01;         // MF=1 + frag offset=1
+        unsigned char payload[] = {0x11, 0x22, 0x33, 0x44};
+        unsigned char out[64];
+        int n = ip4_reasm_rebuild(hdr, 20, payload, 4, out, sizeof out);
+        CHECK("ip4 rebuild len=24", n == 24);
+        CHECK("ip4 rebuild total_len=24", out[2] == 0 && out[3] == 24);
+        CHECK("ip4 rebuild flags/offset cleared", out[6] == 0 && out[7] == 0);
+        CHECK("ip4 rebuild payload", memcmp(out + 20, payload, 4) == 0);
+        // 正確的 IPv4 表頭 checksum：整份表頭（含 checksum 欄）相加應為 0
+        uint16_t csum = checksum16(out, 20);
+        CHECK("ip4 rebuild checksum ok", csum == 0);
+        // out_cap 不足 → -1
+        CHECK("ip4 rebuild cap underflow", ip4_reasm_rebuild(hdr, 20, payload, 4, out, 23) == -1);
     }
 
     printf(g_fail ? "\nRESULT: FAIL\n" : "\nRESULT: PASS\n");

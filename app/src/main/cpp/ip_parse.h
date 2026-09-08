@@ -57,6 +57,13 @@ int ip6_reasm_rebuild(const unsigned char *pre_frag_hdr, size_t pre_frag_len,
                       const unsigned char *payload, size_t plen,
                       unsigned char *out, size_t out_cap);
 
+// 重建重組完成的 IPv4 封包：拷貝 pre-fragment 表頭、重設 total length、
+// 清除 flags/frag offset、重算 header checksum、接上重組後 payload。
+// 回傳總長，或 -1（ip_hdr_len 非法或 out_cap 不足）。
+int ip4_reasm_rebuild(const unsigned char *ip_hdr, size_t ip_hdr_len,
+                      const unsigned char *payload, size_t plen,
+                      unsigned char *out, size_t out_cap);
+
 #ifdef __cplusplus
 }
 #endif

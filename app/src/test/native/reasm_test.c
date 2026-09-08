@@ -27,6 +27,16 @@ static int ins(size_t offset, const unsigned char *data, size_t len, int mf) {
                             &g_s.total_len, &g_s.have_last);
 }
 
+// ---- reasm_table_insert（stateful 重組表）測試用回呼：捕捉重組完成封包 ----
+static unsigned char g_cap[1024];
+static size_t g_cap_len = 0;
+static int g_cap_count = 0;
+static void emit_capture(const unsigned char *out, size_t outlen, void *ctx) {
+    (void)ctx;
+    if (outlen <= sizeof g_cap) { memcpy(g_cap, out, outlen); g_cap_len = outlen; }
+    g_cap_count++;
+}
+
 int main(void) {
     // 1. 循序到達
     state_init();
@@ -82,6 +92,114 @@ int main(void) {
     state_init();
     CHECK("adjacent frag1", ins(0, (const unsigned char*)"AB", 2, 1) == 0);
     CHECK("adjacent frag2", ins(2, (const unsigned char*)"CD", 2, 0) == 1);
+
+    // 10. reasm_table v4 兩片重組端到端
+    {
+        reasm_table_t t;
+        reasm_table_init(&t);
+        ip_addr_t src = { AF_INET, {10,0,0,1} };
+        ip_addr_t dst = { AF_INET, {8,8,8,8} };
+        unsigned char hdr[20] = {0};
+        hdr[0] = 0x45; hdr[9] = 17;
+        memcpy(hdr + 12, src.ip, 4); memcpy(hdr + 16, dst.ip, 4);
+        unsigned char d0[8] = {0xA0,0xA1,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7};
+        unsigned char d1[4] = {0xB0,0xB1,0xB2,0xB3};
+
+        g_cap_len = 0; g_cap_count = 0;
+        reasm_table_insert(&t, AF_INET, &src, &dst, 17, 0x1234, 0, d0, 8, 1, hdr, 20, 0, 100, emit_capture, NULL);
+        CHECK("tbl v4 frag0 no emit", g_cap_count == 0);
+        reasm_table_insert(&t, AF_INET, &src, &dst, 17, 0x1234, 8, d1, 4, 0, hdr, 20, 0, 101, emit_capture, NULL);
+        CHECK("tbl v4 frag1 emit once", g_cap_count == 1);
+        CHECK("tbl v4 len=32", g_cap_len == 32);
+        CHECK("tbl v4 total_len=32", g_cap[2] == 0 && g_cap[3] == 32);
+        CHECK("tbl v4 payload order", memcmp(g_cap + 20, d0, 8) == 0 && memcmp(g_cap + 28, d1, 4) == 0);
+        reasm_table_clear(&t);
+    }
+
+    // 11. reasm_table v6 兩片重組端到端（Fragment 為首個 ext header）
+    {
+        reasm_table_t t;
+        reasm_table_init(&t);
+        ip_addr_t src = { AF_INET6, {0} }; src.ip[15] = 1;                       // ::1
+        ip_addr_t dst = { AF_INET6, {0x20,0x01,0x0d,0xb8} }; dst.ip[15] = 1;      // 2001:db8::1
+
+        unsigned char f0[56] = {0};
+        f0[0] = 0x60; f0[6] = 44;              // Fragment
+        f0[40] = 17;                            // Fragment.next = UDP
+        f0[42] = 0x00; f0[43] = 0x01;           // offset=0, M=1
+        f0[44]=0x12; f0[45]=0x34; f0[46]=0x56; f0[47]=0x78;
+        unsigned char d0[8] = {0xA0,0xA1,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7};
+        memcpy(f0 + 48, d0, 8);
+
+        unsigned char f1[52] = {0};
+        f1[0] = 0x60; f1[6] = 44;
+        f1[40] = 17;
+        f1[42] = 0x00; f1[43] = 0x08;           // offset=8, M=0
+        f1[44]=0x12; f1[45]=0x34; f1[46]=0x56; f1[47]=0x78;
+        unsigned char d1[4] = {0xB0,0xB1,0xB2,0xB3};
+        memcpy(f1 + 48, d1, 4);
+
+        uint8_t nh; size_t fo; int mf; uint32_t id; size_t fdo, pre, po;
+        ipv6_find_fragment(f0, 56, &nh, &fo, &mf, &id, &fdo, &pre, &po);
+        g_cap_len = 0; g_cap_count = 0;
+        reasm_table_insert(&t, AF_INET6, &src, &dst, nh, id, fo, f0 + fdo, 8, mf, f0, pre, po, 100, emit_capture, NULL);
+        CHECK("tbl v6 frag0 no emit", g_cap_count == 0);
+
+        ipv6_find_fragment(f1, 52, &nh, &fo, &mf, &id, &fdo, &pre, &po);
+        reasm_table_insert(&t, AF_INET6, &src, &dst, nh, id, fo, f1 + fdo, 4, mf, f1, pre, po, 101, emit_capture, NULL);
+        CHECK("tbl v6 frag1 emit once", g_cap_count == 1);
+        CHECK("tbl v6 len=52", g_cap_len == 52);
+        CHECK("tbl v6 next=UDP", g_cap[6] == 17);
+        CHECK("tbl v6 payload", memcmp(g_cap + 40, d0, 8) == 0 && memcmp(g_cap + 48, d1, 4) == 0);
+        reasm_table_clear(&t);
+    }
+
+    // 12. reasm_table GC：逾時 entry 被回收
+    {
+        reasm_table_t t;
+        reasm_table_init(&t);
+        ip_addr_t src = { AF_INET, {10,0,0,1} };
+        ip_addr_t dst = { AF_INET, {8,8,8,8} };
+        unsigned char hdr[20] = {0};
+        hdr[0] = 0x45; hdr[9] = 17;
+        unsigned char one = 0xAA;
+        g_cap_count = 0;
+        reasm_table_insert(&t, AF_INET, &src, &dst, 17, 1, 0, &one, 1, 1, hdr, 20, 0, 100, emit_capture, NULL);
+        CHECK("tbl gc entry in use", t.entries[0].in_use == 1);
+        reasm_table_gc(&t, 100 + REASM_TIMEOUT_SEC + 1);
+        CHECK("tbl gc cleared", t.entries[0].in_use == 0);
+        reasm_table_clear(&t);
+    }
+
+    // 13. reasm_table LRU：滿表時淘汰最舊
+    {
+        reasm_table_t t;
+        reasm_table_init(&t);
+        ip_addr_t src = { AF_INET, {10,0,0,1} };
+        ip_addr_t dst = { AF_INET, {8,8,8,8} };
+        unsigned char hdr[20] = {0};
+        hdr[0] = 0x45; hdr[9] = 17;
+        unsigned char one = 0xAA;
+
+        // 填滿 16 個 entry（相異 id、相同時間）
+        for (uint32_t i = 0; i < REASM_MAX_ENTRIES; i++) {
+            reasm_table_insert(&t, AF_INET, &src, &dst, 17, i, 0, &one, 1, 1, hdr, 20, 0, 1000, emit_capture, NULL);
+        }
+        // 第 17 筆觸發 LRU：淘汰 last_active 最舊者（id 0）
+        reasm_table_insert(&t, AF_INET, &src, &dst, 17, 0xFFFF, 0, &one, 1, 1, hdr, 20, 0, 1001, emit_capture, NULL);
+
+        int id0_alive = 0, id_new_alive = 0, n_in_use = 0;
+        for (int i = 0; i < REASM_MAX_ENTRIES; i++) {
+            if (t.entries[i].in_use) {
+                n_in_use++;
+                if (t.entries[i].id == 0) id0_alive = 1;
+                if (t.entries[i].id == 0xFFFF) id_new_alive = 1;
+            }
+        }
+        CHECK("tbl lru evicted oldest", id0_alive == 0 && id_new_alive == 1);
+        CHECK("tbl lru count stays 16", n_in_use == REASM_MAX_ENTRIES);
+        reasm_table_clear(&t);
+    }
 
     printf(g_fail ? "\nRESULT: FAIL\n" : "\nRESULT: PASS\n");
     return g_fail;
