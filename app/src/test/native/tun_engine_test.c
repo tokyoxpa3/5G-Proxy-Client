@@ -37,14 +37,17 @@
 // ---- 引擎公開介面（定義於 tun_socks.c，此處自行 extern，與 jni_bridge.c 一致） ----
 extern int tun_socks_start(int tun_fd, const char *host, int port,
                            const char *user, const char *pass,
-                           int udp_in_tcp, int remote_dns);
+                           int udp_in_tcp, int remote_dns, const char *dns_passthrough);
 extern void tun_socks_stop(void);
 extern int tun_socks_is_running(void);
 extern void tun_socks_reconnect(const char *new_host);
+extern void tun_socks_get_stats(unsigned long long *to_server, unsigned long long *from_server,
+                                int *tcp_sessions, int *udp_sessions);
 
 // ---- host_jni_bridge.c 提供的測試斷言資料 ----
 extern atomic_int g_host_last_server_event;
 extern atomic_int g_host_engine_stopped;
+extern int g_bridge_verbose;
 
 static int g_fail = 0;
 #define CHECK(name, cond) do { \
@@ -68,6 +71,17 @@ static int g_fake_reject_auth = 0;
 static int g_fake_reject_udp_tcp = 0;
 static char g_fake_last_domain[256];
 static volatile int g_fake_saw_domain = 0;
+
+// 情境 7（上傳回壓）用：
+//   g_fake_discard_upload 1 = CONNECT 後丟棄上傳（不回送），並把 SO_RCVBUF 縮小，
+//                             讓引擎的 srv 送緩衝很快滿 → app_buf 才會真的被填滿
+//   g_fake_stall_read_ms  >0 = CONNECT 回覆成功後先暫停讀取 N ms（逼出零視窗）
+static int g_fake_discard_upload = 0;
+static int g_fake_stall_read_ms = 0;
+static atomic_ullong g_fake_upload_bytes;   // 丟棄模式下實際收到的位元組數
+static atomic_int g_fake_upload_bad;        // 收到非預期內容的次數
+static atomic_int g_fake_upload_exit_n;     // 讀取迴圈結束時的 recv 回傳值
+static atomic_int g_fake_upload_exit_errno; // 讀取迴圈結束時的 errno
 
 static int recv_exact(int fd, void *buf, size_t len) {
     size_t off = 0;
@@ -141,10 +155,29 @@ static void *fake_client(void *arg) {
             // CONNECT: reply success, BND 0.0.0.0:0，然後 echo 回送
             unsigned char ok[10] = {0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
             send_all(fd, ok, 10);
+            if (g_fake_stall_read_ms > 0) {
+                // 先不讀：逼引擎把 app_buf（4 MiB）填滿並通告零視窗。
+                // 不可順手縮小 SO_RCVBUF —— 那會觸發 silly-window 症候群，
+                // 把恢復後的排空速率壓到 ~85 KB/s，測試永遠等不到完成。
+                usleep((useconds_t)g_fake_stall_read_ms * 1000);
+            }
             for (;;) {
                 ssize_t n = recv(fd, buf, sizeof buf, 0);
-                if (n <= 0) break;
-                send_all(fd, buf, (size_t)n);
+                if (n <= 0) {
+                    if (g_fake_discard_upload) {
+                        atomic_store(&g_fake_upload_exit_n, (int)n);
+                        atomic_store(&g_fake_upload_exit_errno, errno);
+                    }
+                    break;
+                }
+                if (g_fake_discard_upload) {
+                    for (ssize_t i = 0; i < n; i++) {
+                        if (buf[i] != 0xA5) atomic_fetch_add(&g_fake_upload_bad, 1);
+                    }
+                    atomic_fetch_add(&g_fake_upload_bytes, (unsigned long long)n);
+                } else {
+                    send_all(fd, buf, (size_t)n);
+                }
             }
             goto done;
         } else if (cmd == 0x03) {
@@ -394,6 +427,16 @@ static int tcp_has_rst(const unsigned char *pkt, size_t len, void *vctx) {
     return (pkt[ihl + 13] & 0x04) != 0;
 }
 
+// predicate：TCP 帶 RST 旗標，且「目的埠」等於 ctx->dport（用來鎖定特定 App 連線）
+typedef struct { uint16_t dport; } rst_port_ctx_t;
+static int tcp_has_rst_to(const unsigned char *pkt, size_t len, void *vctx) {
+    rst_port_ctx_t *c = (rst_port_ctx_t *)vctx;
+    if (!tcp_has_rst(pkt, len, NULL)) return 0;
+    int ihl = (pkt[0] & 0x0F) * 4;
+    uint16_t dp = (uint16_t)((pkt[ihl + 2] << 8) | pkt[ihl + 3]);
+    return dp == c->dport;
+}
+
 // 把一個完整 UDP datagram 拆成兩片 IPv4 分片（frag0 = UDP 頭 8 bytes + MF=1；
 // frag1 = 其餘 payload + MF=0）。分片偏移以 8 為單位，故首片固定取 8 bytes。
 static void build_udp_fragments(const unsigned char src[4], const unsigned char dst[4],
@@ -473,7 +516,7 @@ static int start_engine(int tcp_port, const char *user, const char *pass,
                         int udp_in_tcp, int remote_dns) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0) return -1;
-    if (tun_socks_start(sp[0], "127.0.0.1", tcp_port, user, pass, udp_in_tcp, remote_dns) != 0) {
+    if (tun_socks_start(sp[0], "127.0.0.1", tcp_port, user, pass, udp_in_tcp, remote_dns, NULL) != 0) {
         close(sp[0]); close(sp[1]); return -1;
     }
     return sp[1];
@@ -517,6 +560,162 @@ static uint32_t tcp_echo_hello(int test_fd, const unsigned char *app_ip,
 
 static const unsigned char APP_IP[4] = {10, 8, 0, 2};
 static const unsigned char TARGET_IP[4] = {8, 8, 8, 8};
+
+// ---- 情境 7 用：視窗欄位讀取 / 只做交握 / 尊重流控的上傳驅動 ----
+
+// 讀引擎通告的 window（bytes）：SYNACK 協商 wscale=10，故欄位單位為 1KB。
+static uint32_t tcp_win_bytes(const unsigned char *pkt) {
+    int ihl = (pkt[0] & 0x0F) * 4;
+    uint16_t w;
+    memcpy(&w, pkt + ihl + 14, 2);
+    return (uint32_t)ntohs(w) << 10;
+}
+
+// 只做三向交握（不送資料）：成功回傳 1，srv_isn_out 為伺服器 ISN、
+// win_out 為引擎在 SYNACK 通告的接收視窗（bytes，已乘 wscale）。
+static int tcp_handshake_only(int test_fd, const unsigned char *app_ip,
+                              const unsigned char *target_ip, uint16_t sport, uint16_t dport,
+                              uint32_t *srv_isn_out, uint32_t *win_out) {
+    unsigned char pkt[512], rbuf[512], ackpkt[512];
+    ssize_t n = tcp_build_segment(app_ip, target_ip, AF_INET, sport, dport,
+                                  1000, 0, 0x02, NULL, 0, 64240, pkt, sizeof pkt);
+    if (n <= 0) return 0;
+    write(test_fd, pkt, (size_t)n);
+    ssize_t r = read_tun(test_fd, rbuf, sizeof rbuf, 3000);
+    if (r <= 0) return 0;
+    int ihl = (rbuf[0] & 0x0F) * 4;
+    uint8_t flags = rbuf[ihl + 13];
+    uint32_t ack_field; memcpy(&ack_field, rbuf + ihl + 8, 4);
+    if ((flags & 0x12) != 0x12 || ntohl(ack_field) != 1001) return 0;
+    *srv_isn_out = tcp_seq(rbuf);
+    *win_out = tcp_win_bytes(rbuf);
+    ssize_t an = tcp_build_segment(app_ip, target_ip, AF_INET, sport, dport,
+                                   1001, *srv_isn_out + 1, 0x10, NULL, 0, 64240,
+                                   ackpkt, sizeof ackpkt);
+    if (an <= 0) return 0;
+    write(test_fd, ackpkt, (size_t)an);
+    return 1;
+}
+
+typedef struct {
+    size_t accepted;   // 引擎 ACK 的位元組數（= 已進入 app_buf）
+    size_t sent;       // 驅動實際送出的位元組數
+    uint32_t min_win;  // 觀察到的最小通告視窗（0 = 真的通告過零視窗）
+    int saw_zero;      // 是否觀察到引擎通告零視窗
+    int saw_reopen;    // 零視窗之後是否又觀察到開窗（window update）
+    int probe_acked;   // 緩衝滿時故意超窗送一段，引擎是否有回 ACK（不得沉默）
+} upload_stat_t;
+
+// 尊重流控的上傳驅動：嚴格遵守引擎通告的 window（在途量 <= acked + win），
+// 因此不會送出引擎會拒收的資料。引擎排空後以 window-update ACK 開窗，驅動才繼續。
+// 回傳 1 = total 位元組全部被 ACK；0 = 逾時（視為卡死）或連線異常。
+static int tcp_upload_flow_controlled(int test_fd, uint16_t sport, uint16_t dport,
+                                      uint32_t app_isn, uint32_t srv_isn, uint32_t win0,
+                                      size_t total, upload_stat_t *st) {
+    unsigned char wbuf[1600], rbuf[4096];
+    unsigned char payload[1400];
+    memset(payload, 0xA5, sizeof payload);
+    size_t sent = 0, acked = 0;
+    uint32_t win = win0;             // SYNACK 通告的初始視窗
+    int zero_seen = 0;
+    int zero_printed = 0;
+    int probed = 0;
+    int dbg = 0;
+    st->min_win = win0;
+    for (int iter = 0; iter < 500000; iter++) {
+        // 1. 排空引擎→App 的封包：只取 ACK/視窗（本情境伺服器不回送資料）
+        for (;;) {
+            struct pollfd pfd = { .fd = test_fd, .events = POLLIN };
+            if (poll(&pfd, 1, 0) <= 0) break;
+            ssize_t r = read(test_fd, rbuf, sizeof rbuf);
+            if (r <= 0) break;
+            if (r < 20 || (rbuf[0] >> 4) != 4 || rbuf[9] != 6) continue;
+            int ihl = (rbuf[0] & 0x0F) * 4;
+            if ((size_t)ihl + 20 > (size_t)r) continue;
+            uint8_t flags = rbuf[ihl + 13];
+            if (flags & 0x04) return 0;                       // RST
+            if (!(flags & 0x10)) continue;
+            uint32_t ack_field; memcpy(&ack_field, rbuf + ihl + 8, 4);
+            size_t a = (size_t)(ntohl(ack_field) - (app_isn + 1));
+            if (a > acked) acked = a;
+            win = tcp_win_bytes(rbuf);
+            if (dbg < 3 || a > total || (win == 0 && !zero_printed)) {
+                printf("  [upload] seq=%u ack=%u flags=0x%02x win=%u -> accepted=%zu (sent=%zu)\n",
+                       tcp_seq(rbuf), ntohl(ack_field), flags, win, a, sent);
+                dbg++;
+                if (win == 0) zero_printed = 1;
+            }
+            if (win < st->min_win) st->min_win = win;
+            if (win == 0) zero_seen = 1;
+            else if (zero_seen) st->saw_reopen = 1;
+        }
+        if (acked >= total) {
+            st->accepted = acked;
+            st->sent = sent;
+            st->saw_zero = zero_seen;
+            return 1;
+        }
+        // 2. 在視窗內送資料
+        size_t allow = (acked + win > sent) ? (acked + win - sent) : 0;
+        if (allow > 0) {
+            size_t chunk = allow > sizeof payload ? sizeof payload : allow;
+            if (chunk > total - sent) chunk = total - sent;
+            ssize_t n = tcp_build_segment(APP_IP, TARGET_IP, AF_INET, sport, dport,
+                                          app_isn + 1 + (uint32_t)sent, srv_isn + 1, 0x18,
+                                          payload, chunk, 64240, wbuf, sizeof wbuf);
+            if (n <= 0) return 0;
+            if (write(test_fd, wbuf, (size_t)n) != n) return 0;
+            sent += chunk;
+        } else {
+            // 視窗關閉（win==0 → 剩餘空間 <1KB）。先把既有 ACK 全部排空，再故意送一段
+            // 必定放不下的資料（1400 bytes > 剩餘空間）做「超窗探測」：引擎必須回一個
+            // ACK（dup ACK，視窗仍為 0），讓 App 知道這是流控而不是封包遺失。
+            // 舊版在緩衝滿時完全不 ACK → App 只能靠 RTO 重傳 → cwnd 砍到 1。
+            for (;;) {
+                struct pollfd pfd = { .fd = test_fd, .events = POLLIN };
+                if (poll(&pfd, 1, 0) <= 0) break;
+                ssize_t r = read(test_fd, rbuf, sizeof rbuf);
+                if (r < 20 || (rbuf[0] >> 4) != 4 || rbuf[9] != 6) continue;
+                int ihl2 = (rbuf[0] & 0x0F) * 4;
+                if (!(rbuf[ihl2 + 13] & 0x10)) continue;
+                uint32_t af; memcpy(&af, rbuf + ihl2 + 8, 4);
+                size_t a2 = (size_t)(ntohl(af) - (app_isn + 1));
+                if (a2 > acked) acked = a2;
+                win = tcp_win_bytes(rbuf);
+                if (win == 0) zero_seen = 1;
+                else if (zero_seen) st->saw_reopen = 1;
+            }
+            if (win != 0) {
+                probed = 0;            // 視窗已開，下次關閉時再探
+            } else if (!probed) {
+                probed = 1;
+                ssize_t pn = tcp_build_segment(APP_IP, TARGET_IP, AF_INET, sport, dport,
+                                               app_isn + 1 + (uint32_t)sent, srv_isn + 1, 0x18,
+                                               payload, sizeof payload, 64240,
+                                               wbuf, sizeof wbuf);
+                if (pn > 0) write(test_fd, wbuf, (size_t)pn);
+                for (int t = 0; t < 20 && !st->probe_acked; t++) {
+                    struct pollfd pfd = { .fd = test_fd, .events = POLLIN };
+                    if (poll(&pfd, 1, 50) <= 0) continue;
+                    ssize_t r = read(test_fd, rbuf, sizeof rbuf);
+                    if (r < 20 || (rbuf[0] >> 4) != 4 || rbuf[9] != 6) continue;
+                    int ihl2 = (rbuf[0] & 0x0F) * 4;
+                    uint8_t f2 = rbuf[ihl2 + 13];
+                    if ((f2 & 0x10) && !(f2 & 0x04)) st->probe_acked = 1;
+                }
+            } else {
+                // 零視窗、已探測過：等 window update。
+                // 必須真的等待 —— 空轉會燒光迭代額度並搶走引擎執行緒的 CPU。
+                struct pollfd pfd = { .fd = test_fd, .events = POLLIN };
+                poll(&pfd, 1, 20);
+            }
+        }
+    }
+    st->accepted = acked;
+    st->sent = sent;
+    st->saw_zero = zero_seen;
+    return 0;
+}
 
 int main(void) {
     printf("=== tun_engine integration test (real engine + fake SOCKS5 + socketpair TUN) ===\n");
@@ -614,7 +813,7 @@ int main(void) {
             }
         }
 
-        // ---------- 1.6 軟重連：重置 session 但保留引擎，新連線仍可建立 ----------
+        // ---------- 1.6 軟重連：重置 session 但保留引擎；舊連線須收 RST，新連線仍可建立 ----------
         {
             const uint16_t sport = htons(12347);
             const uint16_t dport = htons(80);
@@ -627,18 +826,35 @@ int main(void) {
 
             CHECK("engine still running after soft reconnect", tun_socks_is_running() == 1);
 
-            // 新 session 仍可建立（證明重置未破壞引擎）
+            // 不變式：soft reset 必須對舊 App 連線送 RST。否則 App 的 TCP 堆疊仍以為連線
+            // 活著，會繼續把資料送進黑洞，只能等自己的 RTO 才重撥（實例：Android 私人 DNS
+            // 的 DoT 長連線 → 換網後 DNS 全死，只能手動重建隧道）。
             unsigned char rbuf[512];
+            rst_port_ctx_t rctx = { 12347 };
+            int got_rst = wait_for_packet(test_fd, rbuf, sizeof rbuf, 1500, tcp_has_rst_to, &rctx);
+            CHECK("soft reconnect sends RST to old app session", got_rst == 1);
+            // RST 的 seq 必須是「伺服器下一個序號」＝ App 的 RCV.NXT。若送 0，App 的 TCP 堆疊
+            // 依 RFC 5961 只會回 challenge ACK、不重置連線 → App 永遠等不到通知（真正的缺陷）。
+            // 本 session echo 過 "hello"（6 bytes）⇒ srv_next = srv_isn + 1 + 6。
+            CHECK("soft reconnect RST seq = srv_next (RFC 5961)",
+                  got_rst == 1 && tcp_seq(rbuf) == srv_isn + 7);
+
+            // 新 session 仍可建立（證明重置未破壞引擎）。
+            // 讀取時只認「回給新 session（sport2）」的 SYN-ACK，避免被殘餘 RST 干擾。
             const uint16_t sport2 = htons(12348);
             unsigned char syn[512];
             ssize_t n = tcp_build_segment(app_ip, target_ip, AF_INET, sport2, dport,
                                           1000, 0, 0x02, NULL, 0, 64240, syn, sizeof syn);
             write(test_fd, syn, (size_t)n);
-            ssize_t r = read_tun(test_fd, rbuf, sizeof rbuf, 3000);
             int got_synack = 0;
-            if (r > 0) {
+            for (int i = 0; i < 20 && !got_synack; i++) {
+                ssize_t r = read_tun(test_fd, rbuf, sizeof rbuf, 300);
+                if (r <= 0) break;
+                if (r < 20 || (rbuf[0] >> 4) != 4 || rbuf[9] != 6) continue;
                 int ihl = (rbuf[0] & 0x0F) * 4;
-                got_synack = (rbuf[ihl + 13] & 0x12) == 0x12;
+                if (r < (ssize_t)ihl + 14) continue;
+                uint16_t dstp = (uint16_t)((rbuf[ihl + 2] << 8) | rbuf[ihl + 3]);
+                if (dstp == 12348 && (rbuf[ihl + 13] & 0x12) == 0x12) got_synack = 1;
             }
             CHECK("tcp SYN-ACK after soft reconnect", got_synack);
         }
@@ -790,6 +1006,67 @@ int main(void) {
 
         tun_socks_stop();
         close(test_fd);
+    }
+
+    // ============ 情境 7：上傳回壓 —— app_buf 滿時通告零視窗，不是沉默不 ACK ============
+    // 假伺服器交握後先暫停讀取並丟棄上傳 → 引擎的 app_buf（4 MiB）被填滿。
+    // 期望：① 觀察到引擎通告 win==0；② 伺服器恢復後以 window-update 開窗；
+    //       ③ 全部位元組都被 ACK 且完整抵達伺服器（無重複、無遺漏、無卡死）。
+    // 舊版（tcp_win_field_pure free==0 回 1）永遠不會通告 0，且緩衝滿時完全不 ACK
+    // → saw_zero 為 0 → 本情境失敗。這是回壓修正的迴歸守衛。
+    {
+        const size_t total = 16 * 1024 * 1024;   // 遠大於 app_buf(4 MiB) + srv 送緩衝
+        const uint16_t sport = htons(58000), dport = htons(80);
+        g_fake_discard_upload = 1;
+        g_fake_stall_read_ms = 800;
+        // 需要追 fd 生命週期（誤關 / 重用）時把 g_bridge_verbose 設 1，會多印 request/release 行
+        g_bridge_verbose = 0;
+        atomic_store(&g_fake_upload_bytes, 0);
+        atomic_store(&g_fake_upload_bad, 0);
+        atomic_store(&g_fake_upload_exit_n, 99);
+        atomic_store(&g_fake_upload_exit_errno, 99);
+
+        int test_fd = start_engine(tcp_port, "", "", 0, 0);
+        CHECK("engine start (upload backpressure)", test_fd >= 0);
+
+        uint32_t srv_isn = 0, win0 = 0;
+        int hs = tcp_handshake_only(test_fd, app_ip, target_ip, sport, dport, &srv_isn, &win0);
+        CHECK("upload: handshake", hs == 1);
+        printf("  upload: SYNACK window = %u bytes\n", win0);
+
+        upload_stat_t st = { 0, 0, 0, 0, 0, 0 };
+        int done = hs ? tcp_upload_flow_controlled(test_fd, sport, dport, 1000, srv_isn,
+                                                   win0, total, &st) : 0;
+        printf("  upload: sent=%zu accepted=%zu min_win=%u\n", st.sent, st.accepted, st.min_win);
+        CHECK("upload: all bytes accepted (no deadlock)", done == 1);
+        CHECK("upload: zero window advertised", st.saw_zero == 1);
+        CHECK("upload: full-buffer probe still ACKed (not silent)", st.probe_acked == 1);
+        CHECK("upload: window reopened after drain", st.saw_reopen == 1);
+
+        // 引擎非同步把 app_buf 沖給伺服器：等位元組全部抵達（同時驗證 EPOLLOUT 續送）
+        unsigned long long got = 0;
+        for (int i = 0; i < 200; i++) {
+            got = atomic_load(&g_fake_upload_bytes);
+            if (got >= total) break;
+            usleep(50000);
+        }
+        printf("  upload: server received %llu / %zu bytes (loop_exit recv=%d errno=%d)\n",
+               got, total, atomic_load(&g_fake_upload_exit_n),
+               atomic_load(&g_fake_upload_exit_errno));
+        {
+            unsigned long long to_srv = 0, from_srv = 0;
+            int tcps = 0, udps = 0;
+            tun_socks_get_stats(&to_srv, &from_srv, &tcps, &udps);
+            printf("  upload: engine bytes_to_server=%llu tcp_sessions=%d\n", to_srv, tcps);
+        }
+        CHECK("upload: all bytes reached server", got == total);
+        CHECK("upload: payload intact", atomic_load(&g_fake_upload_bad) == 0);
+
+        tun_socks_stop();
+        close(test_fd);
+        g_fake_discard_upload = 0;
+        g_fake_stall_read_ms = 0;
+        g_bridge_verbose = 0;
     }
 
     close(lfd);

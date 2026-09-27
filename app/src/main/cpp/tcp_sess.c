@@ -52,7 +52,12 @@ static ssize_t write_tcp_to_tun(const ip_addr_t *saddr, const ip_addr_t *daddr,
                                       payload, plen, win, pkt, sizeof pkt);
     if (total < 0) return -1;
     ssize_t w = write(g.tun_fd, pkt, (size_t)total);
-    if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) LOGE("write tun tcp failed: %s", strerror(errno));
+    atomic_fetch_add(&g.tun_write_total, 1);
+    if (w < 0) {
+        // 靜默丟棄＝App 永遠等不到這個 ACK/資料 → 只能靠 RTO 重傳（診斷：量它有多大）
+        if (errno == EAGAIN || errno == EWOULDBLOCK) atomic_fetch_add(&g.tun_write_eagain, 1);
+        else LOGE("write tun tcp failed: %s", strerror(errno));
+    }
     return w;
 }
 
@@ -73,9 +78,12 @@ static void send_tcp_synack(tcp_sess_t *sess) {
     else if (w != total) LOGI("write tun SYN-ACK partial %zd/%zd", w, total);
 }
 
-// 引擎對 App 通告的接收 window：app_buf 剩餘空間（SYNACK 協商 shift=10，單位 1KB）
+// 引擎對 App 通告的接收 window：app_buf 還能收多少（SYNACK 協商 shift=10，單位 1KB）
+// 用 app_len（尚未送出的位元組）而非 app_off+app_len（含已送出前綴的佔用率）：
+// app_buf_reserve 需要時會 compaction 回收前綴，故真正可用空間是 cap-app_len。
+// 用佔用率會讓「已部分排空」仍通告 0（off 不減、len 減，和可能不變）→ App 卡在零窗。
 static uint16_t tcp_win_field(const tcp_sess_t *sess) {
-    return tcp_win_field_pure(sess->app_off + sess->app_len, TCP_APP_BUF_CAP);
+    return tcp_win_field_pure(sess->app_len, TCP_APP_BUF_CAP);
 }
 
 static void send_tcp_ack(tcp_sess_t *sess) {
@@ -88,9 +96,14 @@ static void send_tcp_fin(tcp_sess_t *sess) {
                      sess->srv_next, sess->app_next, 0x11, NULL, 0, tcp_win_field(sess));
 }
 
+// RST 的 seq 必須是「伺服器下一個序號」（＝ App 的 RCV.NXT），與 send_tcp_fin/send_tcp_ack 一致。
+// ⚠️ 這裡曾寫死 0：App 的 TCP 堆疊依 RFC 5961 §3.2 只對「seq == RCV.NXT」的 RST 重置連線，
+// 其餘一律回 challenge ACK 並丟棄 → App 完全收不到「連線已斷」的通知，只能等自己的 RTO
+// （實測 DoT 長連線要 3 分 38 秒）。2026-09-28 由 tun_engine_test 的
+// 「soft reconnect RST seq = srv_next」斷言抓到（之前只驗 RST 旗標，沒驗 seq）。
 static void send_session_rst(tcp_sess_t *sess) {
     write_tcp_to_tun(&sess->dst_ip, &sess->src_ip, sess->dst_port, sess->src_port,
-                     0, sess->app_next, 0x14, NULL, 0, 0);
+                     sess->srv_next, sess->app_next, 0x14, NULL, 0, 0);
 }
 
 // engine 單一執行緒呼叫（唯一釋放 session 之處，background 線程不碰 hash）
@@ -142,9 +155,13 @@ void tcp_graveyard_collect(void) {
 static void close_tcp_session(tcp_sess_t *sess, int send_rst) {
     if (sess->closed) return;
     sess->closed = 1;
-    LOGI("tcp session 關閉 app_bytes=%u srv_bytes=%u rst=%d",
+    // 一併印出送出的 RST seq：這正是能抓到「rst_seq 寫死 0」缺陷的觀測點。
+    LOGI("tcp session 關閉 app_bytes=%u srv_bytes=%u rst=%d rst_seq=%u max_app_len=%zu ooo=%u full_events=%d tun_wr=%llu/%llu",
          (uint32_t)(sess->app_next - sess->app_isn - 1),
-         (uint32_t)(sess->srv_next - sess->srv_isn - 1), send_rst);
+         (uint32_t)(sess->srv_next - sess->srv_isn - 1), send_rst, sess->srv_next,
+         sess->app_max_len, sess->app_ooo_segs, atomic_load(&g.tcp_app_buf_full_events),
+         (unsigned long long)atomic_load(&g.tun_write_eagain),
+         (unsigned long long)atomic_load(&g.tun_write_total));
     if (send_rst) send_session_rst(sess);
     tcp_session_destroy(sess);
 }
@@ -209,6 +226,15 @@ static void flush_tcp_srv_buf(tcp_sess_t *sess) {
     }
 }
 
+// 零視窗狀態解除（app_buf 已有空間）：清旗標並留一行 log。
+// 實機診斷靠這一行確認「回壓真的發生過、而且真的結束了」（配對的進入點是 app_buf_accept）。
+static void app_buf_clear_full(tcp_sess_t *sess) {
+    if (!sess->app_buf_full) return;
+    sess->app_buf_full = 0;
+    LOGI("app_buf 已排空，零視窗解除 (len=%zu full_events=%d)",
+         sess->app_len, atomic_load(&g.tcp_app_buf_full_events));
+}
+
 // App→server：把緩衝的資料寫到 srv_fd（fatal 只標記 closed，不釋放）
 static void flush_tcp_app_buf(tcp_sess_t *sess) {
     int fd = atomic_load(&sess->srv_fd);
@@ -222,6 +248,10 @@ static void flush_tcp_app_buf(tcp_sess_t *sess) {
             sess->app_len -= (size_t)n;
             if (sess->app_len == 0) sess->app_off = 0;
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // srv socket 暫時寫不動：註冊 EPOLLOUT，可寫時再續送。
+            // 不可只靠後續的 TUN/kick 事件喚醒 —— App 收到零視窗後不會再送資料，
+            // 少了這個註冊就會永遠停在「有資料待送、卻沒有任何事件」的狀態。
+            set_srv_out(sess, 1);
             break;
         } else {
             sess->closed = 1;
@@ -232,8 +262,10 @@ static void flush_tcp_app_buf(tcp_sess_t *sess) {
         set_srv_out(sess, 0);
         if (tcp_app_can_shutdown_write(sess->app_fin, sess->app_len)) shutdown(fd, SHUT_WR);
     }
-    // 排空後重開 window：主動送 window-update ACK，避免 App 停在縮小的窗上死鎖
+    // 排空後重開 window：主動送 window-update ACK，避免 App 停在縮小的窗上死鎖。
+    // （window 由 app_len 推算，故排空必然讓 window 變大；這裡保證一定送出那個更新）
     if (sess->app_len < before && !sess->closed && atomic_load(&sess->state) == 1) {
+        if (tcp_win_field(sess) > 0) app_buf_clear_full(sess);
         send_tcp_ack(sess);
     }
 }
@@ -242,12 +274,51 @@ static void flush_tcp_app_buf(tcp_sess_t *sess) {
 static unsigned char *app_buf_reserve(tcp_sess_t *sess, size_t need) {
     if (sess->app_buf == NULL) sess->app_buf = malloc(TCP_APP_BUF_CAP);
     if (!sess->app_buf) return NULL;
-    if (tcp_buf_reserve_should_compact(sess->app_off, sess->app_len)) {
+    // 攤銷 compaction（與 srv 方向一致）：已送出前綴過半才搬移。
+    // 舊版用 tcp_buf_reserve_should_compact（off>0 就搬）＝每個上傳封包都 memmove
+    // 整個待送緩衝（最大 4 MiB），上傳專屬的額外開銷。
+    if (tcp_buf_should_compact_half(sess->app_off, TCP_APP_BUF_CAP)) {
+        memmove(sess->app_buf, sess->app_buf + sess->app_off, sess->app_len);
+        sess->app_off = 0;
+    }
+    // 攤銷門檻未到但尾端放不下 → 立即搬一次（前綴非空時），
+    // 否則會把「前面有空間」誤報成「緩衝滿」而白白通告零視窗。
+    if (!tcp_buf_reserve_fits(sess->app_off, sess->app_len, TCP_APP_BUF_CAP, need) &&
+        tcp_buf_reserve_should_compact(sess->app_off, sess->app_len)) {
         memmove(sess->app_buf, sess->app_buf + sess->app_off, sess->app_len);
         sess->app_off = 0;
     }
     if (!tcp_buf_reserve_fits(sess->app_off, sess->app_len, TCP_APP_BUF_CAP, need)) return NULL;
     return sess->app_buf + sess->app_off + sess->app_len;
+}
+
+// 收下一個 App→server 的 payload 進入 app_buf。
+// 緩衝真的滿時仍然送出 ACK，通告目前（可能為 0）的接收視窗 —— 讓 App 看到的是
+// 「流控」而不是「封包遺失」。舊版在此完全不 ACK，App 只能靠 RTO 重傳，
+// cwnd 被砍到 1，上傳吞吐反覆掉回慢啟動爬升期（上傳卡死的主因）。
+static void app_buf_accept(tcp_sess_t *sess, const unsigned char *payload, size_t payload_len) {
+    unsigned char *dst = app_buf_reserve(sess, payload_len);
+    if (!dst) {
+        flush_tcp_app_buf(sess);
+        if (sess->closed) return;
+        dst = app_buf_reserve(sess, payload_len);
+    }
+    if (dst) {
+        memcpy(dst, payload, payload_len);
+        sess->app_len += payload_len;
+        if (sess->app_len > sess->app_max_len) sess->app_max_len = sess->app_len;  // 診斷
+        sess->app_next += (uint32_t)payload_len;
+        send_tcp_ack(sess);
+        if (atomic_load(&sess->state) == 1) set_srv_out(sess, 1);
+    } else {
+        // 真的滿：ACK（不推進 app_next）並帶目前 window（0）＝零視窗回壓。
+        atomic_fetch_add(&g.tcp_app_buf_full_events, 1);
+        if (!sess->app_buf_full) {
+            sess->app_buf_full = 1;
+            LOGI("app_buf 滿 (cap=%d)，通告零視窗等待排空", TCP_APP_BUF_CAP);
+        }
+        send_tcp_ack(sess);
+    }
 }
 
 void tcp_flush_all(void) {
@@ -524,6 +595,7 @@ void tcp_handle_packet(const unsigned char *pkt, size_t len, size_t t,
         return;
     }
     case TCP_IN_OUT_OF_ORDER: {                            // 亂序 / 重傳 → 重複 ACK
+        sess->app_ooo_segs++;                              // 診斷：App 端重傳／亂序段數
         send_tcp_ack(sess);
         if (sess->srv_len > 0) flush_tcp_srv_buf(sess);    // dup-ACK 仍可能開窗
         return;
@@ -546,35 +618,14 @@ void tcp_handle_packet(const unsigned char *pkt, size_t len, size_t t,
             flush_tcp_srv_buf(sess);
             return;
         }
-        if (atomic_load(&sess->state) == 0) {
-            // CONNECT 中：緩衝並 ACK（避免等 app 重傳），建立後由 kick 觸發送出
-            unsigned char *dst = app_buf_reserve(sess, payload_len);
-            if (!dst) { flush_tcp_app_buf(sess); dst = app_buf_reserve(sess, payload_len); }
-            if (dst) {
-                memcpy(dst, pkt + t + (size_t)tcp_hlen, payload_len);
-                sess->app_len += payload_len;
-                sess->app_next += (uint32_t)payload_len;
-                send_tcp_ack(sess);
-            }
-            // 緩衝滿 / malloc 失敗：不 ACK → app 重傳
-        } else {
+        if (atomic_load(&sess->state) == 1) {
             int sfd = atomic_load(&sess->srv_fd);
             if (sfd < 0) return;
-            // 一律先入 app_buf 再 flush：直接 send 遇到 partial 時，App 重傳餘數會被重複接受
-            unsigned char *dst = app_buf_reserve(sess, payload_len);
-            if (!dst) {
-                flush_tcp_app_buf(sess);
-                if (sess->closed) return;
-                dst = app_buf_reserve(sess, payload_len);
-            }
-            if (dst) {
-                memcpy(dst, pkt + t + (size_t)tcp_hlen, payload_len);
-                sess->app_len += payload_len;
-                sess->app_next += (uint32_t)payload_len;
-                send_tcp_ack(sess);
-                set_srv_out(sess, 1);
-            }
         }
+        // 一律先入 app_buf 再 flush：直接 send 遇到 partial 時，App 重傳餘數會被重複接受。
+        // CONNECT 中（state=0）同樣先緩衝，建立後由 kick 觸發 flush；
+        // 兩種狀態下緩衝滿都改為回零視窗 ACK（見 app_buf_accept），不再沉默不 ACK。
+        app_buf_accept(sess, pkt + t + (size_t)tcp_hlen, payload_len);
     }
 
     if (flags & 0x01) {                                    // FIN
@@ -650,15 +701,32 @@ void tcp_handle_event(tcp_sess_t *sess, uint32_t ev, time_t now) {
 
 // ---------- 入口：soft reset / shutdown / idle GC ----------
 
+// soft-reset：不拆 TUN，但**必須對 App 送 RST**。
+// ⚠️ 這裡曾直接 `s->closed = 1; tcp_session_destroy(s);` —— 等於把 App 的連線「無聲切斷」：
+// App 的 TCP 堆疊仍以為連線活著（實例：Android 私人 DNS 的 DoT 長連線），會繼續把查詢送
+// 進黑洞，只能等自己的 RTO 超時才重撥。2026-09-28 實測：Wi-Fi 開關後 DoT 整整 3 分 38 秒
+// 沒有重撥（引擎連 SYN 都沒收到）→ 整台機 DNS 全死、IP 直連卻正常；而「重建隧道」之所以
+// 有效，正是因為換掉 tun fd 讓 App 立刻察覺介面消失。
+// 走 close_tcp_session(s, 1) 才會送 RST，並沿用既有的兩階段釋放。
 void tcp_soft_reset(void) {
+    int rst_sent = 0;
     for (int b = 0; b < TCP_HASH_BUCKETS; b++) {
         while (g.tcp_hash[b]) {
             tcp_sess_t *s = g.tcp_hash[b];
-            s->closed = 1;
-            tcp_session_destroy(s);
+            // 已 closed 者不再送 RST（close_tcp_session 會 early-return，留在 hash 裡
+            // 會造成無限迴圈），直接回收即可。
+            if (s->closed) {
+                tcp_session_destroy(s);
+            } else {
+                close_tcp_session(s, 1);
+                rst_sent++;
+            }
         }
     }
     tcp_graveyard_collect();
+    // 觀測點：soft reset 過去完全靜默（正是缺陷 2 的成因）。印出送了幾條 RST，
+    // 才能在實機上區分「送 RST 的新版」與「無聲切斷的舊版」。
+    LOGI("soft reset 完成：對 %d 條 App 連線送 RST", rst_sent);
 }
 
 void tcp_shutdown_collect(void) {
