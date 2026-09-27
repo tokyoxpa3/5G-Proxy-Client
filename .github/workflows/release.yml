@@ -58,12 +58,52 @@ jobs:
           APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK"
 
-      - name: Build release notes from commits
+      - name: Build release notes from changelog + commits
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+
+          # F-Droid names its changelog files after the *versionCode*, not the
+          # versionName, so read versionCode straight out of build.gradle. The
+          # checkout is pinned to the tag being released, so it is the right one.
+          VERSION_CODE=$(grep -oP 'versionCode\s+\K[0-9]+' app/build.gradle | head -1)
+          EN="fastlane/metadata/android/en-US/changelogs/${VERSION_CODE}.txt"
+          ZH="fastlane/metadata/android/zh-TW/changelogs/${VERSION_CODE}.txt"
+
+          # Surface a missing changelog as a workflow warning rather than
+          # silently publishing a release whose notes are only commit noise.
+          # Expected for workflow_dispatch rebuilds of tags older than the
+          # fastlane changelogs (only 13 and 14 exist so far).
+          if [ ! -f "$EN" ]; then
+            echo "::warning::No changelog at ${EN} for versionCode ${VERSION_CODE}"
+          fi
+
           {
-            echo "## What's Changed"
+            # The user-facing changelog is the release notes. It is the exact
+            # text F-Droid shows, so the two never drift.
+            if [ -f "$EN" ]; then
+              cat "$EN"
+            else
+              echo "> ⚠️ No changelog found for versionCode ${VERSION_CODE}."
+              echo "> Expected \`${EN}\` — showing the commit list below instead."
+            fi
+            echo
+
+            if [ -f "$ZH" ]; then
+              echo "<details><summary>繁體中文</summary>"
+              echo
+              cat "$ZH"
+              echo
+              echo "</details>"
+              echo
+            fi
+
+            echo "Signed APK attached below (reproducible F-Droid build)."
+            echo
+
+            # Commit subjects stay for traceability, but collapsed: most of them
+            # are chores (version bumps, CI, assets) that mean nothing to a user.
+            echo "<details><summary>Commits in this release</summary>"
             echo
             if [ -n "$PREV" ]; then
               git log "$PREV..$TAG" --no-merges --pretty='- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))'
@@ -71,7 +111,7 @@ jobs:
               git log -1 --pretty='- %s ([%h](https://github.com/${{ github.repository }}/commit/%H))'
             fi
             echo
-            echo "Signed APK attached below (reproducible F-Droid build)."
+            echo "</details>"
           } > RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
