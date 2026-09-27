@@ -42,3 +42,6 @@ AGENTS.md
 # Scratch / test artifacts
 screen.png
 tunnel_config_test.xml
+
+# WorkBuddy 本地工作區（記憶、除錯截圖等，勿提交）
+.workbuddy-ai/

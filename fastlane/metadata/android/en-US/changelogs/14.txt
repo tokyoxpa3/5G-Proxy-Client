@@ -1,0 +1,6 @@
+- New: "Same-device coexistence" switch on the main screen — one tap keeps 5G Proxy Pro outside the tunnel so Pro and Client can run on the same phone (off by default)
+- New: allowlist mode coexists too — Pro is automatically locked outside the tunnel, and its row is dimmed and cannot be checked
+- New: UDP Remote DNS now sends domain frames (ATYP=0x03), so QUIC and other UDP traffic is no longer dropped by IP-only servers
+- Fix: the App list header was clipped by the status bar and ActionBar (most visible on Xiaomi/HyperOS); the screen now uses an ActionBar-less theme
+- Fix: UDP-in-TCP fallback to standard UDP ASSOCIATE now opens a fresh connection and is classified as a protocol failure, so it no longer triggers auto-reconnect
+- Fix: App list search now trims surrounding whitespace instead of returning zero results

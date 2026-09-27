@@ -1,0 +1,6 @@
+- 新增：主頁「同機共存」開關 —— 一鍵把 5G Proxy Pro 留在隧道外，同一支手機同時跑 Pro 與 Client（預設不開啟）
+- 新增：指定 App（白名單）模式也能同機共存 —— Pro 自動鎖在隧道外，清單中該列淡化且無法勾選
+- 新增：UDP Remote DNS 以網域 frame（ATYP=0x03）送出，QUIC 等 UDP 流量不再被只認 IP 的伺服器丟棄
+- 修正：App 清單頁頂部被狀態列與 ActionBar 遮擋（小米／HyperOS 上最明顯），改用無 ActionBar 主題
+- 修正：UDP-in-TCP 退回標準 UDP ASSOCIATE 時改用新連線，且失敗歸類為協定層、不再誤觸發自動重連
+- 修正：App 清單搜尋現在會忽略前後空白，不再因輸入法尾隨空白而顯示 0 筆
