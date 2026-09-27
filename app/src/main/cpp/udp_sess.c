@@ -106,6 +106,7 @@ static int udp_tcp_flush(udp_sess_t *sess) {
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             break;
         } else {
+            LOGE("udp-in-tcp send 錯誤: %s (tx_len=%zu) → 拆線", strerror(errno), sess->tx_len);
             return -1;
         }
     }
@@ -128,27 +129,56 @@ static void udp_tcp_on_frame(void *ctx, const unsigned char *payload, size_t pay
 
 // 從 control_fd 讀入並解析 frames；回傳 <0 = 連線已死
 static int udp_tcp_read(udp_sess_t *sess) {
-    // 1. 讀入可用位元組
+    // 1. 讀入可用位元組。
+    //    [修正] 緩衝滿不是錯誤，是背壓：停止讀取、先把已收到的解析掉，
+    //    剩下的留給 TCP 流量控制（server 送不進來自然會等）。
+    //    舊版在此直接 return -1，把「一次突發 > 8 KB」誤判成協定違規並拆線 ——
+    //    QUIC 一個新連線的首飛（初始擁塞窗 10 包 ≈ 13 KB）必然觸發，
+    //    於是每個 QUIC 會話建立後約一個 RTT 就被本端拆掉、App 重送、
+    //    再建立、再拆（實測同一 App socket 42 秒內重建 31 次）。
     for (;;) {
         if (sess->rx_len == 0) sess->rx_off = 0;
         size_t space = sess->rx_cap - sess->rx_off - sess->rx_len;
-        if (space == 0) return -1; // frame 長度欄異常（>rx_cap）→ 協定違規
+        if (space == 0) break;   // 背壓：先解析，不要拆線
         ssize_t n = recv(sess->control_fd, sess->rx_buf + sess->rx_off + sess->rx_len, space, 0);
         if (n > 0) {
             sess->rx_len += (size_t)n;
             continue;
         }
-        if (n == 0) return -1; // EOF
+        if (n == 0) {   // EOF：對端（伺服器）關閉
+            LOGE("udp-in-tcp 對端 EOF (len=%zu) → 伺服器關閉連線", sess->rx_len);
+            return -1;
+        }
         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        LOGE("udp-in-tcp recv 錯誤: %s → 拆線", strerror(errno));
         return -1;
     }
-    // 2. 解析 frames（純 length-prefixed 解析在 udp_tcp.c，golden/fuzz 覆蓋）
+    // 2. 解析 frames（純 length-prefixed 解析在 udp_tcp.c，golden/fuzz 覆蓋）。
+    //    cap 傳 rx_cap-2：保證「長度欄 + 最大合法 frame」能同時放進緩衝，
+    //    否則 off=0 且緩衝滿時可能一格都解析不掉 → level-triggered EPOLLIN 空轉。
     long consumed = udp_tcp_consume(&sess->rx_stream, sess->rx_buf + sess->rx_off,
-                                    sess->rx_len, sess->rx_cap, udp_tcp_on_frame, sess);
-    if (consumed < 0) return -1;
+                                    sess->rx_len, sess->rx_cap - 2, udp_tcp_on_frame, sess);
+    if (consumed < 0) {
+        LOGE("udp-in-tcp frame 長度欄違規 (len=%zu) → 拆線", sess->rx_len);
+        return -1;
+    }
     sess->rx_off += (size_t)consumed;
     sess->rx_len -= (size_t)consumed;
-    if (sess->rx_len == 0) sess->rx_off = 0;
+    if (sess->rx_len == 0) {
+        sess->rx_off = 0;
+    } else if (sess->rx_off > 0) {
+        // 3. 壓縮：把殘餘的「未完整 frame」搬到開頭。
+        //    舊版只在 rx_len==0 時才歸零 rx_off，於是只要讀取邊界落在 frame 中間，
+        //    rx_off 就會單調前進、可用空間被慢慢吃掉 —— 即使沒有突發，
+        //    最終也會「填滿」而被上面的誤判拆線。
+        memmove(sess->rx_buf, sess->rx_buf + sess->rx_off, sess->rx_len);
+        sess->rx_off = 0;
+    }
+    if (consumed == 0 && sess->rx_len == sess->rx_cap) {
+        // 理論上不可達（cap 已限 rx_cap-2）；真的發生就出聲，不要靜默空轉
+        LOGE("udp-in-tcp 收緩衝滿且無法解析 (len=%zu) → 拆線", sess->rx_len);
+        return -1;
+    }
     return 0;
 }
 
@@ -420,7 +450,10 @@ static void *udp_session_thread(void *arg) {
         sess->udp_tcp = 1;
         sess->tx_cap = 65536;
         sess->tx_buf = malloc(sess->tx_cap);
-        sess->rx_cap = 8192;
+        // [修正] 8 KB 對 QUIC 的一次突發（新連線首飛約 13 KB）根本裝不下。
+        // 現在緩衝滿只是背壓（見 udp_tcp_read），加大純粹是為了少幾輪 recv/parse；
+        // 32 KB ≈ 20 個 QUIC datagram，512 個會話全滿也只有 16 MB。
+        sess->rx_cap = 32768;
         sess->rx_buf = malloc(sess->rx_cap);
         udp_tcp_stream_init(&sess->rx_stream);
         if (!sess->tx_buf || !sess->rx_buf) goto fail;
@@ -605,7 +638,15 @@ void udp_handle_event(udp_sess_t *sess, uint32_t ev, time_t now, int is_relay) {
     sess->last_active = now;
 
     int fatal = 0;
-    if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) fatal = 1;
+    if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+        fatal = 1;
+        // [診斷] 對端關閉/錯誤事件：與「本端緩衝滿」是不同根因，必須分開出聲
+        // （0x03 的控制連線本來就不承載資料，收到事件即拆是正常行為，不記）
+        if (sess->udp_tcp) {
+            LOGE("udp-in-tcp epoll 致命事件 ev=0x%x (ERR=%d HUP=%d RDHUP=%d) → 拆線",
+                 ev, (ev & EPOLLERR) != 0, (ev & EPOLLHUP) != 0, (ev & EPOLLRDHUP) != 0);
+        }
+    }
 
     if (!fatal && !is_relay) {
         // 控制通道握手後不應有流量；任何事件（含 FIN）皆視為斷線
