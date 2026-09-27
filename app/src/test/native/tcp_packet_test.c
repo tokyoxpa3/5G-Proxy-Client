@@ -123,12 +123,18 @@ int main(void){
         CHECK("seq equal not gt", tcp_seq_gt(0x00001000, 0x00001000) == 0);
     }
     // 7. TCP window field helper: tcp_win_field_pure
+    // 不變式：空間不足 1KB 就必須通告 0（真正的零視窗），不可退回 1。
+    // 舊版 free==0 回 1 是「永遠還有 1KB」的謊，配上引擎「滿了不 ACK」＝App 端
+    // 把沉默讀成封包遺失 → RTO → cwnd 砍到 1（上傳吞吐崩潰的主因）。
     {
         size_t cap=4*1024*1024;
         CHECK("window full free", tcp_win_field_pure(0, cap) == 4096);
         CHECK("window almost full", tcp_win_field_pure(cap-1024, cap) == 1);
-        CHECK("window zero -> 1", tcp_win_field_pure(cap, cap) == 1);
-        CHECK("window over cap -> 1", tcp_win_field_pure(cap+1024, cap) == 1);
+        CHECK("window under 1KB -> 0", tcp_win_field_pure(cap-512, cap) == 0);
+        CHECK("window zero -> 0", tcp_win_field_pure(cap, cap) == 0);
+        CHECK("window over cap -> 0", tcp_win_field_pure(cap+1024, cap) == 0);
+        // 極端值不得溢位回非零
+        CHECK("window cap=0 -> 0", tcp_win_field_pure(0, 0) == 0);
     }
     // 8. TCP SYN window scale option parse: tcp_parse_window_scale
     {

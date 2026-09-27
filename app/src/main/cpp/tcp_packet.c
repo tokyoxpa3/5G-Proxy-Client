@@ -150,8 +150,12 @@ int tcp_seq_gt(uint32_t a, uint32_t b) {
 
 uint16_t tcp_win_field_pure(size_t occ, size_t cap) {
     size_t free = (occ >= cap) ? 0 : (cap - occ);
-    uint16_t w = (uint16_t)(free >> 10);
-    return (w > 0) ? w : 1;
+    // 必須誠實回報 0：舊版把 free==0 寫成 1（「永遠還有 1KB」），而引擎在 app_buf
+    // 真的滿時是「不 ACK」，App 端把沉默解讀成封包遺失 → RTO → cwnd 砍到 1 →
+    // 上傳反覆掉回慢啟動爬升期（下載走真流控，故不受影響）。
+    // 不足 1KB 也回 0：寧可保守通告零視窗（App 會用 persist probe 探），
+    // 讓引擎在排空後以 window-update ACK 重開。
+    return (uint16_t)(free >> 10);
 }
 
 uint8_t tcp_parse_window_scale(const unsigned char *opts, size_t optlen) {
