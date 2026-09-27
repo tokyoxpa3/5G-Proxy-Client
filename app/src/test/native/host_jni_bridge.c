@@ -17,6 +17,10 @@
 atomic_int g_host_last_server_event = SE_EVENT_OK;  // 0 = OK
 atomic_int g_host_engine_stopped = 0;               // 0 = 未觸發；1 = 意外退出
 
+// 診斷用：1 = 記錄 socket fd 的生命週期（追 fd 重用 / 誤關；由測試在特定情境開啟）
+int g_bridge_verbose = 0;
+static atomic_int g_bridge_seq = 0;
+
 void jni_attach_thread(void) {}
 void jni_detach_thread(void) {}
 
@@ -35,6 +39,9 @@ int request_java_socket(const char *host, int port, int is_udp) {
             close(fd);
             return -1;
         }
+        if (g_bridge_verbose) {
+            printf("[bridge] request udp fd=%d (#%d)\n", fd, atomic_fetch_add(&g_bridge_seq, 1));
+        }
         return fd;
     }
 
@@ -52,10 +59,17 @@ int request_java_socket(const char *host, int port, int is_udp) {
         close(fd);
         return -1;
     }
+    if (g_bridge_verbose) {
+        printf("[bridge] request tcp fd=%d (#%d) -> %s:%d\n", fd,
+               atomic_fetch_add(&g_bridge_seq, 1), host, port);
+    }
     return fd;
 }
 
 void release_java_socket(int fd) {
+    if (g_bridge_verbose) {
+        printf("[bridge] release fd=%d (#%d)\n", fd, atomic_fetch_add(&g_bridge_seq, 1));
+    }
     if (fd >= 0) close(fd);
 }
 

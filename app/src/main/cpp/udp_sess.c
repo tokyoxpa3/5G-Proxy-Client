@@ -3,6 +3,7 @@
 // 函式本體原封不動，僅改作用域；epoll 事件入口為 udp_handle_event。
 #include "engine.h"
 #include "tcp_packet.h"
+#include "dns_query.h"
 #include "udp_state.h"
 #include "socks5_codec.h"
 #include <arpa/inet.h>
@@ -212,6 +213,15 @@ static void forward_udp_to_server(udp_sess_t *sess, const ip_addr_t *dst, uint16
 static int dns_try_intercept(const unsigned char *q, size_t qlen,
                              const ip_addr_t *src_ip, const ip_addr_t *dst_ip,
                              uint16_t sport, uint16_t dport) {
+    // 私人 DNS（DoT）的伺服器主機名必須拿到**真實 IP**，否則 VPN 的 DoT 端點會變成 fake IP，
+    // 表一被清就斷（見 engine_util.c 的 dns_is_passthrough 說明）。放行給 relay 用真實 DNS 解析。
+    char qname[256];
+    if (dns_query_parse(q, qlen, qname, sizeof qname, NULL, NULL, NULL, NULL) &&
+        dns_is_passthrough(qname)) {
+        LOGI("DNS 放行（私人 DNS 伺服器）: %s", qname);
+        return 0;
+    }
+
     unsigned char reply[512];
     size_t rlen = 0;
     if (!dns_build_reply(q, qlen, 0, reply, &rlen)) return 0;

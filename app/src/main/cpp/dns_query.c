@@ -1,5 +1,17 @@
 #include "dns_query.h"
 
+int dns_name_eq_ci(const char *a, const char *b) {
+    if (!a || !b || !a[0] || !b[0]) return 0;
+    for (size_t i = 0; ; i++) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+        if (ca == '\0') return 1;
+        if (i >= 254) return 0;   // 過長：DNS 名上限 253，不符
+    }
+}
+
 int dns_query_parse(const unsigned char *q, size_t qlen,
                     char *name_out, size_t name_cap,
                     uint16_t *qtype_out, uint16_t *qclass_out,

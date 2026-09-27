@@ -303,7 +303,8 @@ static void engine_ctx_reset(void) {
     reasm_table_clear(&g_reasm);
 }
 
-int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass, int udp_in_tcp, int remote_dns) {
+int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass,
+                    int udp_in_tcp, int remote_dns, const char *dns_passthrough) {
     if (g.running) return -1;
     engine_ctx_reset();
 
@@ -316,6 +317,8 @@ int tun_socks_start(int tun_fd, const char *host, int port, const char *user, co
     strncpy(g.auth_pass, pass ? pass : "", sizeof(g.auth_pass) - 1);
     g.udp_in_tcp = udp_in_tcp ? 1 : 0;
     g.remote_dns = remote_dns ? 1 : 0;
+    strncpy(g.dns_passthrough, dns_passthrough ? dns_passthrough : "", sizeof(g.dns_passthrough) - 1);
+    g.dns_passthrough[sizeof(g.dns_passthrough) - 1] = '\0';
 
     set_nonblocking(g.tun_fd);
 

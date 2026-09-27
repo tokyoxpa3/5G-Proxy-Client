@@ -141,6 +141,20 @@ int main(void) {
         CHECK("question overflow rejected", dns_query_parse(q, qlen - 4, name, sizeof(name), &qtype, &qclass, &supported, &qend) == 0);
     }
 
+    // 16. dns_name_eq_ci（私人 DNS 放行判斷用的名稱比對）
+    CHECK("name_eq exact",            dns_name_eq_ci("dns.adguard-dns.com", "dns.adguard-dns.com") == 1);
+    CHECK("name_eq case-insensitive", dns_name_eq_ci("DNS.AdGuard-DNS.COM", "dns.adguard-dns.com") == 1);
+    CHECK("name_eq mixed-case both",  dns_name_eq_ci("DnS.ADGUARD-dns.CoM", "Dns.Adguard-DNS.com") == 1);
+    CHECK("name_eq prefix rejected",  dns_name_eq_ci("dns.adguard-dns.co", "dns.adguard-dns.com") == 0);
+    CHECK("name_eq longer rejected",  dns_name_eq_ci("xdns.adguard-dns.com", "dns.adguard-dns.com") == 0);
+    CHECK("name_eq different",        dns_name_eq_ci("example.com", "dns.adguard-dns.com") == 0);
+    CHECK("name_eq trailing dot",     dns_name_eq_ci("dns.adguard-dns.com.", "dns.adguard-dns.com") == 0);
+    CHECK("name_eq empty lhs",        dns_name_eq_ci("", "dns.adguard-dns.com") == 0);
+    CHECK("name_eq empty rhs",        dns_name_eq_ci("dns.adguard-dns.com", "") == 0);
+    CHECK("name_eq both empty",       dns_name_eq_ci("", "") == 0);
+    CHECK("name_eq null lhs",         dns_name_eq_ci(NULL, "dns.adguard-dns.com") == 0);
+    CHECK("name_eq null rhs",         dns_name_eq_ci("dns.adguard-dns.com", NULL) == 0);
+
     printf(g_fail ? "\nRESULT: FAIL\n" : "\nRESULT: PASS\n");
     return g_fail;
 }

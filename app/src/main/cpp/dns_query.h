@@ -24,6 +24,11 @@ int dns_query_parse(const unsigned char *q, size_t qlen,
                     uint16_t *qtype_out, uint16_t *qclass_out,
                     int *supported_out, size_t *qend_out);
 
+// 兩個網域名稱是否相同：ASCII 大小寫不敏感、必須完全相同（不做尾點正規化）。
+// 任一為 NULL 或空字串一律回 0（空字串不是合法網域，不該被當成「相符」）。
+// 純函式：不碰全域、不取時間、不加鎖。供私人 DNS（DoT）伺服器主機名的放行判斷使用。
+int dns_name_eq_ci(const char *a, const char *b);
+
 #ifdef __cplusplus
 }
 #endif

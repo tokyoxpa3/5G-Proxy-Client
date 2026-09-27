@@ -54,6 +54,7 @@ typedef struct tcp_sess {
     uint32_t app_win;       // App 通告的 window（已乘 WS，bytes）
     uint32_t app_acked;     // App 已確認的最高 seq（host 序）
     uint8_t app_ws;         // App SYN 協商的 window scale
+    unsigned char app_buf_full;  // 1 = app_buf 已滿、正通告零視窗（僅供轉態 log，塞進 app_ws 後的既有對齊洞）
     uint32_t app_isn;       // App 的 ISN
     uint32_t app_next;      // 我方期望的 App 下一個 seq（= ACK 值）
     uint32_t srv_isn;       // 我方 ISN
@@ -62,6 +63,8 @@ typedef struct tcp_sess {
     int srv_eof;            // server 已 EOF（read 回 0）
     int srv_fin_sent;       // 已送 FIN 給 App
     unsigned char *app_buf; size_t app_off, app_len, app_cap;  // App→server 待送（off=已送出前綴）
+    size_t app_max_len;         // 診斷：本 session 觀測到的 app_buf 最大佔用（判斷回壓是否真被觸發）
+    uint32_t app_ooo_segs;      // 診斷：App 端重傳／亂序段數（seq != app_next）
     unsigned char *srv_buf; size_t srv_off, srv_len, srv_cap;  // server→App 待送（off=已寫 TUN 前綴）
     unsigned char *dns_rx_buf; size_t dns_rx_len, dns_rx_cap;  // DNS-over-TCP 攔截：inbound 串流緩衝
     int dns_tcp;                 // 1 = DNS-over-TCP 攔截（port 53，本機合成 fake 回覆）
@@ -115,6 +118,9 @@ typedef struct {
     int auth_enabled;
     int udp_in_tcp;    // 1 = UDP relay 走 TCP frame（cmd=0x04 擴充）
     int remote_dns;    // 1 = Remote DNS（fakedns）：攔截 DNS、以網域撥號
+    // Android 私人 DNS（DoT hostname 模式）的伺服器主機名：此名稱**不 fake**、放行走 relay
+    // 用真實 DNS 解析（見 engine_util.c 的 dns_is_passthrough）。空字串 = 停用。
+    char dns_passthrough[256];
 
     // 流量統計（payload bytes 累計，供通知列即時顯示）
     atomic_ullong bytes_to_server;    // App → SOCKS5 伺服器
@@ -125,6 +131,9 @@ typedef struct {
     // TCP
     tcp_sess_t *tcp_hash[TCP_HASH_BUCKETS];
     atomic_int tcp_session_count;
+    atomic_int tcp_app_buf_full_events;  // app_buf 滿而改通告零視窗的次數（診斷用：>0 代表回壓真的啟動了）
+    atomic_ullong tun_write_eagain;      // 診斷：引擎→App 的 TUN 寫入遇 EAGAIN 被靜默丟棄的封包數
+    atomic_ullong tun_write_total;       // 診斷：引擎→App 的 TUN 寫入嘗試次數
     int kick_pipe[2];
     int tun_want_out;
     uint32_t isn_counter;
@@ -156,6 +165,8 @@ uint32_t next_tcp_isn(void);
 void srv_snapshot(char *host_out, size_t host_len, int *port_out);
 uint32_t fd_alloc(const char *domain, unsigned char ip6_out[16]);
 int fd_lookup(uint32_t fake_ip, char *domain, size_t dn);
+// 這個查詢名稱是否要放行（不合成 fake IP，改交 relay 用真實 DNS 解析）；詳見 engine_util.c
+int dns_is_passthrough(const char *name);
 uint32_t fd_find_domain(const char *domain);
 int fd_lookup6(const unsigned char ip6[16], char *domain, size_t dn);
 void set_nonblocking(int fd);

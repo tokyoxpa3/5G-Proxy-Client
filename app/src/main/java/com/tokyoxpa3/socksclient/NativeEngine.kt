@@ -63,7 +63,10 @@ object NativeEngine {
         onEngineStopped?.invoke(unexpected)
     }
 
-    external fun startTunnel(fd: Int, host: String, port: Int, user: String, pass: String, udpInTcp: Boolean, remoteDns: Boolean): String
+    // dnsPassthrough：Android 私人 DNS（DoT hostname 模式）的伺服器主機名。此名稱不套用 fake DNS，
+    // 改由伺服器端用真實 DNS 解析 —— 否則系統的 DoT 端點會被解析成 fake IP，一旦 fake 表被清
+    // （換網重建）就「私人 DNS 無法解析」而整台機 DNS 卡死。空字串 = 停用。
+    external fun startTunnel(fd: Int, host: String, port: Int, user: String, pass: String, udpInTcp: Boolean, remoteDns: Boolean, dnsPassthrough: String): String
     external fun stopTunnel(): String
 
     // soft-reconnect：不拆 TUN/VPN，重置引擎連線狀態。

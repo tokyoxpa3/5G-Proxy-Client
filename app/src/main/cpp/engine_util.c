@@ -164,6 +164,23 @@ int net_recv_all(int fd, unsigned char *buf, size_t len) {
     return 0;
 }
 
+// 這個查詢名稱是否要「放行」—— 不合成 fake IP，而是交給 relay 用真實 DNS 解析。
+//
+// 為什麼需要：Android 的「私人 DNS」設為 hostname 模式（DoT）時，系統必須先把 DoT 伺服器的
+// 主機名解析成**真實 IP** 才能建 TLS。這個解析用的是 VPN 網路自己宣告的 DNS（本專案 =
+// 8.8.8.8 / 1.1.1.1），封包會進 tun0 → 被 fake DNS 攔截 → 拿到 198.18.x.x。於是 VPN 的
+// DoT 端點變成 fake IP，可用性綁在 fake 表上：表一被清（engine_fake_dns_reset()、換網重建）
+// DoT 立刻斷 → 系統判「私人 DNS 無法解析」→ 整台機 DNS 卡死，只能手動重建隧道。
+// 2026-09-28 於小米 Pad Mini 完整驗證（`ValidatedPrivateDnsAddresses: [198.18.0.1, fd00::5e:1]`
+// 與引擎 log 的 `dst=198.18.0.1:853` 互相印證）。
+//
+// 放行代價：這個主機名的查詢內容會以明文送到上游 DNS。它是使用者自己設定的公開 DoT 服務
+// 主機名、不含使用者資料，可接受。
+int dns_is_passthrough(const char *name) {
+    // 比對邏輯抽在 dns_query.c 的純函式裡，可被單元測試直接覆蓋
+    return dns_name_eq_ci(name, g.dns_passthrough);
+}
+
 // 解析並合成單一 DNS query（A/AAAA/HTTPS）的 fake 回覆，不寫 TUN。
 // always_answer=0（UDP）：僅 A/AAAA/HTTPS 攔截，其餘回 0 放行走 relay。
 // always_answer=1（TCP）：任何合法 query 都產生回覆（A/AAAA fake、其餘 NOERROR 空答）。

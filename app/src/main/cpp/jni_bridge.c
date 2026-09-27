@@ -19,7 +19,8 @@ static jmethodID g_mid_notifyClosed = NULL;
 static jmethodID g_mid_notifyServerEvent = NULL;
 static jmethodID g_mid_notifyEngineStopped = NULL;
 
-extern int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass, int udp_in_tcp, int remote_dns);
+extern int tun_socks_start(int tun_fd, const char *host, int port, const char *user, const char *pass,
+                           int udp_in_tcp, int remote_dns, const char *dns_passthrough);
 extern void tun_socks_stop(void);
 extern void tun_socks_get_stats(unsigned long long *to_server, unsigned long long *from_server, int *tcp_sessions, int *udp_sessions);
 extern void tun_socks_reconnect(const char *new_host);
@@ -28,11 +29,12 @@ extern int tun_socks_is_running(void);
 static pthread_t g_tunnel_thread;
 static atomic_int g_tunnel_running = 0;
 
-typedef struct { int fd; char host[256]; int port; char user[128]; char pass[128]; int udp_in_tcp; int remote_dns; } TunnelArgs;
+typedef struct { int fd; char host[256]; int port; char user[128]; char pass[128]; int udp_in_tcp; int remote_dns; char dns_passthrough[256]; } TunnelArgs;
 
 static void *tunnel_thread_func(void *arg) {
     TunnelArgs *args = (TunnelArgs *)arg;
-    tun_socks_start(args->fd, args->host, args->port, args->user, args->pass, args->udp_in_tcp, args->remote_dns);
+    tun_socks_start(args->fd, args->host, args->port, args->user, args->pass, args->udp_in_tcp, args->remote_dns,
+                    args->dns_passthrough);
     free(args);
     // 注意：不可在此清 g_tunnel_running，否則 stop 會 join 不到本線程
     return NULL;
@@ -180,7 +182,7 @@ JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
     }
 }
 
-JNIEXPORT jstring JNICALL native_start_tunnel(JNIEnv *env, jobject thiz, jint fd, jstring host, jint port, jstring user, jstring pass, jboolean udp_in_tcp, jboolean remote_dns) {
+JNIEXPORT jstring JNICALL native_start_tunnel(JNIEnv *env, jobject thiz, jint fd, jstring host, jint port, jstring user, jstring pass, jboolean udp_in_tcp, jboolean remote_dns, jstring dns_passthrough) {
     // g_tunnel_running 在引擎意外退出（epoll 錯誤）後可能殘留為 1；只有「引擎實際仍執行」
     // 時才拒絕，否則歸零照常啟動，避免隧道卡在假運行狀態永遠無法重啟。
     if (atomic_load(&g_tunnel_running) && tun_socks_is_running())
@@ -197,12 +199,15 @@ JNIEXPORT jstring JNICALL native_start_tunnel(JNIEnv *env, jobject thiz, jint fd
     const char *chost = host ? (*env)->GetStringUTFChars(env, host, NULL) : NULL;
     const char *cuser = user ? (*env)->GetStringUTFChars(env, user, NULL) : NULL;
     const char *cpass = pass ? (*env)->GetStringUTFChars(env, pass, NULL) : NULL;
+    const char *cdns = dns_passthrough ? (*env)->GetStringUTFChars(env, dns_passthrough, NULL) : NULL;
     strncpy(args->host, chost ? chost : "", sizeof(args->host) - 1);
     strncpy(args->user, cuser ? cuser : "", sizeof(args->user) - 1);
     strncpy(args->pass, cpass ? cpass : "", sizeof(args->pass) - 1);
+    strncpy(args->dns_passthrough, cdns ? cdns : "", sizeof(args->dns_passthrough) - 1);
     if (chost) (*env)->ReleaseStringUTFChars(env, host, chost);
     if (cuser) (*env)->ReleaseStringUTFChars(env, user, cuser);
     if (cpass) (*env)->ReleaseStringUTFChars(env, pass, cpass);
+    if (cdns) (*env)->ReleaseStringUTFChars(env, dns_passthrough, cdns);
 
     atomic_store(&g_tunnel_running, 1);
     pthread_create(&g_tunnel_thread, NULL, tunnel_thread_func, args);
@@ -235,7 +240,7 @@ JNIEXPORT jstring JNICALL native_reconnect(JNIEnv *env, jobject thiz, jstring jh
 
 static const JNINativeMethod gMethods[] = {
     {"nativeRegisterInstance", "()V", (void *)native_register_instance},
-    {"startTunnel", "(ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;ZZ)Ljava/lang/String;", (void *)native_start_tunnel},
+    {"startTunnel", "(ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;ZZLjava/lang/String;)Ljava/lang/String;", (void *)native_start_tunnel},
     {"stopTunnel", "()Ljava/lang/String;", (void *)native_stop_tunnel},
     {"getStats", "()[J", (void *)native_get_stats},
     {"reconnect", "(Ljava/lang/String;)Ljava/lang/String;", (void *)native_reconnect},

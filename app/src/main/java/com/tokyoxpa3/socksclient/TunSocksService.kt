@@ -8,12 +8,14 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.provider.Settings
 import android.util.Log
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -85,6 +87,10 @@ class TunSocksService : VpnService() {
         kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()
     )
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // 供 resolveCandidateDnsServers()（軟重連補 DHCP DNS）與 logNetworkContext() 使用。
+    private val connectivityManager: ConnectivityManager?
+        get() = try { getSystemService(ConnectivityManager::class.java) } catch (e: Exception) { null }
 
     // 開機自啟 / 磁貼 / START_STICKY 重建等背景啟動：網路與 DNS 在開機當下可能尚未就緒，
     // 失敗後定時重試（有界），避免隧道永遠起不來。
@@ -285,6 +291,7 @@ class TunSocksService : VpnService() {
                 return
             }
             Log.d(TAG, "Server resolved to $serverIp")
+            logNetworkContext(host, serverIp)
 
             val builder = Builder()
             builder.setSession(getString(R.string.app_name))
@@ -327,6 +334,14 @@ class TunSocksService : VpnService() {
                 return
             }
 
+            // 明確宣告「底層網路 = 系統預設網路」，讓系統在換網時自行更新本 VPN 的
+            // underlying network；不呼叫的話它會停在 establish() 當下的那個網路。
+            try {
+                setUnderlyingNetworks(null)
+            } catch (e: Exception) {
+                Log.w(TAG, "setUnderlyingNetworks failed: ${e.message}")
+            }
+
             // native lib 載入失敗（如 16KB page 裝置未對齊）時，直接報錯而不是崩潰
             if (!NativeEngine.isLibraryLoaded()) {
                 startPending = false
@@ -341,7 +356,10 @@ class TunSocksService : VpnService() {
             NativeEngine.socketProvider = { h, p, isUdp -> createProtectedSocket(h, p, isUdp) }
             NativeEngine.registerInstance()
             Log.d(TAG, "Calling native startTunnel")
-            val result = NativeEngine.startTunnel(tunFd.detachFd(), serverIp, port, user, pass, udpInTcp, remoteDns)
+            val result = NativeEngine.startTunnel(
+                tunFd.detachFd(), serverIp, port, user, pass, udpInTcp, remoteDns,
+                privateDnsPassthroughHost()
+            )
             Log.d(TAG, "native startTunnel result: $result")
 
             startPending = false
@@ -519,6 +537,55 @@ class TunSocksService : VpnService() {
         }
     }
 
+    // ---------- 診斷 ----------
+
+    // ⚠️ 只給 logNetworkContext 當診斷值用。對 VPN App 而言這個值是「自己的 VPN 網路」，
+    // **不可**拿它當「換網」的判準（歷史教訓：拿它判換網會造成無限重啟迴圈）。
+    private fun activeNetworkId(): Any? =
+        try { connectivityManager?.activeNetwork } catch (e: Exception) { null }
+
+    // 啟動時把「伺服器位址 / 本機介面位址 / 目前預設網路」記成一行。
+    // 換網後需要重建時，這一行能直接區分兩種完全不同的原因：
+    //   ① 伺服器位址已不在本機任何介面上（同機共存 + Wi-Fi 換 IP → 位址真的失效）
+    //   ② 位址沒變、壞在隧道狀態（→ 重建即可）
+    // 沒有這一行，兩者只能靠猜。
+    private fun logNetworkContext(host: String, serverIp: String) {
+        val localAddrs = try {
+            java.net.NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { nif -> nif.inetAddresses.toList().map { nif.name + "=" + it.hostAddress } }
+                .joinToString(", ")
+        } catch (e: Exception) {
+            "unavailable: ${e.message}"
+        }
+        Log.i(TAG, "network context: server=$host -> $serverIp, default=${activeNetworkId()}, local=[$localAddrs]")
+    }
+
+    /**
+     * Android「私人 DNS」若為 hostname 模式（DoT），系統必須先把該主機名解析成**真實 IP**。
+     * 那個解析走 VPN 網路自己宣告的 DNS，會被本引擎的 fake DNS 攔截成 198.18.x.x
+     * → VPN 的 DoT 端點變成 fake IP → 表一被清（換網重建）就「私人 DNS 無法解析」，
+     * 整台機的 DNS 跟著卡死，只能手動重建隧道（2026-09-28 實機完整驗證）。
+     *
+     * 回傳該主機名讓原生端放行（不 fake、交由伺服器端用真實 DNS 解析）。
+     * 非 hostname 模式、或名稱不合法時回傳空字串（＝維持原行為）。
+     */
+    private fun privateDnsPassthroughHost(): String {
+        return try {
+            val cr = contentResolver
+            // 用字串常數而非 Settings.Global.PRIVATE_DNS_MODE：後者是 API 28+，minSdk 26 會觸發 NewApi
+            if (Settings.Global.getString(cr, "private_dns_mode") != "hostname") return ""
+            val host = Settings.Global.getString(cr, "private_dns_specifier")?.trim().orEmpty()
+            // 只接受看起來像主機名的值，避免把奇怪的設定值餵進原生端
+            if (host.length !in 4..253 || !host.contains('.')) return ""
+            if (!host.all { it.isLetterOrDigit() || it == '.' || it == '-' || it == '_' }) return ""
+            host
+        } catch (e: Exception) {
+            Log.w(TAG, "read private_dns_specifier failed: ${e.message}")
+            ""
+        }
+    }
+
     private fun restartTunnel() {
         publishStatus(getString(R.string.status_restarting))
         serviceScope.launch {
@@ -535,11 +602,39 @@ class TunSocksService : VpnService() {
     // 供軟重連在 DDNS／IP 變動後重新解析伺服器位址；失敗回傳 null（沿用舊 IP）。
     private fun resolveHostOutsideTunnel(host: String): String? {
         if (Config.isLiteralIp(host)) return host
-        for (server in Config.dnsServers(this)) {
+        for (server in resolveCandidateDnsServers()) {
             val ip = queryDns(server, host)
             if (ip != null) return ip
         }
         return null
+    }
+
+    /**
+     * 軟重連要用的 DNS 伺服器候選：使用者設定的優先，再補上「目前預設網路的 DHCP DNS」。
+     *
+     * 只靠設定值（預設 8.8.8.8 / 1.1.1.1）不夠：那些位址在部分網路被封或不可達，
+     * 一旦兩個都不通，`softRestart()` 就永遠拿不到新 IP、只能沿用舊的 —— DDNS／換網後
+     * 再也追不上（README 說會自動追蹤，實際只在設定值通的時候成立）。DHCP DNS 是那條
+     * 網路上「唯一保證存在」的解析器，補進來才真的追得上。
+     * 查詢一律經 protect() 過的 socket（見 queryDns），不會被自己的隧道 fake DNS 攔截。
+     */
+    private fun resolveCandidateDnsServers(): List<String> {
+        val servers = LinkedHashSet<String>()
+        servers.addAll(Config.dnsServers(this))
+        try {
+            val cm = connectivityManager
+            val net = cm?.activeNetwork
+            if (cm != null && net != null) {
+                cm.getLinkProperties(net)?.dnsServers?.forEach { addr ->
+                    // hostAddress 對 IPv6 可能帶 zone id（fe80::1%wlan0）→ 去掉後才是查詢用的位址
+                    val ip = addr.hostAddress?.substringBefore('%')
+                    if (ip != null && Config.isLiteralIp(ip)) servers.add(ip)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "collect DHCP DNS servers failed: ${e.message}")
+        }
+        return servers.toList()
     }
 
     // 對單一 DNS 伺服器發 A/AAAA 查詢並解析第一個位址；逾時／失敗回傳 null。
