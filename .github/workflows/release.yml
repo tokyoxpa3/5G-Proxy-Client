@@ -73,7 +73,7 @@ jobs:
           # Surface a missing changelog as a workflow warning rather than
           # silently publishing a release whose notes are only commit noise.
           # Expected for workflow_dispatch rebuilds of tags older than the
-          # fastlane changelogs (only 13 and 14 exist so far).
+          # fastlane changelogs (the oldest is 13.txt, for v1.6.0 = versionCode 13).
           if [ ! -f "$EN" ]; then
             echo "::warning::No changelog at ${EN} for versionCode ${VERSION_CODE}"
           fi
