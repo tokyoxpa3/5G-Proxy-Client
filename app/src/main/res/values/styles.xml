@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      App 清單頁專用主題：不使用 ActionBar。
+
+      原因（2026-09-27 在 POCO X7 Pro / HyperOS 2 / Android 15 實測）：
+      targetSdk 35 強制 edge-to-edge，而此 ROM 的 ActionBar 是以 overlay 方式
+      疊在內容之上 —— 標題列（y 154–222）畫在模式提示（y 32–110）與搜尋框
+      （y 110–212）上面，導致「顯示系統 App」只露出下半截、搜尋框完全看不到。
+      光靠 systemBars insets 只清得掉狀態列，清不掉 overlay 的 ActionBar，
+      因此這一頁直接不用 ActionBar，標題改由內容自己畫（見 AppListActivity）。
+    -->
+    <style name="AppListTheme" parent="@android:style/Theme.DeviceDefault">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+</resources>

@@ -34,7 +34,9 @@
         <activity
             android:name=".AppListActivity"
             android:exported="false"
-            android:label="@string/applist_title" />
+            android:label="@string/applist_title"
+            android:theme="@style/AppListTheme"
+            android:windowSoftInputMode="adjustResize" />
 
         <service
             android:name=".TunSocksService"

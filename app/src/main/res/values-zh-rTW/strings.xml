@@ -52,8 +52,21 @@
     <string name="applist_hint_allowlist">白名單模式：只有「勾選」的 App 會走隧道。</string>
     <string name="applist_hint_exclude">排除模式：勾選的 App 走手機本機網路（繞過隧道）。</string>
     <string name="applist_search_hint">搜尋 App…</string>
+    <string name="applist_search_clear">✕</string>
     <string name="applist_empty">找不到 App</string>
-    <string name="applist_show_system">顯示系統 App</string>
+    <string name="applist_show_system_on">☑ 顯示系統 App（目前顯示中）</string>
+    <string name="applist_show_system_off">☐ 顯示系統 App（目前隱藏中）</string>
+    <string name="applist_summary">顯示 %1$d 個 App ・ 已選 %2$d 個</string>
+    <string name="applist_hint_pro_exclude">⚠️ 偵測到已安裝 5G Proxy Pro，但尚未排除。請勾選「5G Proxy Pro」（讓它走本機網路），或回主頁開啟「同機共存」開關。</string>
+    <string name="applist_hint_pro_global">⚠️ 偵測到已安裝 5G Proxy Pro。請把隧道模式改為「🚫 排除勾選的 App」並勾選它，或回主頁開啟「同機共存」開關。</string>
+    <string name="applist_hint_pro_allowlist">ℹ️ 指定 App 模式：5G Proxy Pro 已鎖定在隧道外 —— 兩者可同時運作。</string>
+
+    <!-- 同機共存開關（主頁） -->
+    <string name="label_coexist">🔗 同機共存（5G Proxy Pro）</string>
+    <string name="coexist_on">已把 5G Proxy Pro 留在隧道外 —— 兩者可同時運作。</string>
+    <string name="coexist_off_exclude">未開啟：Pro 會被隧道接管，無法綁定 5G 出口（EPERM），起不來。</string>
+    <string name="coexist_off_other_mode">未開啟：僅在「🚫 排除勾選的 App」模式有效 —— 開啟會一併切到該模式並勾選 Pro。</string>
+    <string name="coexist_locked">指定 App 模式下 5G Proxy Pro 不會進隧道 —— 已鎖定，無法勾選。</string>
 
     <!-- Section labels -->
     <string name="label_server">SOCKS5 伺服器</string>

@@ -52,8 +52,21 @@
     <string name="applist_hint_allowlist">Allowlist mode: only CHECKED apps go through the tunnel.</string>
     <string name="applist_hint_exclude">Exclusion mode: checked apps use the phone\'s direct network (bypass the tunnel).</string>
     <string name="applist_search_hint">Search apps…</string>
+    <string name="applist_search_clear">✕</string>
     <string name="applist_empty">No apps found</string>
-    <string name="applist_show_system">Show system apps</string>
+    <string name="applist_show_system_on">☑ Show system apps (currently shown)</string>
+    <string name="applist_show_system_off">☐ Show system apps (currently hidden)</string>
+    <string name="applist_summary">%1$d apps shown ・ %2$d selected</string>
+    <string name="applist_hint_pro_exclude">⚠️ 5G Proxy Pro is installed but not excluded. Check 5G Proxy Pro so it uses the device network, or turn on “Coexist with 5G Proxy Pro” on the main screen.</string>
+    <string name="applist_hint_pro_global">⚠️ 5G Proxy Pro is installed. Switch Tunnel Mode to “🚫 Exclude checked apps” and check it, or turn on “Coexist with 5G Proxy Pro” on the main screen.</string>
+    <string name="applist_hint_pro_allowlist">ℹ️ Per-App mode: 5G Proxy Pro is locked out of the tunnel — both apps can run at once.</string>
+
+    <!-- Coexistence switch (main screen) -->
+    <string name="label_coexist">🔗 Coexist with 5G Proxy Pro</string>
+    <string name="coexist_on">5G Proxy Pro is kept outside the tunnel — both apps can run at once.</string>
+    <string name="coexist_off_exclude">Off: 5G Proxy Pro is inside the tunnel and cannot bind its 5G socket (EPERM), so it will not start.</string>
+    <string name="coexist_off_other_mode">Off: only effective in “🚫 Exclude checked apps” mode — turning it on also switches to that mode and checks 5G Proxy Pro.</string>
+    <string name="coexist_locked">Per-App mode keeps 5G Proxy Pro outside the tunnel — locked so it cannot be checked.</string>
 
     <!-- Section labels -->
     <string name="label_server">SOCKS5 Server</string>

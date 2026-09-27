@@ -37,6 +37,13 @@ class AppListFilterTest {
     }
 
     @Test
+    fun queryIsTrimmed() {
+        // 輸入法常自動帶尾隨空白；trim 後仍應命中
+        assertEquals(listOf(apps[0], apps[2]), AppListFilter.filter(apps, "  example  ", showSystem = true))
+        assertEquals(apps, AppListFilter.filter(apps, "   ", showSystem = true))
+    }
+
+    @Test
     fun queryExcludingSystemAppsReturnsNothingWhenOnlySystemMatches() {
         // "system" 只命中系統 App（System UI / com.android.systemui），showSystem=false 時全部被排除
         assertEquals(emptyList<AppListFilter.Entry>(), AppListFilter.filter(apps, "system", showSystem = false))

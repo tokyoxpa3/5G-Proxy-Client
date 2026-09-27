@@ -12,6 +12,8 @@
 | **Server 端** | 5G Proxy Pro（`com.tokyoxpa3.androidproxy`） | 小米手機 192.168.1.178 | 鎖定 5G 網路，在 Wi-Fi 內網開 SOCKS5 代理 |
 | **Client 端** | 5G Proxy Client（`com.tokyoxpa3.socksclient`） | 三星手機 192.168.1.192 | 建立 TUN 隧道，把全部流量導向 Server 的代理 |
 
+> 只有一支手機時，可以讓同一支手機同時扮演 Server 與 Client（Pro 與 Client 同機共存），見 **第 6 節**。
+
 ### 整體架構
 
 ![整體架構](docs/figures/fig1_architecture.png)
@@ -179,7 +181,65 @@ adb -s 192.168.1.192:45643 shell "curl -s https://api.ipify.org"
 
 ---
 
-## 6. 常見問題
+## 6. 進階：同一支手機同時跑 Pro 與 Client（同機共存）
+
+前面 1–5 節是「兩支手機」的標準拓撲。若你只有一支手機、但想讓**這支手機自己的流量**也走 5G（而不是走它連著的那條 Wi-Fi），可以在同一支手機上同時跑 Pro 與 Client。
+
+```
+[手機自身所有 App] --TUN 10.8.0.2--> [Client 引擎] --SOCKS5（同機 Wi-Fi IP:1080）--> [Pro] --5G 介面--> [Internet]
+                                                        ▲
+                                         例外：Pro 本身被排除在隧道外
+```
+
+### 6.1 為什麼一定要「排除 Pro」
+
+Client 的 TUN 會接管**所有** App 的路由，包含 Pro。而 Pro 必須把 Socket 綁定到蜂巢式出口（`Network.bindSocket`）才能走 5G —— 一旦被隧道接管，這一步會被系統以 `EPERM` 拒絕，Pro 就起不來。
+
+Pro 現在不再「偵測到 VPN 就拒絕啟動」，改成**實際 bind 一次蜂巢式出口**，bind 成功才啟動。所以只要把 Pro 排除在 Client 的隧道之外，兩者就能同時運作。
+
+### 6.2 設定步驟
+
+1. **先啟動 Pro**（照第 3 節），記下它顯示的 **「📶 Wi-Fi 代理」`IP:Port`**。
+2. **Client 的伺服器位址填「同一支手機的 Wi-Fi IP」**（例：`192.168.1.178` / `1080`）。
+   - ⚠️ 填 `127.0.0.1` **無效**：Pro 的監聽器刻意**不綁 loopback**，只綁 Wi-Fi / 熱點 / USB 分享等 LAN 位址。
+3. **開啟主頁的「🔗 同機共存（5G Proxy Pro）」開關**（就在隧道模式下方）。**預設不開啟。**
+   共存的判準是「**Pro 不在隧道裡**」，而同一個勾選動作在排除模式與指定 App 模式語意相反，
+   所以開關做的事也跟著模式不同：
+   - 🚫 **排除勾選的 App**：勾選 = 走本機網路 → 開關會**勾選** Pro。
+   - 🎯 **指定 App**：勾選 = 走隧道 → 開關不改模式，只把 Pro **移出**清單（不勾）。
+   - 🌐 **全局**：所有 App 都進隧道、清單不生效 → 開關會**連帶切到排除模式**並勾選 Pro
+     （電台按鈕同步跳過去，是可見行為）。
+   - 只在**偵測到已安裝 5G Proxy Pro** 時出現；開關與清單裡的 Pro 是同一狀態的兩種呈現，
+     不會各說各話。
+   - **指定 App 模式下共存自動成立、無法關閉** —— 唯一能「關掉」的動作是把 Pro 勾進白名單，
+     而那正是要避免的事。因此該模式下開關與 Pro 那一列都**鎖住**（列會淡化、按了沒反應），
+     切到該模式時 Pro 也會自動被移出清單。
+   - 想手動做也行：排除模式點「📱 App」勾選「5G Proxy Pro」；指定 App 模式只要不勾它即可。
+4. 點「🚀 啟動隧道」並允許 VPN 權限。
+5. **驗證**：`adb shell curl -s https://api.ipify.org` 的結果應等於 Pro 顯示的「📲 5G 行動 IP」。
+
+![同機共存：Client 主頁設定](docs/shots/client_coexist_main_annotated.png)
+
+排除模式下的主頁：伺服器位址填本機 Wi-Fi IP、隧道模式選「排除勾選的 App」、開啟「同機共存」開關（步驟 3 的預設動作就是幫你勾好 Pro）。
+
+指定 App（白名單）模式則不需要那個開關 —— 只要 Pro 不被勾進清單，共存就自動成立，開關與 Pro 那一列都會被鎖住：
+
+![同機共存：指定 App 模式](docs/shots/client_coexist_allowlist_annotated.png)
+
+> 建議順序是先 Pro 後 Client。反過來也可以（Pro 的啟動檢查是實測 bind，不是看有沒有 VPN），但若 Pro 先失敗，畫面會提示「本 App 可能已被納入 VPN 隧道」。
+
+### 6.3 同機共存常見症狀
+
+| 症狀 | 原因 | 解決 |
+|---|---|---|
+| Pro 顯示「❌ 偵測到 VPN 正在運作…」 | Pro 沒被排除在 Client 隧道外 | 開主頁的「🔗 同機共存」開關，或回 Client 的「📱 App」勾選「5G Proxy Pro」 |
+| Pro 狀態顯示 `BLOCKED_BY_VPN` 且不自動重建 | 同上。這是設定問題，重建無用，Pro 刻意不重建 | 同上 |
+| Client 一直「正在解析伺服器位址…」 | 伺服器位址填成了 `127.0.0.1` | 改填手機的 Wi-Fi IP |
+| 其他裝置透過 Pro 正常、但本機手機上不了網 | Client 隧道沒建立起來 | 檢查 Client 狀態；先停 Client 確認 Pro 本身仍正常 |
+
+---
+
+## 7. 常見問題
 
 | 症狀 | 原因 | 解決方法 |
 |---|---|---|
@@ -190,10 +250,11 @@ adb -s 192.168.1.192:45643 shell "curl -s https://api.ipify.org"
 | Client 按啟動沒反應 / Toast 顯示輸入錯誤 | 伺服器位址或埠格式不對 | 確認 IP 格式、Port 在 1~65535 之間 |
 | VPN 對話框按了拒絕 | 使用者拒絕授權 | 到 系統設定 → VPN（或 App 資訊 → 更多設定）重新允許 |
 | 有 VPN 鑰匙但無法上網 | Server 沒啟動、或 Server 換了 Wi-Fi IP | 檢查 Server 端狀態與「Wi-Fi 代理」IP 是否仍相同 |
+| Pro 端顯示「偵測到 VPN 正在運作…」或狀態為 `BLOCKED_BY_VPN` | 同機共存時，Pro 沒有被排除在 Client 的隧道外 | Client 隧道模式選「🚫 排除勾選的 App」並勾選「5G Proxy Pro」（見第 6 節） |
 
 ---
 
-## 7. 附錄
+## 8. 附錄
 
 ### 7.1 用 ADB 遠端操作兩支手機（本教學使用）
 
@@ -224,7 +285,7 @@ adb -s <serial> pull /sdcard/s.png
 
 ---
 
-## 8. 本教學的圖檔來源
+## 9. 本教學的圖檔來源
 
 | 檔案 | 說明 |
 |---|---|

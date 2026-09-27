@@ -254,6 +254,33 @@ def main():
         title="Client 端：隧道已啟用",
     )
 
+    # --- 同機共存（同一支手機同時跑 Pro 與 Client）---
+    # 截圖取自小米 Pad Mini（1220x2712，Pro 與 Client 同機），與 Server 端同裝置。
+
+    annotate(
+        os.path.join(S, "client_coexist_main.png"),
+        os.path.join(S, "client_coexist_main_annotated.png"),
+        [
+            (1, 610, 496, "伺服器位址填「同一支手機的 Wi-Fi IP」——填 127.0.0.1 無效"),
+            (2, 610, 1886, "隧道模式選「🚫 排除勾選的 App」"),
+            (3, 610, 1990, "開啟「🔗 同機共存（5G Proxy Pro）」"),
+            (4, 610, 2073, "開啟後 Pro 被留在隧道外 —— 兩者可同時運作"),
+        ],
+        title="同機共存：Client 主頁設定",
+    )
+
+    annotate(
+        os.path.join(S, "client_coexist_allowlist.png"),
+        os.path.join(S, "client_coexist_allowlist_annotated.png"),
+        [
+            (1, 610, 310, "指定 App（白名單）模式：只有勾選的 App 走隧道"),
+            (2, 610, 440, "此模式下 Pro 自動被鎖在隧道外 —— 兩者仍可同時運作"),
+            (3, 610, 894, "已選 0 個：Pro 不在清單中"),
+            (4, 610, 1381, "Pro 那一列淡化且無法勾選（勾了 = 送它進隧道）"),
+        ],
+        title="同機共存：指定 App 模式（Pro 已鎖定）",
+    )
+
 
 if __name__ == "__main__":
     main()

@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.ScrollView
+import android.view.View
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -60,10 +61,15 @@ class MainActivity : Activity() {
     private lateinit var tvKillSwitch: TextView
     private lateinit var btnKillSwitch: Button
     private lateinit var btnBattery: Button
+    private lateinit var cbCoexist: CheckBox
+    private lateinit var tvCoexist: TextView
 
     private var pendingAutoStart = false
     private var autoFinishPending = false
     private val profileNames = mutableListOf<String>()
+
+    /** 由程式同步 cbCoexist 時抑制其監聽器，避免「同步 → 觸發 → 再寫入」的回圈。 */
+    private var suppressCoexistWrite = false
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -119,6 +125,9 @@ class MainActivity : Activity() {
         )
         updateStatus(TunSocksService.lastStatus)
         refreshKillSwitch()
+        // 從 App 清單頁回來後，勾選清單可能已變動（例如取消了 Pro）→ 重算開關狀態。
+        // 也一併重探 Pro 是否已安裝／被解除安裝。
+        syncCoexistSwitch()
 
         // 開機「閃一下」：若在背景停留期間隧道已連上，回到前台時立即關閉
         if (autoFinishPending && TunSocksService.isRunning) {
@@ -226,6 +235,19 @@ class MainActivity : Activity() {
         modeGroup.addView(modeBtn(getString(R.string.label_mode_allowlist), Config.MODE_ALLOWLIST))
         modeGroup.addView(modeBtn(getString(R.string.label_mode_exclude), Config.MODE_EXCLUDE))
 
+        // 同機共存開關（僅在偵測到 5G Proxy Pro 時顯示）。
+        // 它是 (隧道模式, 勾選清單) 的衍生值 —— 開＝排除模式且已勾選 Pro，不持有自己的狀態。
+        // 因此把它打開會連帶把模式切到「排除勾選的 App」：電台按鈕會同步跳過去，是可見行為。
+        cbCoexist = CheckBox(this).apply {
+            text = getString(R.string.label_coexist)
+            setPadding(0, 12, 0, 0)
+        }
+        tvCoexist = TextView(this).apply {
+            textSize = 12f
+            alpha = 0.75f
+            setPadding(0, 0, 0, 4)
+        }
+
         // 設定檔
         spinnerProfile = Spinner(this)
         btnSaveProfile = Button(this).apply { text = getString(R.string.btn_save_profile) }
@@ -262,6 +284,8 @@ class MainActivity : Activity() {
         root.addView(etPass)
         root.addView(label(getString(R.string.label_mode)))
         root.addView(modeGroup)
+        root.addView(cbCoexist)
+        root.addView(tvCoexist)
         // App 按鈕貼近「僅排除以下 App」選項
         root.addView(btnSelectApps)
         root.addView(btnToggle)
@@ -306,11 +330,100 @@ class MainActivity : Activity() {
         cbAutoStart.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(Config.KEY_AUTO_START, checked).apply()
         }
+
+        // 同機共存預設**不開啟**：不代使用者動模式或勾選清單，開關只反映現況。
         modeGroup.check(prefs.getInt(Config.KEY_MODE, Config.MODE_GLOBAL))
+
+        // 模式一改就立即落地。原本只在按下「啟動」時才寫 KEY_MODE，導致「先改模式、
+        // 未按啟動就進 App 清單頁」時，該頁讀到的是舊模式（提示文字與實際不符）。
+        modeGroup.setOnCheckedChangeListener { _, id ->
+            prefs.edit().putInt(Config.KEY_MODE, id).apply()
+            // 切到「指定 App」時把 Pro 擋在白名單外 —— Pro 不得進隧道（見 Coexist.sanitize）
+            enforceCoexistInvariant()
+            syncCoexistSwitch()
+        }
+
+        cbCoexist.setOnCheckedChangeListener { _, checked ->
+            if (suppressCoexistWrite) return@setOnCheckedChangeListener
+            val cur = prefs.getInt(Config.KEY_MODE, Config.MODE_GLOBAL)
+            val sel = currentSelectedApps()
+            val next = if (checked) Coexist.turnOn(cur, sel) else Coexist.turnOff(cur, sel)
+            applyCoexistState(next)
+            // 模式可能被 turnOn 改成排除 → 電台按鈕同步跳過去（可見，不是隱藏行為）
+            if (modeGroup.checkedRadioButtonId != next.mode) modeGroup.check(next.mode)
+            syncCoexistSwitch()
+        }
+
+        syncCoexistSwitch()
 
         setupProfileUi()
 
         refreshProfileSpinner()
+    }
+
+    private fun currentSelectedApps(): Set<String> =
+        prefs().getStringSet(AppListActivity.KEY_APPS, emptySet()) ?: emptySet()
+
+    /** 模式與勾選清單必須同時寫入，否則中途讀取會看到「新模式 + 舊清單」的不一致組合。 */
+    private fun applyCoexistState(state: Coexist.State) {
+        prefs().edit()
+            .putInt(Config.KEY_MODE, state.mode)
+            .putStringSet(AppListActivity.KEY_APPS, state.selected)
+            .apply()
+    }
+
+    /** 5G Proxy Pro 是否已安裝（本 App 具備 QUERY_ALL_PACKAGES，看得到）。 */
+    private fun isProInstalled(): Boolean = try {
+        packageManager.getPackageInfo(Coexist.PRO_PACKAGE, 0)
+        true
+    } catch (e: Exception) {
+        false
+    }
+
+    /**
+     * 把「同機共存」開關與其說明同步成 (隧道模式, 勾選清單) 的衍生結果。
+     *
+     * 開關只反映狀態、不持有狀態：在 App 清單頁把 Pro 取消勾選、或在此切換模式，
+     * 下一次同步就會反映出來 —— 所以不存在「開關說開了、清單卻沒勾」的不一致。
+     * Pro 未安裝時整個區塊隱藏（這個概念不適用）。
+     */
+    /** 把「Pro 不得進隧道」的不變式套用到勾選清單（只有指定 App 模式會實際變動）。 */
+    private fun enforceCoexistInvariant() {
+        val mode = prefs().getInt(Config.KEY_MODE, Config.MODE_GLOBAL)
+        val cur = currentSelectedApps()
+        val fixed = Coexist.sanitize(mode, cur)
+        if (fixed != cur) prefs().edit().putStringSet(AppListActivity.KEY_APPS, fixed).apply()
+    }
+
+    /** 同機共存開關可否操作：隧道未執行（設定已凍結），且該模式允許關閉。 */
+    private fun coexistSwitchEnabled(): Boolean =
+        !TunSocksService.isRunning &&
+            !Coexist.isLocked(prefs().getInt(Config.KEY_MODE, Config.MODE_GLOBAL))
+
+    private fun syncCoexistSwitch() {
+        if (!::cbCoexist.isInitialized) return
+        val installed = isProInstalled()
+        cbCoexist.visibility = if (installed) View.VISIBLE else View.GONE
+        tvCoexist.visibility = cbCoexist.visibility
+        if (!installed) return
+
+        val mode = prefs().getInt(Config.KEY_MODE, Config.MODE_GLOBAL)
+        val on = Coexist.isOn(mode, currentSelectedApps())
+        cbCoexist.isEnabled = coexistSwitchEnabled()
+        if (cbCoexist.isChecked != on) {
+            suppressCoexistWrite = true
+            cbCoexist.isChecked = on
+            suppressCoexistWrite = false
+        }
+        tvCoexist.text = getString(
+            when {
+                // 指定 App 模式下共存自動成立且不可關閉 → 顯示為已鎖定
+                on && Coexist.isLocked(mode) -> R.string.coexist_locked
+                on -> R.string.coexist_on
+                mode == Config.MODE_EXCLUDE -> R.string.coexist_off_exclude
+                else -> R.string.coexist_off_other_mode
+            }
+        )
     }
 
     private fun attemptStart() {
@@ -433,6 +546,9 @@ class MainActivity : Activity() {
                         .putStringSet(AppListActivity.KEY_APPS, p.apps)
                         .putInt(Config.KEY_MODE, p.mode)
                         .apply()
+                    // 設定檔可能把模式與勾選清單一起換掉 → 先套用不變式，再重算開關
+                    enforceCoexistInvariant()
+                    syncCoexistSwitch()
                 }
             }
 
@@ -618,6 +734,9 @@ class MainActivity : Activity() {
         cbUdpInTcp.isEnabled = enabled
         cbRemoteDns.isEnabled = enabled
         btnSelectApps.isEnabled = enabled
+        // 同機共存開關改的是「模式 + 勾選清單」，同樣在 establish() 時就固定 → 一併鎖住。
+        // 指定 App 模式下共存強制成立、不可關閉，那裡也維持鎖定（見 Coexist.isLocked）。
+        cbCoexist.isEnabled = coexistSwitchEnabled()
         // RadioGroup 的 isEnabled 不會停用子 RadioButton，需逐一設定
         for (i in 0 until modeGroup.childCount) {
             modeGroup.getChildAt(i).isEnabled = enabled

@@ -11,7 +11,9 @@ object AppListFilter {
 
     fun filter(entries: List<Entry>, query: String, showSystem: Boolean): List<Entry> {
         val base = if (showSystem) entries else entries.filterNot { it.system }
-        return if (query.isBlank()) base
-        else base.filter { it.label.contains(query, ignoreCase = true) || it.pkg.contains(query, ignoreCase = true) }
+        // trim：輸入法常自動帶尾隨空白，未去除會讓「搜尋 App 」變成 0 筆結果
+        val q = query.trim()
+        return if (q.isEmpty()) base
+        else base.filter { it.label.contains(q, ignoreCase = true) || it.pkg.contains(q, ignoreCase = true) }
     }
 }
