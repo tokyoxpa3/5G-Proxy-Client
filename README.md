@@ -108,8 +108,11 @@ export JAVA_HOME=<JDK 17 路徑>
 ### UDP-in-TCP（可選，MainActivity 勾選）
 
 - 握手改用自訂 SOCKS5 擴充指令 `0x04`；伺服器回覆成功後，**同一條 TCP 連線**以 frame 承載 UDP datagram
-- frame 格式：`[2-byte 長度 (network order)] + [SOCKS5 UDP datagram]`，datagram = `RSV(2)=0 + FRAG(1)=0 + ATYP + ADDR + PORT(2) + DATA`（ATYP 0x01 → 表頭 10B；0x04 → 22B）
-- 伺服器不支援 0x04（回覆 REP≠0）時，客戶端自動在同一條連線**退回標準 UDP ASSOCIATE（0x03）**，一般 SOCKS5 伺服器亦可直接使用
+- frame 格式：`[2-byte 長度 (network order)] + [SOCKS5 UDP datagram]`，datagram = `RSV(2)=0 + FRAG(1)=0 + ATYP + ADDR + PORT(2) + DATA`（ATYP 0x01 → 表頭 10B；0x03 網域 → 可變長；0x04 → 22B）
+- **Remote DNS 開啟時 frame 用 ATYP=0x03（網域）**：客戶端只知道 fake IP，真名要由伺服器以自身出口解析（RFC 1928 §7 明文允許 UDP header 帶網域）。伺服器若只認 0x01/0x04，這類 frame 會被丟棄，QUIC 等 UDP 全滅
+- 伺服器回覆 REP≠0（不支援 0x04，或暫時拒絕如額度耗盡）時，客戶端會**重新建立一條連線**再退回標準 UDP ASSOCIATE（0x03）。
+  不可續用原連線：依 RFC 1928，REP≠0 後伺服器通常已直接關閉它（5G-Proxy-Pro 就是如此），續用只會拿到 EOF
+- 退回過程的失敗一律歸類為**協定層**（伺服器端拒絕／忙碌），**不觸發自動重連看門狗**；真正的網路斷線由 TCP CONNECT 的網路層失敗照樣偵測
 - 完整規格見配套伺服器專案（5G-Proxy-Pro）README
 
 ### Per-App 排除

@@ -339,9 +339,22 @@ static void *udp_session_thread(void *arg) {
             if (recv_all(cfd, buf, bnd_len) < 0) goto fail;
             udp_tcp = 1;
         } else {
-            // 伺服器不支援 0x04：同一連線退回標準 UDP ASSOCIATE（0x03）。
-            // 失敗回覆仍含 BND.ADDR/PORT，須完整吃掉，否則殘留位元組會污染下一筆 0x03 的回覆。
-            LOGI("伺服器不支援 UDP-in-TCP (REP=%d)，退回 UDP-in-UDP", buf[1]);
+            // 伺服器不支援 0x04，或**暫時拒絕**（5G-Proxy-Pro 在連線額度／UDP slot 耗盡、
+            // 或建不起 5G UDP socket 時，回的就是 REP=0x04）。
+            //
+            // 這裡**不可在同一條連線上退回 0x03**：RFC 1928 中 REP≠0 代表該請求失敗，
+            // 伺服器通常會直接關閉連線（5G-Proxy-Pro 即 send_zero_reply + close），
+            // 續用同一條只會拿到 EOF。而且那個失敗會被歸類成 SE_EVENT_NETWORK_FAIL，
+            // 餵進 ServerWatchdog（60 秒 3 次就自動重啟隧道）→ 使用者看到的是
+            // 「勾了 UDP-in-TCP 就無法連線」。
+            //
+            // 正解：吃掉失敗回覆 → 釋放舊連線 → **重開一條** → 重新握手 → 再送 0x03。
+            // 失敗歸類：伺服器剛剛才回覆過我們（REP≠0），代表它還活著，所以後續
+            // 這條退路的失敗一律算協定層（伺服器端拒絕／忙碌），不餵看門狗；
+            // 真正的網路斷線會由 TCP CONNECT 的 NETWORK_FAIL 照樣偵測到，不會漏。
+            // 唯一例外是認證失敗——那是使用者要改設定的明確訊號，原樣往上報。
+            LOGI("伺服器不支援或拒絕 UDP-in-TCP (REP=%d)，改用新連線退回 UDP-in-UDP", buf[1]);
+            fail_code = SE_EVENT_PROTOCOL_FAIL;
             int atyp_r = buf[3];
             int bnd_len = socks5_atyp_bnd_len(atyp_r);
             if (bnd_len == -2) {   // 0x03 變長：先讀 1-byte 長度再讀 len+2
@@ -351,6 +364,17 @@ static void *udp_session_thread(void *arg) {
             } else if (bnd_len > 0) {
                 if (recv_all(cfd, buf, (size_t)bnd_len) < 0) goto fail;
             }
+            // 舊連線多半已被伺服器關閉，一律換新的（fd 由 Java 端唯一 close）
+            release_java_socket(cfd);
+            cfd = -1;
+            cfd = request_java_socket(srv_host, srv_port, 0);
+            if (cfd < 0) goto fail;
+            if (!g.running) { fail_code = SE_EVENT_NONE; goto fail; }
+            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+            hs = socks5_greet_auth(cfd, send_all, recv_all, buf, sizeof buf);
+            if (hs == SE_EVENT_AUTH_FAIL) { fail_code = hs; goto fail; }
+            if (hs != 0) goto fail;   // 其餘維持 PROTOCOL_FAIL（伺服器端問題）
             req[1] = 0x03;
             if (send_all(cfd, req, 10) < 0) goto fail;
             if (recv_all(cfd, buf, 4) < 0) goto fail;
@@ -437,6 +461,12 @@ static void *udp_session_thread(void *arg) {
         if (sess->tx_len > 0) uev |= EPOLLOUT;   // 首包已入隊：需立即排空
         ev.events = uev; ev.data.ptr = (udp_sess_t *)((uintptr_t)sess | 1);
         if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
+        // [修正] 上面若 arm 了 EPOLLOUT，必須同步 tx_armed。先前 udp_tcp_append
+        // 在註冊前會先做一次 EPOLL_CTL_MOD，但那個 fd 還沒進 epoll → 回 ENOENT，
+        // tx_armed 因此永遠是 0；首包排空後 udp_tcp_flush 的取消分支被跳過，
+        // level-triggered 的 EPOLLOUT 就永久就緒 → 引擎執行緒空轉（100% CPU）
+        // 直到第二個 datagram 到來。此處補上狀態，別只 arm 不記。
+        if (sess->tx_len > 0) sess->tx_armed = 1;
     } else {
         ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR; ev.data.ptr = sess;
         if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) goto fail;
