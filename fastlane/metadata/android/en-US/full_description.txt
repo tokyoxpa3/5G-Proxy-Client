@@ -14,4 +14,8 @@ Features:
 - Multiple profile management with JSON export/import via clipboard
 - Native C (epoll) engine + JNI + Kotlin UI
 
+Privacy notes:
+- While the tunnel is up, the proxy server's hostname is re-resolved outside the tunnel (needed to follow DDNS / IP changes without tearing the TUN interface down). That lookup is sent to the DNS servers of the network the tunnel actually runs over. The custom DNS servers above are used only as a fallback when that resolver gives no answer, and the fallback is written to the log.
+- With Remote DNS enabled, DNS queries from apps are relayed to the proxy exit instead of being answered locally.
+
 Open source (MIT), reproducible builds.
