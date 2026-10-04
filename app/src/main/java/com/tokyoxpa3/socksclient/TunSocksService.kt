@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -67,6 +68,14 @@ class TunSocksService : VpnService() {
         // 背景重試失敗幾次後，自動開啟 MainActivity（前台建立）再自動關閉
         private const val BOOT_FLASH_AFTER_RETRIES = 3
 
+        // 軟重連解析伺服器主機名時，取用「底層網路」DNS 的傳輸型別優先序
+        // （與 Android 選擇預設網路的偏好一致：Ethernet > Wi-Fi > Cellular）。
+        private val UNDERLYING_TRANSPORTS = intArrayOf(
+            NetworkCapabilities.TRANSPORT_ETHERNET,
+            NetworkCapabilities.TRANSPORT_WIFI,
+            NetworkCapabilities.TRANSPORT_CELLULAR
+        )
+
         @Volatile
         var isRunning = false
 
@@ -88,7 +97,7 @@ class TunSocksService : VpnService() {
     )
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // 供 resolveCandidateDnsServers()（軟重連補 DHCP DNS）與 logNetworkContext() 使用。
+    // 供 underlyingDnsServers()（軟重連取底層網路 DNS）與 logNetworkContext() 使用。
     private val connectivityManager: ConnectivityManager?
         get() = try { getSystemService(ConnectivityManager::class.java) } catch (e: Exception) { null }
 
@@ -559,6 +568,12 @@ class TunSocksService : VpnService() {
             "unavailable: ${e.message}"
         }
         Log.i(TAG, "network context: server=$host -> $serverIp, default=${activeNetworkId()}, local=[$localAddrs]")
+        // 軟重連解析伺服器主機名時會依序問這些 DNS（底層網路優先、設定值為後備，見 DnsCandidates）。
+        // 有這一行，「主機名到底送給誰」就不必靠推論；底層網路換了 DNS 也看得出來。
+        val dnsPlan = DnsCandidates.plan(underlyingDnsServers(), Config.dnsServers(this))
+        Log.i(TAG, "soft-reconnect DNS order: " + dnsPlan.joinToString(" -> ") {
+            if (it.fallback) "${it.server}(fallback)" else it.server
+        })
     }
 
     /**
@@ -602,37 +617,58 @@ class TunSocksService : VpnService() {
     // 供軟重連在 DDNS／IP 變動後重新解析伺服器位址；失敗回傳 null（沿用舊 IP）。
     private fun resolveHostOutsideTunnel(host: String): String? {
         if (Config.isLiteralIp(host)) return host
-        for (server in resolveCandidateDnsServers()) {
-            val ip = queryDns(server, host)
-            if (ip != null) return ip
+        val plan = DnsCandidates.plan(underlyingDnsServers(), Config.dnsServers(this))
+        for (c in plan) {
+            val ip = queryDns(c.server, host) ?: continue
+            if (c.fallback) {
+                // 只有底層網路的解析器答不出來才會走到這裡 —— 這是「主機名被送給設定值
+                // （預設 8.8.8.8 / 1.1.1.1）那個第三方」的唯一情況，所以不靜默。
+                Log.w(TAG, "soft reconnect: underlying DNS gave no answer for $host, resolved via configured DNS ${c.server} -> $ip")
+            } else {
+                Log.d(TAG, "soft reconnect: resolved $host via underlying DNS ${c.server} -> $ip")
+            }
+            return ip
         }
+        Log.w(TAG, "soft reconnect: cannot resolve $host outside tunnel (tried ${plan.size} DNS servers), keeping current IP")
         return null
     }
 
     /**
-     * 軟重連要用的 DNS 伺服器候選：使用者設定的優先，再補上「目前預設網路的 DHCP DNS」。
+     * 真正承載隧道的「底層網路」（非 VPN）之 DNS 伺服器，依 Android 預設網路的偏好排序
+     * （Ethernet > Wi-Fi > Cellular）。查詢一律經 protect() 過的 socket（見 queryDns），
+     * 不會被自己的隧道 fake DNS 攔截。
      *
-     * 只靠設定值（預設 8.8.8.8 / 1.1.1.1）不夠：那些位址在部分網路被封或不可達，
-     * 一旦兩個都不通，`softRestart()` 就永遠拿不到新 IP、只能沿用舊的 —— DDNS／換網後
-     * 再也追不上（README 說會自動追蹤，實際只在設定值通的時候成立）。DHCP DNS 是那條
-     * 網路上「唯一保證存在」的解析器，補進來才真的追得上。
-     * 查詢一律經 protect() 過的 socket（見 queryDns），不會被自己的隧道 fake DNS 攔截。
+     * 為什麼底層優先：這條網路本來就承載整個隧道流量，查它不會多洩漏主機名給第三方；
+     * 設定值（預設 8.8.8.8 / 1.1.1.1）是外部第三方，只能當後備（見 DnsCandidates）。
+     *
+     * ⚠️ 不能用 `ConnectivityManager.activeNetwork`：對 VPN App 而言那是「自己的 VPN 網路」
+     * （見 activeNetworkId 的註解），其 `LinkProperties.dnsServers` 就是本 App 自己
+     * `addDnsServer()` 進去的設定值 —— 拿它當「DHCP DNS」等於原地打轉。舊版正是這樣寫的，
+     * 那一格因此從來沒生效過，永遠只查得到設定值。必須從 `allNetworks` 篩掉 VPN。
      */
-    private fun resolveCandidateDnsServers(): List<String> {
+    private fun underlyingDnsServers(): List<String> {
+        val cm = connectivityManager ?: return emptyList()
         val servers = LinkedHashSet<String>()
-        servers.addAll(Config.dnsServers(this))
         try {
-            val cm = connectivityManager
-            val net = cm?.activeNetwork
-            if (cm != null && net != null) {
-                cm.getLinkProperties(net)?.dnsServers?.forEach { addr ->
-                    // hostAddress 對 IPv6 可能帶 zone id（fe80::1%wlan0）→ 去掉後才是查詢用的位址
-                    val ip = addr.hostAddress?.substringBefore('%')
-                    if (ip != null && Config.isLiteralIp(ip)) servers.add(ip)
+            // allNetworks 在 API 31 起 deprecated（官方建議改非同步的 registerNetworkCallback），
+            // 但這裡要的是「此刻」的同步快照，而軟重連是即時路徑 —— 回呼模型不適合，故沿用。
+            @Suppress("DEPRECATION")
+            val networks = cm.allNetworks.toList()
+            for (transport in UNDERLYING_TRANSPORTS) {
+                for (net in networks) {
+                    val caps = cm.getNetworkCapabilities(net) ?: continue
+                    if (!caps.hasTransport(transport)) continue
+                    // VPN 網路要排除：它的 DNS 是我們自己宣告的，不是底層網路的 DHCP DNS
+                    if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) continue
+                    if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+                    cm.getLinkProperties(net)?.dnsServers?.forEach { addr ->
+                        // 去 zone id（fe80::1%wlan0）與格式檢查由 DnsCandidates.normalize 統一處理
+                        addr.hostAddress?.let { servers.add(it) }
+                    }
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "collect DHCP DNS servers failed: ${e.message}")
+            Log.w(TAG, "collect underlying DNS servers failed: ${e.message}")
         }
         return servers.toList()
     }

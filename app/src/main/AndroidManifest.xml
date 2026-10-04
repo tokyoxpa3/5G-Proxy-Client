@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- 讀取網路狀態：軟重連時補上目前網路的 DHCP DNS（resolveCandidateDnsServers），
+    <!-- 讀取網路狀態：軟重連時取底層（非 VPN）網路的 DNS（underlyingDnsServers），
          以及啟動時記一行診斷（logNetworkContext）。屬 normal 權限，安裝即授予。 -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
