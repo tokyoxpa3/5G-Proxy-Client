@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#1B5E20</color>
+    <!-- 品牌標誌（fastlane icon.png）本身就是白底，背景層跟著用白色。 -->
+    <color name="ic_launcher_background">#FFFFFF</color>
 </resources>

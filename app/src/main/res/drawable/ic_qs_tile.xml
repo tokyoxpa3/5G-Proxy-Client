@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 快速設定磚圖示。磚圖示會被系統上色成單色，所以這裡刻意留簡單的白色幾何圖形，
+     不要換成彩色品牌標誌（會被壓成一團剪影）。 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
