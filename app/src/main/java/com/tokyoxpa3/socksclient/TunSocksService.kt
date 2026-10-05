@@ -715,16 +715,33 @@ class TunSocksService : VpnService() {
             // 候選是跨網路彙整的，不綁的話封包一律走系統預設路由：Wi-Fi 與行動網路同時存在
             // 且 DNS 不同時，排在後面的那台會查不到（白等一個 3 秒逾時）。
             // 綁定失敗不致命 —— 記 warning 後照舊走預設路由（＝未綁定的舊行為），不靜默。
+            var bound = "default route"
             if (network != null) {
                 try {
                     network.bindSocket(ds)
+                    bound = network.toString()
                 } catch (e: Exception) {
                     Log.w(TAG, "queryDns: bind $server to network failed, using default route: ${e.message}")
                 }
             }
+            val target = InetAddress.getByName(server)
+            // 觀測點：connect() 會依 socket 的 fwmark 做一次路由查詢，之後 localAddress 就是
+            // 封包實際的來源位址 —— 「到底從哪張網卡出去」唯一可靠的證據。若它是 tun 位址
+            // （10.8.0.2），代表查詢被自己的隧道吃掉（會被 fake DNS 換成假 IP）；若是底層網卡
+            // 位址，才代表真的繞過了隧道、且綁對了網路。綁定若因鍵值對不上而整個被略過
+            // （network==null），這裡也會看得出來，不會靜默。
+            val egress = try {
+                ds.connect(target, 53)
+                ds.localAddress?.hostAddress
+            } catch (e: Exception) {
+                Log.w(TAG, "queryDns: probe route to $server failed: ${e.message}")
+                null
+            }
+            val egressText = egress ?: "?"
+            Log.d(TAG, "queryDns: $hostname @ $server egress=$egressText ($bound)")
             val id = java.util.Random().nextInt(0x10000)
             val query = DnsClient.buildQuery(hostname, id)
-            ds.send(DatagramPacket(query, query.size, InetAddress.getByName(server), 53))
+            ds.send(DatagramPacket(query, query.size, target, 53))
             val buf = ByteArray(512)
             val pkt = DatagramPacket(buf, buf.size)
             ds.receive(pkt)
