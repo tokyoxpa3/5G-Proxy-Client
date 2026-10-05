@@ -47,15 +47,33 @@ object DnsCandidates {
     }
 
     /**
+     * 單一伺服器經 `normalize` 後的字串（被過濾則為 null）。
+     *
+     * 給「位址 → 來源網路」的對照表當 key 用：那個表必須與 `plan()` 實際吐出的字串**逐字**
+     * 一致，否則查詢 socket 就綁不回它來源的網路 —— 而且是**靜默**退回預設路由。
+     * 所以兩邊共用同一套正規化，並由 `normalizeOneMatchesWhatPlanEmits` 把這個契約鎖住。
+     */
+    fun normalizeOne(server: String): String? = normalize(listOf(server)).firstOrNull()
+
+    /**
      * 連結本地 IPv6（`fe80::/10`）在**去掉 zone id 之後就送不出去** —— 沒有 scope 就不知道
      * 要走哪個介面，`DatagramPacket` 會直接拋錯。而 `LinkProperties.dnsServers` 給的正是
      * 帶 zone id 的形式（`fe80::1%wlan0`），所以留在候選裡只會白等一個 3 秒逾時
      * （實測本機 Wi-Fi 的第一個 DNS 就是這種）。直接排除。
+     *
+     * ⚠️ 必須比對第一個 hextet 的**數值**，不能比對文字。`fe8::1` 省略前導零，實際是
+     * `0fe8::`（＝0000:1111:1110:1000），**不在** `fe80::/10`。舊版看「fe 之後的第一個
+     * 字元是不是 8/9/a/b」，會把 `fe8::1`／`fe9::1`／`fea::1`／`feb::1`（0x0fe8–0x0feb）
+     * 誤判成連結本地而丟掉（F-Droid 1.6.5 review 指出此 over-filtering，且既有測試把
+     * 錯誤行為寫成了斷言）。
      */
     fun isLinkLocalV6(ip: String): Boolean {
-        val lower = ip.lowercase()
-        if (!lower.startsWith("fe")) return false
-        // fe80::/10 = 1111 1110 10xx xxxx → 第二個 nibble 為 8/9/a/b
-        return lower.removePrefix("fe").take(1) in listOf("8", "9", "a", "b")
+        // 取第一個 hextet；呼叫端多半已去 zone id，這裡再保險一次
+        val firstHextet = ip.substringBefore(':').substringBefore('%')
+        // IPv6 的 hextet 最多 4 位十六進位；更長或非 hex 就不是合法位址，不判為連結本地
+        if (firstHextet.isEmpty() || firstHextet.length > 4) return false
+        val value = firstHextet.toIntOrNull(16) ?: return false
+        // fe80::/10 = 1111 1110 10xx xxxx → 第一個 hextet 落在 0xfe80..0xfebf
+        return value in 0xfe80..0xfebf
     }
 }

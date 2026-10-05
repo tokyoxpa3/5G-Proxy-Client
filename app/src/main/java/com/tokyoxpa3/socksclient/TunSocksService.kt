@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
@@ -617,9 +618,11 @@ class TunSocksService : VpnService() {
     // 供軟重連在 DDNS／IP 變動後重新解析伺服器位址；失敗回傳 null（沿用舊 IP）。
     private fun resolveHostOutsideTunnel(host: String): String? {
         if (Config.isLiteralIp(host)) return host
-        val plan = DnsCandidates.plan(underlyingDnsServers(), Config.dnsServers(this))
+        val targets = underlyingDnsTargets()
+        val netByServer = underlyingNetworkByServer(targets)
+        val plan = DnsCandidates.plan(targets.map { it.server }, Config.dnsServers(this))
         for (c in plan) {
-            val ip = queryDns(c.server, host) ?: continue
+            val ip = queryDns(c.server, host, netByServer[c.server]) ?: continue
             if (c.fallback) {
                 // 只有底層網路的解析器答不出來才會走到這裡 —— 這是「主機名被送給設定值
                 // （預設 8.8.8.8 / 1.1.1.1）那個第三方」的唯一情況，所以不靜默。
@@ -634,6 +637,15 @@ class TunSocksService : VpnService() {
     }
 
     /**
+     * 一個底層網路 DNS 候選：伺服器位址 + **它所屬的網路**。
+     *
+     * 為什麼要帶上網路：候選是從「所有」非 VPN 網路彙整來的，但查詢 socket 若不綁回
+     * 該 DNS 所屬的網路，封包會走系統預設路由 —— Wi-Fi 與行動網路同時存在且 DNS 不同時，
+     * 排在後面的那台根本查不到（白等一個 3 秒逾時才落到設定值）。
+     */
+    private data class UnderlyingDns(val network: Network, val server: String)
+
+    /**
      * 真正承載隧道的「底層網路」（非 VPN）之 DNS 伺服器，依 Android 預設網路的偏好排序
      * （Ethernet > Wi-Fi > Cellular）。查詢一律經 protect() 過的 socket（見 queryDns），
      * 不會被自己的隧道 fake DNS 攔截。
@@ -646,9 +658,10 @@ class TunSocksService : VpnService() {
      * `addDnsServer()` 進去的設定值 —— 拿它當「DHCP DNS」等於原地打轉。舊版正是這樣寫的，
      * 那一格因此從來沒生效過，永遠只查得到設定值。必須從 `allNetworks` 篩掉 VPN。
      */
-    private fun underlyingDnsServers(): List<String> {
+    private fun underlyingDnsTargets(): List<UnderlyingDns> {
         val cm = connectivityManager ?: return emptyList()
-        val servers = LinkedHashSet<String>()
+        val targets = ArrayList<UnderlyingDns>()
+        val seen = HashSet<String>()
         try {
             // allNetworks 在 API 31 起 deprecated（官方建議改非同步的 registerNetworkCallback），
             // 但這裡要的是「此刻」的同步快照，而軟重連是即時路徑 —— 回呼模型不適合，故沿用。
@@ -663,24 +676,52 @@ class TunSocksService : VpnService() {
                     if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
                     cm.getLinkProperties(net)?.dnsServers?.forEach { addr ->
                         // 去 zone id（fe80::1%wlan0）與格式檢查由 DnsCandidates.normalize 統一處理
-                        addr.hostAddress?.let { servers.add(it) }
+                        val host = addr.hostAddress ?: return@forEach
+                        if (seen.add(host)) targets.add(UnderlyingDns(net, host))
                     }
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "collect underlying DNS servers failed: ${e.message}")
         }
-        return servers.toList()
+        return targets
+    }
+
+    /** 只要位址（給 log 用）；實際查詢走 underlyingDnsTargets，才會保留網路歸屬。 */
+    private fun underlyingDnsServers(): List<String> = underlyingDnsTargets().map { it.server }
+
+    /**
+     * 正規化後的伺服器位址 → 它所屬的底層網路。
+     * 正規化用 `DnsCandidates.normalize`，與 `plan()` 內部同一套，key 才對得上。
+     * 設定值（fallback）不在這張表裡 —— 它們是公開解析器，走預設路由即可，不綁網路。
+     */
+    private fun underlyingNetworkByServer(targets: List<UnderlyingDns>): Map<String, Network> {
+        val map = HashMap<String, Network>()
+        targets.forEach { t ->
+            DnsCandidates.normalizeOne(t.server)?.let { map.putIfAbsent(it, t.network) }
+        }
+        return map
     }
 
     // 對單一 DNS 伺服器發 A/AAAA 查詢並解析第一個位址；逾時／失敗回傳 null。
-    private fun queryDns(server: String, hostname: String): String? {
+    // `network` 非 null 時把 socket 綁回該 DNS 所屬的底層網路（見 underlyingDnsTargets）。
+    private fun queryDns(server: String, hostname: String, network: Network?): String? {
         if (!Config.isLiteralIp(server)) return null   // 只允許數字 IP，避免遞迴 DNS 查詢
         val ds = DatagramSocket()
         return try {
             ds.soTimeout = 3000
             val ok = protect(ds)
             if (!ok) return null
+            // 候選是跨網路彙整的，不綁的話封包一律走系統預設路由：Wi-Fi 與行動網路同時存在
+            // 且 DNS 不同時，排在後面的那台會查不到（白等一個 3 秒逾時）。
+            // 綁定失敗不致命 —— 記 warning 後照舊走預設路由（＝未綁定的舊行為），不靜默。
+            if (network != null) {
+                try {
+                    network.bindSocket(ds)
+                } catch (e: Exception) {
+                    Log.w(TAG, "queryDns: bind $server to network failed, using default route: ${e.message}")
+                }
+            }
             val id = java.util.Random().nextInt(0x10000)
             val query = DnsClient.buildQuery(hostname, id)
             ds.send(DatagramPacket(query, query.size, InetAddress.getByName(server), 53))
