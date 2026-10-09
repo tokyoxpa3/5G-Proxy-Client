@@ -1,5 +1,8 @@
 # Android SOCKS5 TUN Tunnel Client
 
+[<img src="assets/f-droid-badge.png" alt="Get it on F-Droid" height="80">](https://f-droid.org/packages/com.tokyoxpa3.socksclient/)
+[<img src="assets/github-badge.png" alt="Get it on GitHub" height="80">](https://github.com/tokyoxpa3/5G-Proxy-Client/releases/latest)
+
 把整台裝置的網路流量透過 TUN 虛擬網卡導向遠端 SOCKS5 伺服器的 Android 客戶端。
 
 - **TCP**：內建完整的 TCP 狀態機（於使用者空間實作），透過 SOCKS5 **CONNECT** 轉發
