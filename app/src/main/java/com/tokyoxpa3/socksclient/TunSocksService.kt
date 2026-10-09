@@ -898,13 +898,16 @@ class TunSocksService : VpnService() {
      * 會因為拿不到 fd 而靜默失敗；因此先 bind(0) 強制建立 fd 再 protect。
      */
     private fun createProtectedSocket(host: String, port: Int, isUdp: Boolean): Int {
+        // 例外路徑（connect 逾時、ParcelFileDescriptor.fromSocket 失敗…）必須關閉
+        // 已建立的 socket；否則每次失敗都洩漏一個 fd（曾觀察到累積數百個）。
+        var pending: AutoCloseable? = null
         return try {
             if (isUdp) {
                 val ds = DatagramSocket()
+                pending = ds
                 ds.receiveBufferSize = SOCKET_BUFFER_SIZE
                 ds.sendBufferSize = SOCKET_BUFFER_SIZE
-                val ok = protect(ds)
-                if (!ok) {
+                if (!protect(ds)) {
                     Log.e(TAG, "protect(DatagramSocket) 失敗")
                     ds.close()
                     return -1
@@ -912,14 +915,15 @@ class TunSocksService : VpnService() {
                 val pfd = ParcelFileDescriptor.fromDatagramSocket(ds)
                 val fd = pfd.detachFd()
                 activeSockets[fd] = ds
+                pending = null   // fd 已交出，生命週期改由 activeSockets 管理
                 fd
             } else {
                 val socket = Socket()
+                pending = socket
                 socket.setReceiveBufferSize(SOCKET_BUFFER_SIZE)
                 socket.setSendBufferSize(SOCKET_BUFFER_SIZE)
                 socket.bind(InetSocketAddress(0)) // 強制建立 fd（綁定暫存埠）
-                val ok = protect(socket)
-                if (!ok) {
+                if (!protect(socket)) {
                     Log.e(TAG, "protect(Socket) 失敗")
                     socket.close()
                     return -1
@@ -929,10 +933,16 @@ class TunSocksService : VpnService() {
                 val pfd = ParcelFileDescriptor.fromSocket(socket)
                 val fd = pfd.detachFd()
                 activeSockets[fd] = socket
+                pending = null   // fd 已交出，生命週期改由 activeSockets 管理
                 fd
             }
         } catch (e: Exception) {
             Log.e(TAG, "createProtectedSocket failed ($host:$port udp=$isUdp): ${e.message}")
+            try {
+                pending?.close()
+            } catch (e2: Exception) {
+                Log.w(TAG, "close leaked socket failed: ${e2.message}")
+            }
             -1
         }
     }
