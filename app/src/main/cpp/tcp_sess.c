@@ -558,6 +558,12 @@ void tcp_handle_packet(const unsigned char *pkt, size_t len, size_t t,
         if (g.remote_dns && ntohs(dport) == 53 && sess->dst_domain[0] == 0) {
             sess->dns_tcp = 1;
             atomic_store(&sess->state, 1);
+            // 此路徑不建立 SOCKS5 連線，故不會有 handshake 線程；thread_done 只有
+            // tcp_connect_thread 尾端會設定。不在這裡標記的話，tcp_graveyard_collect()
+            // 永遠等不到 thread_done==1 → session（struct + srv_buf，約 1 MiB）永不釋放，
+            // 且 tcp_session_count 只增不減；累計達 MAX_TCP_SESSIONS 後 tcp_handle_packet
+            // 會對所有新 TCP 連線回 RST（DNS 正常但 TCP 全掛）。
+            atomic_store(&sess->thread_done, 1);
             return;
         }
         if (hs_submit(tcp_connect_thread, sess) != 0) close_tcp_session(sess, 1);

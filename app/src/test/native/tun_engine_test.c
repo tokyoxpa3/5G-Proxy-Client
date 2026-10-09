@@ -12,6 +12,9 @@
 //   3. RFC 1929 認證被拒 → RST + SE_EVENT_AUTH_FAIL
 //   4. UDP-in-TCP（自訂指令 0x04）frame relay echo
 //   5. UDP-in-TCP 伺服器不支援 → 退回標準 UDP ASSOCIATE(0x03) relay echo
+//   6. Remote DNS（fake IP + ATYP=0x03 撥號）
+//   7. 上傳回壓（app_buf 滿時通告零視窗，不沉默）
+//   8. DNS-over-TCP session 回收（資源洩漏迴歸守衛）
 
 #define _DEFAULT_SOURCE 1
 
@@ -1067,6 +1070,101 @@ int main(void) {
         g_fake_discard_upload = 0;
         g_fake_stall_read_ms = 0;
         g_bridge_verbose = 0;
+    }
+
+    // ============ 情境 8：DNS-over-TCP session 必須被回收（資源洩漏迴歸守衛） ============
+    // dns_tcp 分支不建立 SOCKS5 連線，因此沒有 handshake 線程會設定 thread_done。
+    // 若該分支漏標 thread_done，session 會永遠留在 graveyard：
+    //   ① 每次洩漏 struct + srv_buf（約 1 MiB）；
+    //   ② tcp_session_count 只增不減，累計達 MAX_TCP_SESSIONS(512) 後
+    //      tcp_handle_packet 會對所有新 TCP 連線回 RST（DNS 正常但 TCP 全掛）。
+    // 本情境以「關閉後 tcp_session_count 必須回到連線前水位」鎖住此不變式。
+    {
+        int test_fd = start_engine(tcp_port, "", "", 0, 1);   // remote_dns=1
+        CHECK("engine start (dns-over-tcp)", test_fd >= 0);
+
+        int tcps0 = -1, udps0 = 0;
+        unsigned long long b0 = 0, b1 = 0;
+        tun_socks_get_stats(&b0, &b1, &tcps0, &udps0);
+        CHECK("dns-over-tcp: baseline session count is 0", tcps0 == 0);
+
+        const uint16_t sport = htons(59000);
+        const uint16_t dport = htons(53);
+        const unsigned char dns_ip[4] = {8, 8, 8, 8};   // literal DNS IP → dns_tcp 路徑
+        unsigned char pkt[512], rbuf[512], framed[512];
+
+        // DNS-over-TCP frame = [2-byte 長度][DNS message]
+        size_t qlen = build_dns_a_query("example.com", framed + 2, sizeof framed - 2);
+        CHECK("dns-over-tcp: query build", qlen > 0);
+        framed[0] = (unsigned char)(qlen >> 8);
+        framed[1] = (unsigned char)(qlen & 0xFF);
+        size_t framed_len = 2 + qlen;
+
+        // 1. 三向交握（連到 literal DNS IP 的 53/tcp）
+        ssize_t n = tcp_build_segment(app_ip, dns_ip, AF_INET, sport, dport,
+                                      1000, 0, 0x02, NULL, 0, 64240, pkt, sizeof pkt);
+        CHECK("dns-over-tcp: syn build", n > 0);
+        write(test_fd, pkt, (size_t)n);
+        ssize_t r = read_tun(test_fd, rbuf, sizeof rbuf, 3000);
+        int synack_ok = 0;
+        uint32_t srv_isn = 0;
+        if (r > 0) {
+            int ihl = (rbuf[0] & 0x0F) * 4;
+            synack_ok = ((rbuf[ihl + 13] & 0x12) == 0x12);
+            srv_isn = tcp_seq(rbuf);
+        }
+        CHECK("dns-over-tcp: syn-ack", synack_ok);
+
+        if (synack_ok) {
+            // session 已建立：計數必須為 1，否則本情境沒有測到任何東西
+            int tcps_mid = -1;
+            tun_socks_get_stats(&b0, &b1, &tcps_mid, &udps0);
+            CHECK("dns-over-tcp: session created (count == 1)", tcps_mid == 1);
+
+            // 2. ACK + 帶 DNS query 的資料段
+            n = tcp_build_segment(app_ip, dns_ip, AF_INET, sport, dport,
+                                  1001, srv_isn + 1, 0x18, framed, framed_len, 64240,
+                                  pkt, sizeof pkt);
+            write(test_fd, pkt, (size_t)n);
+
+            // 3. 讀回覆：引擎合成 DNS 回覆後會先送資料、再送 FIN
+            int saw_reply = 0, saw_fin = 0;
+            for (int i = 0; i < 60 && !saw_fin; i++) {
+                ssize_t rr = read_tun(test_fd, rbuf, sizeof rbuf, 50);
+                if (rr <= 0) continue;
+                const unsigned char *pl;
+                ssize_t plen = tcp_payload(rbuf, (size_t)rr, &pl);
+                if (plen >= 6) {
+                    // TCP frame = [2-byte 長度][DNS message]；QR 在 message 第 3 byte
+                    // （不像 UDP 沒有長度前綴，故是 pl[4] 而非 pl[2]）
+                    size_t frame_len = ((size_t)pl[0] << 8) | pl[1];
+                    if (frame_len == (size_t)plen - 2 && (pl[4] & 0x80) != 0) saw_reply = 1;
+                }
+                if (tcp_has_fin(rbuf, (size_t)rr, NULL)) saw_fin = 1;
+            }
+            CHECK("dns-over-tcp: synthesized dns reply over tcp", saw_reply == 1);
+            CHECK("dns-over-tcp: engine sends FIN after reply", saw_fin == 1);
+
+            // 4. App 關閉（RST 一律走 close_tcp_session）
+            n = tcp_build_segment(app_ip, dns_ip, AF_INET, sport, dport,
+                                  1001 + (uint32_t)framed_len, srv_isn + 1, 0x04,
+                                  NULL, 0, 64240, pkt, sizeof pkt);
+            write(test_fd, pkt, (size_t)n);
+        }
+
+        // 5. 等引擎回收（tcp_graveyard_collect 每輪尾端清一次）
+        int tcps_after = -1;
+        for (int i = 0; i < 40; i++) {
+            tun_socks_get_stats(&b0, &b1, &tcps_after, &udps0);
+            if (tcps_after <= tcps0) break;
+            usleep(50000);
+        }
+        printf("  dns-over-tcp: tcp_sessions before=%d after=%d\n", tcps0, tcps_after);
+        CHECK("dns-over-tcp: session count returns to baseline after close",
+              tcps_after == tcps0);
+
+        tun_socks_stop();
+        close(test_fd);
     }
 
     close(lfd);
