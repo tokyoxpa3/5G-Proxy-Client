@@ -87,10 +87,14 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         DebugLog.init(this)
-        pendingAutoStart = intent?.getBooleanExtra(EXTRA_AUTO_START, false) ?: false
+        // 螢幕旋轉等設定變更會重建 Activity。重建時不可重跑「開啟即連線」或「閃一下啟動」，
+        // 否則使用者按了停止之後，只要轉一下螢幕隧道就會自己起來。
+        val isRecreation = savedInstanceState != null
+        pendingAutoStart = !isRecreation &&
+            (intent?.getBooleanExtra(EXTRA_AUTO_START, false) ?: false)
         buildUi()
         // 開啟 App 即自動連線（像 sockstun）：非「閃一下」啟動、隧道未在跑、有已存設定 → 自動建立 VPN
-        if (!pendingAutoStart && !TunSocksService.isRunning &&
+        if (!isRecreation && !pendingAutoStart && !TunSocksService.isRunning &&
             !(Config.prefs(this).getString(Config.KEY_HOST, "") ?: "").isBlank()
         ) {
             attemptStart()
