@@ -22,6 +22,10 @@ object Config {
     const val KEY_DNS2 = "dns2"
     const val KEY_MODE = "tunnel_mode"      // 0=global 1=allowlist 2=exclude
     const val KEY_AUTO_START = "auto_start"
+    // [開機自啟] 使用者「最後的意圖」：收到 START/RESTART 設 true、收到 STOP 設 false。
+    // 系統撤銷 VPN 或被系統殺掉不改它。BootReceiver 要 KEY_AUTO_START 與本旗標同時成立
+    // 才會在開機時拉起隧道 —— 否則使用者按了停止、重開機又會被悄悄拉起來。
+    const val KEY_WAS_RUNNING = "was_running"
 
     // 設定檔（JSON 字串）
     const val KEY_PROFILES = "profiles"

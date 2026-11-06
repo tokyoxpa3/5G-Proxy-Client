@@ -78,7 +78,7 @@
     <string name="label_mode_global">🌐 全局（所有流量）</string>
     <string name="label_mode_allowlist">🎯 指定 App（僅勾選者走隧道）</string>
     <string name="label_mode_exclude">🚫 排除勾選的 App</string>
-    <string name="label_auto_start">開機自動啟動隧道</string>
+    <string name="label_auto_start">開機自動啟動隧道（僅限關機前仍在執行）</string>
     <string name="label_other">其他設定</string>
     <string name="label_profiles">設定檔</string>
     <string name="label_kill_switch_status">斷線保護：%1$s</string>

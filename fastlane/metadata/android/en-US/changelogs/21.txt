@@ -1,0 +1,4 @@
+- Fixed: rotating the screen no longer reconnects the tunnel. The main screen used to rebuild itself on a rotation and re-run "connect on open", so after you pressed Stop, turning the device brought the tunnel back up. A rebuilt screen is now treated as the same session and no longer auto-connects
+- Fixed: "start tunnel on boot" now also requires that the tunnel was still running when you shut down. Previously it only checked the checkbox, so a Stop you pressed was silently undone at the next boot. Pressing Stop (from the app, the notification or the Quick Settings tile) clears that state; a VPN revocation by the system or a crash does not, so those cases are still restored
+- The option is now labelled "Start tunnel on boot (only if it was running when you shut down)" so the behaviour is visible where you enable it
+- Also restores the tunnel after an app update (the update kills it, and nothing used to bring it back until the next reboot)

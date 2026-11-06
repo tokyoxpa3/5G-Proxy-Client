@@ -78,7 +78,7 @@
     <string name="label_mode_global">🌐 Global (all traffic)</string>
     <string name="label_mode_allowlist">🎯 Per-App (only checked apps)</string>
     <string name="label_mode_exclude">🚫 Exclude checked apps</string>
-    <string name="label_auto_start">Start tunnel on boot</string>
+    <string name="label_auto_start">Start tunnel on boot (only if it was running when you shut down)</string>
     <string name="label_other">Other Settings</string>
     <string name="label_profiles">Profiles</string>
     <string name="label_kill_switch_status">Kill switch: %1$s</string>

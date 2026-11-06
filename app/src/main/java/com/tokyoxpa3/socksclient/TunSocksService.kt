@@ -170,11 +170,25 @@ class TunSocksService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // [開機自啟] 先記下「使用者最後的意圖」，供 BootReceiver 判斷開機要不要還原。
+        // 只有明確的 ACTION_STOP 才算「不要跑」；onRevoke（系統撤銷 VPN）與引擎意外停止
+        // 走的是 stopTunnel() 而非這裡，旗標保持 true —— 那些不是使用者的意思，
+        // 下次開機仍應還原。
+        val prefs = Config.prefs(this)
         when (intent?.action) {
-            ACTION_STOP -> stopTunnel()
-            ACTION_RESTART -> restartTunnel()
+            ACTION_STOP -> {
+                prefs.edit().putBoolean(Config.KEY_WAS_RUNNING, false).apply()
+                stopTunnel()
+            }
+            ACTION_RESTART -> {
+                prefs.edit().putBoolean(Config.KEY_WAS_RUNNING, true).apply()
+                restartTunnel()
+            }
             // ACTION_START、null（START_STICKY 被系統重建）→ 啟動（無 extras 時讀取已儲存設定）
-            else -> startTunnel(intent)
+            else -> {
+                prefs.edit().putBoolean(Config.KEY_WAS_RUNNING, true).apply()
+                startTunnel(intent)
+            }
         }
         return START_STICKY
     }
