@@ -137,7 +137,15 @@ void tcp_graveyard_collect(void) {
             int fd = atomic_load(&s->srv_fd);
             if (fd >= 0) {
                 if (g.epoll_fd >= 0) epoll_ctl(g.epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                // [CLOSE_WAIT 修復 2026-11-12] `ParcelFileDescriptor.fromSocket().detachFd()`
+                // 交出的是 **dup**：Java 的 Socket 仍持有自己那一份 fd，
+                // release_java_socket() 只是回呼 Java 關掉那一份，**C 這一份從未 close**。
+                // 於是 socket 永遠停在 CLOSE_WAIT —— 實測換四次 IP 後累積 501 條
+                // （uid 全部是 com.tokyoxpa3.socksclient），每條都佔一個 fd。
+                // 這裡必須自己關，順序與 5G-Proxy-Pro 的 conn_finalize 一致：
+                // 先 release（移除 Java map，避免 fd 編號被重用後誤刪無辜連線）再 close。
                 release_java_socket(fd);
+                close(fd);
                 atomic_store(&s->srv_fd, -1);
             }
             free(s->app_buf);

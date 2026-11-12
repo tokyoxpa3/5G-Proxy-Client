@@ -1,0 +1,1 @@
+- Fixed: every closed TCP session left one socket behind in CLOSE_WAIT. `detachFd()` hands the native layer a duplicate of the socket's descriptor, and the cleanup path only asked the Java side to close its copy — the native copy was never closed. After four IP changes this reached 501 leaked sockets, each holding a descriptor. Both copies are now closed
